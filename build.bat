@@ -27,6 +27,13 @@ if not exist "ffmpeg\ffmpeg.exe" (
     exit /b 1
 )
 
+if not exist "ffmpeg\ffplay.exe" (
+    echo [WARN] ffmpeg\ffplay.exe が見つかりません。
+    echo        話者割当画面の区間再生が簡易モード ^(winsound^) になります。
+    echo        同じ zip の bin\ffplay.exe を ffmpeg\ にコピーすることを推奨します。
+    echo.
+)
+
 REM ----- 1) Python 仮想環境 -----
 if not exist ".venv\Scripts\python.exe" (
     echo [1/4] 仮想環境を作成しています...
@@ -97,7 +104,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  完了!
-echo  インストーラ: Output\GeminiTranscriberSetup-1.0.0.exe
+echo  インストーラ: Output\GeminiTranscriberSetup-2.0.0.exe
 echo ============================================================
 pause
 endlocal

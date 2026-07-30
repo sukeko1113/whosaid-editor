@@ -26,17 +26,19 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Download ffmpeg (essentials build)
+      - name: Download ffmpeg + ffplay (essentials build)
         shell: pwsh
         run: |
           $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
           Write-Host "Downloading ffmpeg from $url"
           Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted -Force
-          $exe = Get-ChildItem -Path ffmpeg-extracted -Filter ffmpeg.exe -Recurse | Select-Object -First 1
-          if (-not $exe) { throw 'ffmpeg.exe not found in archive' }
           New-Item -ItemType Directory -Path ffmpeg -Force | Out-Null
-          Copy-Item -Path $exe.FullName -Destination ffmpeg/ffmpeg.exe -Force
+          foreach ($name in @('ffmpeg.exe', 'ffplay.exe')) {
+            $exe = Get-ChildItem -Path ffmpeg-extracted -Filter $name -Recurse | Select-Object -First 1
+            if (-not $exe) { throw "$name not found in archive" }
+            Copy-Item -Path $exe.FullName -Destination "ffmpeg/$name" -Force
+          }
           & ffmpeg/ffmpeg.exe -version
 
       - name: Install Python dependencies
@@ -44,6 +46,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $env:PATH = "$PWD\ffmpeg;$env:PATH"
+          python tests/test_core.py
+          python tests/test_pipeline_integration.py
+          python tests/test_gui_smoke.py
 
       - name: Build with PyInstaller
         run: pyinstaller --clean -y build.spec

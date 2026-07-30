@@ -39,3 +39,7 @@ desktop.ini
 .env
 .env.*
 config.local.json
+
+# tests
+__pycache__/
+.pytest_cache/

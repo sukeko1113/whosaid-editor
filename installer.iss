@@ -9,7 +9,7 @@
 
 #define MyAppName        "Gemini 文字起こし"
 #define MyAppNameAscii   "GeminiTranscriber"
-#define MyAppVersion     "1.3.0"
+#define MyAppVersion     "2.0.0"
 #define MyAppPublisher   "Your Name"
 #define MyAppExeName     "GeminiTranscriber.exe"
 

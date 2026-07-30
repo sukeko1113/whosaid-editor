@@ -11,15 +11,29 @@ import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from .assign_gui import open_assign_window
 from .config import load_config, save_config
-from .pipeline import run_pipeline
+from .pipeline import run_pipeline, run_segment_pipeline
+from .segments import Project
 
 
 APP_TITLE = "Gemini 文字起こし"
 MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+
+MODE_MANUAL = "manual"
+MODE_AUTO = "auto"
+
+MODE_MANUAL_DESC = (
+    "AI は声質で発言者を A/B/C… に分けるだけ。実名は、区間ごとに音声を聴いて"
+    "候補リストから選んで確定します(確定するたびに候補の並び順を学習)。"
+)
+MODE_AUTO_DESC = (
+    "AI が名簿を見て実名まで推定します(v1 の方式)。速いが誤りが多く、"
+    "後から直すのが大変です。"
+)
 ROSTER_HINT = (
-    "1行に1人、「名前(役職): 補足」の形式で入力(例: 佐藤(理事): 名乗ることが多い)。"
-    "空欄の場合は 発言者A/B/C... 方式になります。"
+    "1行に1人、「名前(役職)」の形式で入力(例: 佐藤(理事長))。"
+    "よく発言する人を上に置くと、初期の候補順が良くなります。"
 )
 
 
@@ -27,17 +41,18 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("760x820")
-        self.minsize(680, 700)
+        self.geometry("780x900")
+        self.minsize(700, 720)
 
         self.cfg = load_config()
         self.msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._cancel_flag = threading.Event()
         self._worker: threading.Thread | None = None
+        self._assign_win = None
 
         self._build_ui()
         self._populate_from_config()
-        self._update_diarization_state()
+        self._update_mode_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
 
@@ -73,9 +88,30 @@ class App(tk.Tk):
             command=self._on_toggle_use_input_dir,
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 
+        # === 話者の決め方(v2.0.0) ===
+        frm_mode = ttk.LabelFrame(self, text="話者の決め方")
+        frm_mode.grid(row=2, column=0, sticky="ew", **pad)
+        frm_mode.columnconfigure(0, weight=1)
+        self.var_mode = tk.StringVar(value=MODE_MANUAL)
+        ttk.Radiobutton(
+            frm_mode, text="区間ごとに聴いて割り当てる(推奨)",
+            value=MODE_MANUAL, variable=self.var_mode, command=self._update_mode_state,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(frm_mode, text=MODE_MANUAL_DESC, foreground="#666", wraplength=700)\
+            .grid(row=1, column=0, sticky="w", padx=28, pady=(0, 4))
+        ttk.Radiobutton(
+            frm_mode, text="AI にすべて任せる(従来方式)",
+            value=MODE_AUTO, variable=self.var_mode, command=self._update_mode_state,
+        ).grid(row=2, column=0, sticky="w", padx=6)
+        ttk.Label(frm_mode, text=MODE_AUTO_DESC, foreground="#666", wraplength=700)\
+            .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
+        ttk.Button(
+            frm_mode, text="保存済みの割当作業を開く...", command=self._open_saved_project,
+        ).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 8))
+
         # === 詳細設定 ===
         frm_adv = ttk.LabelFrame(self, text="詳細設定")
-        frm_adv.grid(row=2, column=0, sticky="ew", **pad)
+        frm_adv.grid(row=3, column=0, sticky="ew", **pad)
         frm_adv.columnconfigure(1, weight=1)
 
         ttk.Label(frm_adv, text="API キー:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
@@ -133,9 +169,9 @@ class App(tk.Tk):
         )
         self.chk_verbatim.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
-        # === 参加者名簿(v1.3.0) ===
-        self.frm_roster = ttk.LabelFrame(self, text="参加者名簿(任意・話者識別が ON のとき使用)")
-        self.frm_roster.grid(row=3, column=0, sticky="ew", **pad)
+        # === 出席者(候補者リスト) ===
+        self.frm_roster = ttk.LabelFrame(self, text="出席者(候補者リスト)")
+        self.frm_roster.grid(row=4, column=0, sticky="ew", **pad)
         self.frm_roster.columnconfigure(0, weight=1)
         ttk.Label(self.frm_roster, text=ROSTER_HINT, foreground="#666", wraplength=700)\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
@@ -147,7 +183,7 @@ class App(tk.Tk):
 
         # === 操作ボタン ===
         frm_btn = ttk.Frame(self)
-        frm_btn.grid(row=4, column=0, sticky="ew", **pad)
+        frm_btn.grid(row=5, column=0, sticky="ew", **pad)
         self.btn_start = ttk.Button(frm_btn, text="文字起こし開始", command=self._start)
         self.btn_start.pack(side="left")
         self.btn_cancel = ttk.Button(frm_btn, text="キャンセル", command=self._cancel, state="disabled")
@@ -157,7 +193,7 @@ class App(tk.Tk):
 
         # === 進捗 ===
         frm_prog = ttk.Frame(self)
-        frm_prog.grid(row=5, column=0, sticky="ew", **pad)
+        frm_prog.grid(row=6, column=0, sticky="ew", **pad)
         frm_prog.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(frm_prog, mode="determinate")
         self.progress.grid(row=0, column=0, sticky="ew")
@@ -167,10 +203,10 @@ class App(tk.Tk):
 
         # === ログ ===
         frm_log = ttk.LabelFrame(self, text="ログ")
-        frm_log.grid(row=6, column=0, sticky="nsew", **pad)
+        frm_log.grid(row=7, column=0, sticky="nsew", **pad)
         frm_log.columnconfigure(0, weight=1)
         frm_log.rowconfigure(0, weight=1)
-        self.rowconfigure(6, weight=1)
+        self.rowconfigure(7, weight=1)
         self.txt_log = tk.Text(frm_log, height=10, wrap="word", state="disabled")
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         sb = ttk.Scrollbar(frm_log, orient="vertical", command=self.txt_log.yview)
@@ -188,6 +224,8 @@ class App(tk.Tk):
                 self.var_chunk.set(int(chunk))
             except Exception:
                 pass
+        if self.cfg.get("mode") in (MODE_MANUAL, MODE_AUTO):
+            self.var_mode.set(str(self.cfg["mode"]))
         if "with_timestamps" in self.cfg:
             self.var_timestamps.set(bool(self.cfg.get("with_timestamps")))
         if "with_diarization" in self.cfg:
@@ -202,9 +240,36 @@ class App(tk.Tk):
                 self.var_input.set(last_in)
         self._on_toggle_use_input_dir()
 
+    def _update_mode_state(self) -> None:
+        """モード切替に応じてチェックボックスと名簿欄の有効/無効を整える。
+
+        手動割当モードでは、タイムスタンプも話者識別も必ず ON になるため
+        個別のチェックボックスは意味を持たない(無効化して誤解を防ぐ)。
+        """
+        if self.var_mode.get() == MODE_MANUAL:
+            self.var_timestamps.set(True)
+            self.var_diarization.set(True)
+            self.chk_timestamps.configure(state="disabled")
+            self.chk_diarization.configure(state="disabled")
+            self.lbl_diar_note.configure(
+                text="※ この方式では名簿を AI に渡しません。声質だけで区切った区間を、"
+                     "あとの割当画面で 1 区間ずつ確定します。"
+            )
+            self.txt_roster.configure(state="normal", background="white")
+            self.btn_start.configure(text="文字起こし → 割当画面へ")
+        else:
+            self.chk_diarization.configure(state="normal")
+            self.lbl_diar_note.configure(
+                text="※ 名簿なしの場合、話者ラベルはチャンクごとに識別されるため、"
+                     "境界をまたぐと同一人物が別ラベルになる場合があります"
+            )
+            self._update_diarization_state()
+            self.btn_start.configure(text="文字起こし開始")
+
     def _update_diarization_state(self) -> None:
-        """話者識別 ON: タイムスタンプは強制 ON + 無効化。名簿欄を有効化。
-        話者識別 OFF: タイムスタンプ選択可。名簿欄は無効化(誤解防止)。"""
+        """(従来方式のみ)話者識別 ON: タイムスタンプは強制 ON。名簿欄を有効化。"""
+        if self.var_mode.get() == MODE_MANUAL:
+            return
         if self.var_diarization.get():
             self.var_timestamps.set(True)
             self.chk_timestamps.configure(state="disabled")
@@ -212,6 +277,30 @@ class App(tk.Tk):
         else:
             self.chk_timestamps.configure(state="normal")
             self.txt_roster.configure(state="disabled", background="#f0f0f0")
+
+    # ------------------------------------------------------------------
+    def _open_saved_project(self) -> None:
+        """既存の <音声名>.speakers.json を開いて割当作業を再開する。"""
+        initial = self.var_output.get() or os.path.dirname(self.var_input.get() or "")
+        path = filedialog.askopenfilename(
+            title="割当作業ファイルを選択",
+            initialdir=initial or None,
+            filetypes=[("割当作業ファイル", "*.speakers.json"), ("JSON", "*.json"), ("すべて", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            proj = Project.load(path)
+        except Exception as e:
+            messagebox.showerror("読み込みエラー", f"作業ファイルを読めませんでした。\n\n{e}")
+            return
+        self._open_assign(proj)
+
+    def _open_assign(self, proj: Project) -> None:
+        try:
+            self._assign_win = open_assign_window(self, proj)
+        except Exception:
+            messagebox.showerror("エラー", traceback.format_exc())
 
     # ------------------------------------------------------------------
     # ハンドラ
@@ -303,6 +392,7 @@ class App(tk.Tk):
             messagebox.showwarning("API キー", "Gemini の API キーを入力してください。")
             return
 
+        mode = self.var_mode.get()
         with_ts = bool(self.var_timestamps.get())
         with_diar = bool(self.var_diarization.get())
         verbatim = bool(self.var_verbatim.get())
@@ -310,10 +400,19 @@ class App(tk.Tk):
         if with_diar:
             with_ts = True  # 強制
 
+        if mode == MODE_MANUAL and not roster.strip():
+            if not messagebox.askyesno(
+                "出席者リストが空です",
+                "出席者を入力しておくと、割当画面ですぐ候補から選べます。\n"
+                "(あとから割当画面で追加することもできます)\n\nこのまま進めますか?",
+            ):
+                return
+
         self.cfg.update({
             "api_key": api,
             "model": self.var_model.get(),
             "chunk_minutes": int(self.var_chunk.get()),
+            "mode": mode,
             "with_timestamps": with_ts,
             "with_diarization": with_diar,
             "verbatim": verbatim,
@@ -344,6 +443,7 @@ class App(tk.Tk):
                 with_diar,
                 roster,
                 verbatim,
+                mode,
             ),
             daemon=True,
         )
@@ -366,22 +466,37 @@ class App(tk.Tk):
         with_diarization: bool,
         roster: str,
         verbatim: bool,
+        mode: str = MODE_AUTO,
     ) -> None:
         try:
-            result = run_pipeline(
-                audio_path=in_path,
-                output_dir=out_dir,
-                api_key=api_key,
-                model=model,
-                chunk_minutes=chunk_minutes,
-                on_log=lambda m: self._post("log", m),
-                on_progress=lambda c, t: self._post("progress", (c, t)),
-                is_cancelled=self._cancel_flag.is_set,
-                with_timestamps=with_timestamps,
-                with_diarization=with_diarization,
-                roster=roster,
-                verbatim=verbatim,
-            )
+            if mode == MODE_MANUAL:
+                result = run_segment_pipeline(
+                    audio_path=in_path,
+                    output_dir=out_dir,
+                    api_key=api_key,
+                    model=model,
+                    chunk_minutes=chunk_minutes,
+                    on_log=lambda m: self._post("log", m),
+                    on_progress=lambda c, t: self._post("progress", (c, t)),
+                    is_cancelled=self._cancel_flag.is_set,
+                    verbatim=verbatim,
+                    roster=roster,
+                )
+            else:
+                result = run_pipeline(
+                    audio_path=in_path,
+                    output_dir=out_dir,
+                    api_key=api_key,
+                    model=model,
+                    chunk_minutes=chunk_minutes,
+                    on_log=lambda m: self._post("log", m),
+                    on_progress=lambda c, t: self._post("progress", (c, t)),
+                    is_cancelled=self._cancel_flag.is_set,
+                    with_timestamps=with_timestamps,
+                    with_diarization=with_diarization,
+                    roster=roster,
+                    verbatim=verbatim,
+                )
             self._post("done", result)
         except Exception:
             self._post("error", traceback.format_exc())
@@ -416,13 +531,23 @@ class App(tk.Tk):
         self.txt_log.see("end")
         self.txt_log.configure(state="disabled")
 
-    def _on_done(self, result: Path | None) -> None:
+    def _on_done(self, result: object) -> None:
         self.btn_start.configure(state="normal")
         self.btn_cancel.configure(state="disabled")
         if result is None:
             self.var_status.set("キャンセル")
             return
         self.var_status.set("完了")
+
+        # 手動割当モード: そのまま割当画面を開く
+        if isinstance(result, Project):
+            n = result.total_count
+            clusters = len(result.clusters())
+            self._append_log(f"{n} 区間 / 声のまとまり {clusters} 種類。割当画面を開きます。")
+            self._open_assign(result)
+            return
+
+        result = Path(str(result))
         if messagebox.askyesno("完了", f"文字起こしが完了しました。\n\n{result}\n\nファイルを開きますか?"):
             try:
                 if sys.platform == "win32":

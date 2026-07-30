@@ -1,7 +1,8 @@
-"""ffmpeg を呼び出して音声ファイルを分割するモジュール"""
+"""ffmpeg を呼び出して音声ファイルを分割・調査するモジュール"""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,13 +36,44 @@ def find_ffmpeg() -> str:
     )
 
 
-def _hide_console_kwargs() -> dict:
+def hide_console_kwargs() -> dict:
     """Windows でサブプロセスのコンソールを隠すための kwargs"""
     if sys.platform == "win32":
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         return {"startupinfo": si, "creationflags": 0x08000000}  # CREATE_NO_WINDOW
     return {}
+
+
+# 後方互換(旧名)
+_hide_console_kwargs = hide_console_kwargs
+
+
+_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d+))?")
+
+
+def probe_duration(input_path: Path) -> float:
+    """入力音声の総再生時間(秒)を返す。
+
+    ffprobe は同梱していないため、`ffmpeg -i <file>` の stderr に出る
+    "Duration: HH:MM:SS.ss" を読む。取得できなければ 0.0 を返す。
+    """
+    try:
+        res = subprocess.run(
+            [find_ffmpeg(), "-hide_banner", "-i", str(input_path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **hide_console_kwargs(),
+        )
+    except Exception:
+        return 0.0
+    m = _DURATION_PATTERN.search((res.stderr or "") + (res.stdout or ""))
+    if not m:
+        return 0.0
+    h, mm, ss, frac = m.group(1), m.group(2), m.group(3), m.group(4) or "0"
+    return int(h) * 3600 + int(mm) * 60 + int(ss) + float(f"0.{frac}")
 
 
 def split_audio(
