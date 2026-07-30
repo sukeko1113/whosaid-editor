@@ -17,6 +17,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# Windows の既定コンソールは cp932 / cp1252 なので、日本語のラベルを print した
+# 時点で UnicodeEncodeError になる(テストの中身とは無関係に落ちる)。
+# 出力先のエンコーディングをここで固定しておく。
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        _s.reconfigure(encoding="utf-8", errors="replace")
+
+
 from src import pipeline  # noqa: E402
 from src.segments import Project  # noqa: E402
 
