@@ -12,7 +12,7 @@ from typing import Callable, Optional
 from google import genai
 
 from .audio import probe_duration, split_audio
-from .segments import Project, Segment, parse_roster
+from .segments import Project, Segment, Speaker, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
     ROSTER_NOTE,
@@ -46,14 +46,20 @@ def _cache_suffix(
     with_diarization: bool,
     verbatim: bool,
     roster: str,
+    chunk_seconds: int = 0,
 ) -> str:
     """設定の組み合わせごとに別キャッシュにする(混在を防ぐ)。
 
     v1.3.0: 逐語モードと名簿の内容もキャッシュキーに含める。
     名簿を書き換えたのに古い結果が再利用される事故を防ぐため、
     名簿本文のハッシュ(先頭8桁)をサフィックスに埋め込む。
+
+    v2.0.0: チャンク長も含める。チャンクのファイル名は長さによらず
+    chunk_0000.m4a なので、含めないと別の長さの転写を使い回してしまう。
     """
     parts: list[str] = []
+    if chunk_seconds:
+        parts.append(f"c{chunk_seconds}")
     if with_diarization:
         parts.append("diar")
     elif with_timestamps:
@@ -122,7 +128,8 @@ def run_pipeline(
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
-    cache_suffix = _cache_suffix(with_timestamps, with_diarization, verbatim, roster)
+    cache_suffix = _cache_suffix(
+        with_timestamps, with_diarization, verbatim, roster, chunk_seconds)
 
     # docx 冒頭の注意書きの選択
     note: str | None = None
@@ -178,34 +185,92 @@ def run_pipeline(
 # 実名の確定はこのあと GUI(assign_gui)でユーザーが行う。
 # ======================================================================
 
-def _carry_over_assignments(old: Project, new_segments: list[Segment], on_log: LogFn) -> int:
-    """再実行時に、以前の割当結果を新しいセグメントへ引き継ぐ。
+MATCH_TOLERANCE_SECONDS = 2.0
 
-    「開始秒(±2秒)と本文先頭が一致する区間」を同一とみなす。
-    キャッシュがある限り本文は変わらないので、実際にはほぼ全件が一致する。
+
+def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
+    """既存の話者 ID を保ったまま、名簿テキストの内容を反映する。
+
+    ID を振り直してはいけない。segment.speaker_id は ID を指しているので、
+    振り直すと「以前の割当」が別人を指してしまう(名簿の並びを変えただけで
+    全員の名前が入れ替わる、という事故になる)。
     """
-    buckets: dict[tuple[int, str], list[Segment]] = {}
-    for seg in old.segments:
-        if not seg.speaker_id:
-            continue
-        key = (int(seg.start // 2), seg.text[:16])
-        buckets.setdefault(key, []).append(seg)
+    wanted = parse_roster(roster)
+    if not wanted:
+        return list(old_speakers)
+
+    remaining: dict[str, list[Speaker]] = {}
+    for sp in old_speakers:
+        remaining.setdefault(sp.name, []).append(sp)
+
+    used_ids = {sp.id for sp in old_speakers}
+    result: list[Speaker] = []
+
+    for w in wanted:
+        pool = remaining.get(w.name)
+        if pool:
+            src = pool.pop(0)                  # 同名が複数いても 1 人ずつ対応付ける
+            src.note = w.note or src.note
+            result.append(src)
+        else:
+            i = 1
+            while f"sp{i:02d}" in used_ids:
+                i += 1
+            sid = f"sp{i:02d}"
+            used_ids.add(sid)
+            result.append(Speaker(id=sid, name=w.name, note=w.note))
+
+    # 名簿から消えた人も、割当が残っているかもしれないので保持する
+    for pool in remaining.values():
+        result.extend(pool)
+
+    for i, sp in enumerate(result):
+        sp.order = i
+    assert len({sp.id for sp in result}) == len(result), "話者 ID が重複しています"
+    return result
+
+
+def _carry_over_assignments(old: Project, new_segments: list[Segment], on_log: LogFn) -> int:
+    """再実行時に、以前の割当結果とユーザーの本文修正を新しいセグメントへ引き継ぐ。
+
+    突き合わせは開始秒で行う(本文は編集されている可能性があるので鍵に使わない)。
+    キャッシュが効いていれば開始秒は完全一致するので、実際にはほぼ全件が一致する。
+    話者 ID は _merge_speakers が ID を保存するので、そのまま移してよい。
+    """
+    pool = sorted(
+        (s for s in old.segments if s.speaker_id or s.text_edited),
+        key=lambda s: s.start,
+    )
+    used: set[int] = set()
 
     carried = 0
+    carried_text = 0
     for seg in new_segments:
-        for k in ((int(seg.start // 2), seg.text[:16]),
-                  (int(seg.start // 2) - 1, seg.text[:16]),
-                  (int(seg.start // 2) + 1, seg.text[:16])):
-            pool = buckets.get(k)
-            if pool:
-                src = pool.pop(0)
-                seg.speaker_id = src.speaker_id
-                seg.reviewed = src.reviewed
-                seg.note = src.note
-                carried += 1
-                break
+        best: Segment | None = None
+        best_gap = MATCH_TOLERANCE_SECONDS + 1e-9
+        for i, src in enumerate(pool):
+            if i in used:
+                continue
+            gap = abs(src.start - seg.start)
+            if gap < best_gap:
+                best, best_gap, best_i = src, gap, i
+        if best is None:
+            continue
+        used.add(best_i)
+        if best.speaker_id:
+            seg.speaker_id = best.speaker_id
+            seg.reviewed = best.reviewed
+            carried += 1
+        seg.note = best.note
+        if best.text_edited:
+            seg.text = best.text          # ユーザーの手直しを潰さない
+            seg.text_edited = True
+            carried_text += 1
+
     if carried:
         on_log(f"以前の割当 {carried} 区間を引き継ぎました。")
+    if carried_text:
+        on_log(f"手直しした本文 {carried_text} 区間を復元しました。")
     return carried
 
 
@@ -254,7 +319,9 @@ def run_segment_pipeline(
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
-    cache_suffix = ".cluster.vb.txt" if verbatim else ".cluster.txt"
+    # チャンク長をキャッシュ名に含める。含めないと、分割サイズを変えたときに
+    # 別の長さで作った転写を使い回してしまい、音声とテキストがずれる。
+    cache_suffix = f".cluster.c{chunk_seconds}{'.vb' if verbatim else ''}.txt"
 
     all_segments: list[Segment] = []
     for i, chunk in enumerate(chunks):
@@ -313,17 +380,12 @@ def run_segment_pipeline(
     if json_path.exists():
         try:
             old = Project.load(json_path)
+            # 話者リストを先に統合してから割当を移す(ID を保存するのが要点)
+            speakers = _merge_speakers(old.speakers, roster)
             _carry_over_assignments(old, all_segments, on_log)
-            if not speakers:
-                speakers = old.speakers
-            else:
-                # 既存の話者 ID を保ちながら、名簿に無い人は残す
-                known = {sp.name for sp in speakers}
-                speakers = speakers + [sp for sp in old.speakers if sp.name not in known]
-                for n, sp in enumerate(speakers):
-                    sp.order = n
         except Exception as e:  # 壊れた JSON は無視して作り直す
             on_log(f"既存の作業ファイルを読めませんでした({e})。新規作成します。")
+            speakers = parse_roster(roster)
 
     proj = Project(
         audio_path=str(audio_path),

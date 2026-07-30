@@ -33,6 +33,10 @@ SPECIAL_SPEAKERS: dict[str, str] = {
     SPECIAL_NOISE: "発言なし・雑音",
 }
 
+# 擬似クラスタの記号(transcribe.normalize_cluster_label の出力と対応)
+PSEUDO_UNKNOWN = "?"
+PSEUDO_MULTI = "*"
+
 
 def fmt_hms(seconds: float) -> str:
     """秒 → [HH:MM:SS] 用の 'HH:MM:SS' 文字列"""
@@ -135,12 +139,27 @@ class Segment:
     cluster: str                    # 例 "0:A"(チャンク0の発言者A)。声質ベースの仮ラベル
     chunk: int = 0
     speaker_id: Optional[str] = None    # 確定した話者(None = 未確定)
-    reviewed: bool = False              # ユーザーが目を通した(音声を聴いた)か
+    reviewed: bool = False              # この区間の音声を実際に聴いて確定したか
     note: str = ""
+    text_edited: bool = False           # ユーザーが本文を手直ししたか(再実行時に保護)
 
     @property
     def duration(self) -> float:
         return max(0.0, self.end - self.start)
+
+    @property
+    def cluster_tail(self) -> str:
+        """クラスタ記号だけ('0:A' → 'A')"""
+        return self.cluster.partition(":")[2] or self.cluster
+
+    @property
+    def is_pseudo_cluster(self) -> bool:
+        """『誰か判別できない』『複数人が重なっている』の擬似クラスタか。
+
+        これらは「同じ声のまとまり」ではなく雑多な寄せ集めなので、
+        学習にも一括適用にも使ってはいけない。
+        """
+        return self.cluster_tail in (PSEUDO_UNKNOWN, PSEUDO_MULTI)
 
     @property
     def cluster_label(self) -> str:
@@ -170,6 +189,7 @@ class Segment:
             speaker_id=d.get("speaker_id") or None,
             reviewed=bool(d.get("reviewed", False)),
             note=str(d.get("note", "")),
+            text_edited=bool(d.get("text_edited", False)),
         )
 
 
@@ -225,6 +245,19 @@ class Project:
     @property
     def assigned_count(self) -> int:
         return sum(1 for s in self.segments if s.speaker_id)
+
+    @property
+    def reviewed_count(self) -> int:
+        """実際に音声を聴いて確定した区間の数。
+
+        一括適用で埋めた区間は「確定はしているが未確認」なので、ここには入らない。
+        あとから未確認だけを拾い直せるようにするための区別。
+        """
+        return sum(1 for s in self.segments if s.speaker_id and s.reviewed)
+
+    @property
+    def unreviewed_count(self) -> int:
+        return sum(1 for s in self.segments if s.speaker_id and not s.reviewed)
 
     @property
     def total_count(self) -> int:
@@ -296,23 +329,21 @@ class Project:
 # Word 出力
 # ----------------------------------------------------------------------
 
-REVIEW_NOTE_TEMPLATE = (
-    "※ 話者ラベルはユーザーが音声を聴いて割り当てたものです"
-    "(確定 {done}/{total} 区間{unassigned_note})。"
-)
-
-
 def _merge_runs(
     proj: Project,
     merge_consecutive: bool = True,
+    drop_noise: bool = True,
 ) -> list[tuple[float, Optional[str], str]]:
     """(開始秒, 話者ID, 本文) の並びを作る。
     merge_consecutive=True なら、同一話者の連続区間を 1 段落にまとめる。
+    drop_noise=True なら「発言なし・雑音」と印を付けた区間は出力しない。
     """
     runs: list[tuple[float, Optional[str], list[str]]] = []
     for seg in proj.segments:
         text = seg.text.strip()
         if not text:
+            continue
+        if drop_noise and seg.speaker_id == SPECIAL_NOISE:
             continue
         if (
             merge_consecutive
@@ -323,7 +354,23 @@ def _merge_runs(
             runs[-1][2].append(text)
         else:
             runs.append((seg.start, seg.speaker_id, [text]))
-    return [(start, sid, " ".join(parts)) for start, sid, parts in runs]
+    # 日本語なので連結時に空白を挟まない
+    return [(start, sid, "".join(parts)) for start, sid, parts in runs]
+
+
+def build_note(proj: Project) -> str:
+    """docx 冒頭に入れる但し書き。何がどこまで人手で確認されたかを明示する。"""
+    parts = [
+        "※ 話者ラベルはユーザーが音声を聴いて割り当てたものです",
+        f"(全 {proj.total_count} 区間中、聴いて確定 {proj.reviewed_count} 区間",
+    ]
+    if proj.unreviewed_count:
+        parts.append(f"、まとめて適用 {proj.unreviewed_count} 区間")
+    unassigned = proj.total_count - proj.assigned_count
+    if unassigned:
+        parts.append(f"、未確定 {unassigned} 区間")
+    parts.append(")。")
+    return "".join(parts)
 
 
 def write_docx(
@@ -333,6 +380,8 @@ def write_docx(
     with_timestamps: bool = True,
     merge_consecutive: bool = True,
     include_note: bool = True,
+    include_attendees: bool = True,
+    drop_noise: bool = True,
 ) -> Path:
     """割当結果を Word ファイルに書き出す。"""
     from docx import Document
@@ -355,20 +404,20 @@ def write_docx(
 
     doc.add_heading(title or Path(proj.audio_path).stem, level=1)
 
-    if include_note:
-        unassigned = proj.total_count - proj.assigned_count
-        note = REVIEW_NOTE_TEMPLATE.format(
-            done=proj.assigned_count,
-            total=proj.total_count,
-            unassigned_note=f"・未確定 {unassigned} 区間" if unassigned else "",
-        )
+    if include_attendees and proj.speakers:
         p = doc.add_paragraph()
-        run = p.add_run(note)
+        head = p.add_run("出席者: ")
+        head.bold = True
+        p.add_run("、".join(sp.display for sp in proj.speakers))
+
+    if include_note:
+        p = doc.add_paragraph()
+        run = p.add_run(build_note(proj))
         run.italic = True
         run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
         doc.add_paragraph()
 
-    for start, sid, text in _merge_runs(proj, merge_consecutive):
+    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
         p = doc.add_paragraph()
         if with_timestamps:
             ts = p.add_run(f"[{fmt_hms(start)}] ")
@@ -377,19 +426,28 @@ def write_docx(
         label = sp.name if sp else UNKNOWN_LABEL
         name_run = p.add_run(f"【{label}】 ")
         name_run.bold = True
-        if sp is None:
+        if sid is None:
+            # 一度も触れられていない区間。要確認なので赤で目立たせる
             name_run.font.color.rgb = RGBColor(0xC0, 0x00, 0x00)
+        elif sid in SPECIAL_SPEAKERS:
+            # ユーザーが意図的に「不明」等と判断した区間はグレー
+            name_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
         p.add_run(text)
 
     doc.save(str(output_path))
     return output_path
 
 
-def write_text(proj: Project, output_path: Path | str, merge_consecutive: bool = True) -> Path:
-    """プレーンテキスト出力(確認・差分取り用)"""
+def write_text(
+    proj: Project,
+    output_path: Path | str,
+    merge_consecutive: bool = True,
+    drop_noise: bool = True,
+) -> Path:
+    """プレーンテキスト出力(自分のテンプレートに貼り込む場合や、差分取り用)"""
     output_path = Path(output_path)
     lines = []
-    for start, sid, text in _merge_runs(proj, merge_consecutive):
+    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
         sp = proj.speaker(sid)
         lines.append(f"[{fmt_hms(start)}] 【{sp.name if sp else UNKNOWN_LABEL}】 {text}")
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

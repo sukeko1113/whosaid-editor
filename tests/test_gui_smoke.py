@@ -18,7 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import tkinter as tk  # noqa: E402
 
-from src.assign_gui import AssignWindow, _apply_roster_text  # noqa: E402
+from src.assign_gui import (  # noqa: E402
+    FILTER_ALL,
+    FILTER_UNASSIGNED,
+    FILTER_UNREVIEWED,
+    AssignWindow,
+    plan_roster_text,
+)
 from src.segments import Project, SPECIAL_UNKNOWN, Segment, parse_roster  # noqa: E402
 
 
@@ -54,7 +60,8 @@ def run() -> int:
         root = tk.Tk()
         root.withdraw()
         win = AssignWindow(root, proj)
-        win.var_autoplay.set(False)   # 実音声を用意しないので自動再生は切る
+        win.var_autoplay.set(False)      # 実音声を用意しないので自動再生は切る
+        win.var_apply_cluster.set(False)  # 個別確定から検証する
         win.update()
 
         check("初期表示: 区間 40 件", len(win.tree.get_children()) == 40)
@@ -66,6 +73,7 @@ def run() -> int:
         win.assign(sato)
         win.update()
         check("確定後に 1 件カウント", proj.assigned_count == 1)
+        check("自分で聴いた区間は確認済み", proj.segments[0].reviewed is True)
         check("確定したら次の未確定へ進む", win.current == 1)
 
         # --- 学習: 同じクラスタで佐藤が 1 位に -------------------------
@@ -81,6 +89,9 @@ def run() -> int:
         win.update()
         cluster_size = len(proj.cluster_segments("0:A"))
         check("クラスタ一括適用", proj.assigned_count == cluster_size)
+        check("一括適用ぶんは未確認のまま",
+              proj.unreviewed_count == cluster_size - 2)   # index 0 と 3 は聴いて確定
+        check("一括適用の件数が画面に残る", "まとめて適用" in win.var_action.get())
         win.var_apply_cluster.set(False)
 
         # --- 取り消し ----------------------------------------------------
@@ -96,14 +107,44 @@ def run() -> int:
         check("不明ラベルを割り当てられる",
               proj.segments[1].speaker_id == SPECIAL_UNKNOWN)
 
-        # --- 未確定のみ表示 ---------------------------------------------
-        win.var_only_unassigned.set(True)
-        win.reload_tree()
+        # --- 未確定に戻す ------------------------------------------------
+        win.goto(1)
+        win.unassign()
         win.update()
-        visible = len(win.tree.get_children())
-        check("未確定のみ表示", visible == proj.total_count - proj.assigned_count)
-        win.var_only_unassigned.set(False)
-        win.reload_tree()
+        check("未確定に戻せる", proj.segments[1].speaker_id is None)
+
+        # --- 絞り込み ----------------------------------------------------
+        win.var_filter.set(FILTER_UNASSIGNED)
+        win._on_filter_change()
+        win.update()
+        check("未確定のみ表示",
+              len(win.tree.get_children()) == proj.total_count - proj.assigned_count)
+
+        win.var_apply_cluster.set(True)
+        win.var_filter.set(FILTER_ALL)
+        win._on_filter_change()
+        win.goto(1)
+        win.assign(proj.speakers[1].id)     # 0:B を一括で埋める
+        win.update()
+        win.var_filter.set(FILTER_UNREVIEWED)
+        win._on_filter_change()
+        win.update()
+        check("未確認のみ表示に一括適用ぶんが出る",
+              len(win.tree.get_children()) == proj.total_count - proj.reviewed_count)
+        win.var_apply_cluster.set(False)
+        win.var_filter.set(FILTER_ALL)
+        win._on_filter_change()
+        win.update()
+
+        # --- 絞り込み中の 1 件移動が飛ばさない ---------------------------
+        win.var_filter.set(FILTER_UNASSIGNED)
+        win._on_filter_change()
+        vis = win._visible_indexes()
+        win.current = -1                    # わざと表示外に置く
+        win.move(1)
+        check("絞り込み中でも 1 件ずつ進む", win.current == vis[0])
+        win.var_filter.set(FILTER_ALL)
+        win._on_filter_change()
         win.update()
 
         # --- 本文の編集 --------------------------------------------------
@@ -112,20 +153,46 @@ def run() -> int:
         win.txt_body.insert("1.0", "編集しました")
         win._commit_text()
         check("本文編集が反映される", proj.segments[5].text == "編集しました")
+        check("編集した印が付く", proj.segments[5].text_edited is True)
 
-        # --- 出席者の編集(ID を保ったまま) -----------------------------
-        added, removed, names = _apply_roster_text(proj, "佐藤(理事長)\n田中(事務局長)\n鈴木\n高橋")
-        check("出席者追加", added == 1 and removed == 0)
+        # --- 出席者の編集(下見してから適用) -----------------------------
+        plan = plan_roster_text(proj, "佐藤(理事長)\n田中(事務局長)\n鈴木\n高橋")
+        check("出席者追加の下見", plan.added == ["高橋"] and not plan.removed)
+        plan.apply(proj)
         check("既存 ID が保持される", proj.speakers[0].id == sato)
         check("確定済みの割当が壊れない", proj.segments[0].speaker_id == sato)
 
-        added, removed, names = _apply_roster_text(proj, "田中(事務局長)\n鈴木")
-        check("出席者削除で割当が外れる",
-              removed == 2 and proj.segments[0].speaker_id is None)
+        # 下見だけでは何も変わらないこと(『いいえ』を選んだ場合に相当)
+        snapshot = [(s.speaker_id, s.reviewed) for s in proj.segments]
+        plan = plan_roster_text(proj, "田中(事務局長)\n鈴木")
+        check("下見の時点では割当が消えない",
+              [(s.speaker_id, s.reviewed) for s in proj.segments] == snapshot)
+        check("削除の影響件数を数えられる", plan.affected_segments > 0)
+        plan.apply(proj)
+        check("適用すると割当が外れる", proj.segments[0].speaker_id is None)
 
-        # --- 次の未確定へジャンプ ---------------------------------------
+        # --- 同姓の人がいても取りこぼさない ------------------------------
+        dup = Project(audio_path="x.m4a")
+        dup.speakers = parse_roster("佐藤(理事)\n佐藤(監事)")
+        dup.segments = [Segment(index=0, start=0, end=1, text="a", cluster="0:A"),
+                        Segment(index=1, start=1, end=2, text="b", cluster="0:B")]
+        dup.segments[0].speaker_id = dup.speakers[0].id
+        dup.segments[1].speaker_id = dup.speakers[1].id
+        p2 = plan_roster_text(dup, "佐藤(理事)\n佐藤(監事)")
+        p2.apply(dup)
+        check("同姓 2 人がそのまま維持される",
+              [s.id for s in dup.speakers] == ["sp01", "sp02"]
+              and dup.segments[0].speaker_id == "sp01"
+              and dup.segments[1].speaker_id == "sp02")
+        p3 = plan_roster_text(dup, "佐藤(理事)")
+        check("同姓 1 人を消すと 1 区間だけ外れる", p3.affected_segments == 1)
+        p3.apply(dup)
+        check("残った側の割当は保たれる",
+              dup.segments[0].speaker_id == "sp01" and dup.segments[1].speaker_id is None)
+
+        # --- 次の対象へジャンプ ------------------------------------------
         win.goto(0)
-        win._goto_next_unassigned()
+        win._goto_next_target()
         win.update()
         check("次の未確定へ移動", not proj.segments[win.current].speaker_id)
 

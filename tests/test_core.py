@@ -21,7 +21,11 @@ from src.segments import (  # noqa: E402
     parse_roster,
     roster_to_text,
 )
-from src.suggest import SpeakerSuggester, next_unassigned  # noqa: E402
+from src.suggest import (  # noqa: E402
+    SpeakerSuggester,
+    next_unassigned,
+    next_unreviewed,
+)
 from src.transcribe import (  # noqa: E402
     build_prompt,
     normalize_cluster_label,
@@ -222,6 +226,76 @@ def test_rank_ignores_own_current_assignment():
     assert not ranked[0].reasons            # クラスタ投票の根拠は消えている
 
 
+def test_pseudo_clusters_are_not_learned():
+    """【?】【*】は「同じ声のまとまり」ではないので、投票にも一括適用にも使わない"""
+    proj = _make_project()
+    sato = proj.speakers[0]
+    for i, seg in enumerate(proj.segments):
+        seg.cluster = "0:?"
+    proj.segments[0].speaker_id = sato.id
+    s = SpeakerSuggester(proj)
+
+    top = s.rank(4)[0]
+    assert not top.reasons, "判別不能の区間から他の区間を推測してはいけない"
+    assert s.dominant_speaker("0:?") is None
+    assert proj.segments[4].is_pseudo_cluster is True
+    assert "一括適用は不可" in s.cluster_summary("0:?")
+
+
+def test_boundary_continuity_bonus():
+    """チャンク境界をまたぐ隣接区間は同一話者の可能性が高い"""
+    proj = Project(audio_path="x.m4a", duration=1200.0, chunk_seconds=600)
+    proj.speakers = parse_roster("佐藤\n田中\n鈴木")
+    sato, tanaka, _ = proj.speakers
+    proj.segments = [
+        Segment(index=0, start=560.0, end=595.0, text="…そこで", cluster="0:B", chunk=0),
+        Segment(index=1, start=600.0, end=630.0, text="申し上げた", cluster="1:A", chunk=1),
+        Segment(index=2, start=630.0, end=660.0, text="別の発言", cluster="1:B", chunk=1),
+    ]
+    proj.segments[0].speaker_id = tanaka.id
+    s = SpeakerSuggester(proj)
+
+    ranked = s.rank(1)
+    assert ranked[0].speaker.id == tanaka.id
+    assert "チャンク境界" in ranked[0].reason_text
+    # 境界でない区間には効かない
+    assert "チャンク境界" not in " ".join(c.reason_text for c in s.rank(2))
+
+
+def test_letter_prior_across_chunks():
+    """前のチャンクの A が誰だったかは、次のチャンクの A の弱い手がかりになる"""
+    proj = Project(audio_path="x.m4a", duration=1800.0, chunk_seconds=600)
+    proj.speakers = parse_roster("佐藤\n田中\n鈴木")
+    sato = proj.speakers[0]
+    segs = []
+    for i in range(6):
+        chunk = i // 2
+        segs.append(Segment(index=i, start=i * 100.0, end=i * 100.0 + 50,
+                            text=f"t{i}", cluster=f"{chunk}:{'AB'[i % 2]}", chunk=chunk))
+    proj.segments = segs
+    # チャンク 0 と 1 の A を佐藤で確定
+    proj.segments[0].speaker_id = sato.id
+    proj.segments[2].speaker_id = sato.id
+    s = SpeakerSuggester(proj)
+
+    # チャンク 2 の A(未確定・クラスタ票なし)でも佐藤が 1 位
+    ranked = s.rank(4)
+    assert ranked[0].speaker.id == sato.id
+    assert "別チャンクの 【A】" in ranked[0].reason_text
+
+
+def test_next_unreviewed():
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    proj.segments[0].speaker_id = sid
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = sid     # 一括適用ぶん(未確認)
+    assert proj.reviewed_count == 1
+    assert proj.unreviewed_count == 1
+    assert next_unreviewed(proj, 0) == 1
+    assert next_unassigned(proj, 0) == 2
+
+
 def test_next_unassigned():
     proj = _make_project()
     proj.segments[0].speaker_id = "sp01"
@@ -263,23 +337,63 @@ def test_remove_speaker_clears_assignments():
 
 def test_write_docx_merges_consecutive():
     from docx import Document
-    from src.segments import write_docx
+    from src.segments import SPECIAL_NOISE, write_docx
 
     proj = _make_project()
     sid = proj.speakers[0].id
     for i in (0, 1, 2):
         proj.segments[i].speaker_id = sid
+    proj.segments[3].speaker_id = SPECIAL_NOISE    # 出力から省かれるはず
     with tempfile.TemporaryDirectory() as d:
         out = Path(d) / "out.docx"
-        write_docx(proj, out)
+        write_docx(proj, out, title="第1回理事会")
         doc = Document(str(out))
         paras = [p.text for p in doc.paragraphs if p.text.strip()]
     body = [p for p in paras if p.startswith("[")]
-    # 連続する 3 区間が 1 段落にまとまる
+    # 連続する 3 区間が 1 段落にまとまる(日本語なので空白を挟まない)
     assert body[0].startswith("[00:00:00] 【佐藤】")
-    assert "あ い う" in body[0]
+    assert "あいう" in body[0]
+    # 表題・出席者一覧が入る
+    assert paras[0] == "第1回理事会"
+    assert any(p.startswith("出席者: 佐藤、田中、鈴木") for p in paras)
+    # 雑音と印を付けた区間は出ない
+    assert not any("え" == p[-1] for p in body if "【発言なし" in p)
+    assert all("発言なし・雑音" not in p for p in paras)
     # 未確定は【発言者不明】
     assert "【発言者不明】" in body[1]
+
+
+def test_write_docx_options():
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    for i in (0, 1):
+        proj.segments[i].speaker_id = sid
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, with_timestamps=False, merge_consecutive=False,
+                   include_attendees=False, include_note=False)
+        paras = [p.text for p in Document(str(out)).paragraphs if p.text.strip()]
+    assert not any(p.startswith("[") for p in paras)
+    assert not any(p.startswith("出席者:") for p in paras)
+    assert paras[1] == "【佐藤】 あ"      # まとめない
+    assert paras[2] == "【佐藤】 い"
+
+
+def test_build_note_distinguishes_reviewed():
+    from src.segments import build_note
+
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    proj.segments[0].speaker_id = sid
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = sid          # 一括適用ぶん
+    note = build_note(proj)
+    assert "聴いて確定 1 区間" in note
+    assert "まとめて適用 1 区間" in note
+    assert "未確定 8 区間" in note
 
 
 def test_fmt_hms():

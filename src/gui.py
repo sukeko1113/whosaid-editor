@@ -127,10 +127,11 @@ class App(tk.Tk):
             .grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
 
         ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
-        self.var_chunk = tk.IntVar(value=10)
+        # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
+        self.var_chunk = tk.IntVar(value=15)
         ttk.Spinbox(frm_adv, from_=1, to=30, textvariable=self.var_chunk, width=6)\
             .grid(row=2, column=1, sticky="w", padx=6, pady=4)
-        ttk.Label(frm_adv, text="(長すぎるとアップロード/転写が失敗しやすくなります)",
+        ttk.Label(frm_adv, text="(長いほど割当の手数が減りますが、転写の失敗率は上がります)",
                   foreground="#666").grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
 
         # タイムスタンプ・チェックボックス
@@ -571,4 +572,13 @@ class App(tk.Tk):
             if not messagebox.askyesno("確認", "処理中です。終了しますか?"):
                 return
             self._cancel_flag.set()
+        # メインウィンドウを destroy すると子ウィンドウの終了処理が走らないので、
+        # 割当画面に「保存してから閉じる」を先に実行させる(編集中の本文が消える)
+        win = self._assign_win
+        if win is not None:
+            try:
+                if win.winfo_exists():
+                    win._on_close()
+            except Exception:
+                pass
         self.destroy()

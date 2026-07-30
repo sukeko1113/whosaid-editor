@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tkinter as tk
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
@@ -32,8 +33,9 @@ from .segments import (
     parse_roster,
     roster_to_text,
     write_docx,
+    write_text,
 )
-from .suggest import SpeakerSuggester, next_unassigned
+from .suggest import SpeakerSuggester, next_unassigned, next_unreviewed
 
 
 SPEEDS = ["0.8x", "1.0x", "1.2x", "1.5x", "2.0x"]
@@ -48,46 +50,79 @@ COLOR_SPECIAL = "#9A9A9A"
 
 QUICK_KEYS = "123456789"
 
+# 一覧の絞り込み
+FILTER_ALL = "all"
+FILTER_UNASSIGNED = "unassigned"
+FILTER_UNREVIEWED = "unreviewed"
 
-def _apply_roster_text(proj: Project, text: str) -> tuple[int, int, list[str]]:
-    """出席者リストのテキストを Project に反映する。
+FILTER_LABELS = [
+    ("すべて表示", FILTER_ALL),
+    ("未確定のみ", FILTER_UNASSIGNED),
+    ("未確認のみ(一括適用したぶんを含む)", FILTER_UNREVIEWED),
+]
 
-    既存の話者 ID は名前一致で保持するので、既に確定した区間の割当は壊れない。
-    戻り値: (追加数, 削除数, 削除された話者名)
+
+@dataclass
+class RosterPlan:
+    """出席者リストの変更内容(まだ適用していない下見)。
+
+    「消してから確認する」と、確認で『いいえ』を選んでも割当が戻らない。
+    先に計画を立てて、確認が済んでから apply() する。
+    """
+
+    speakers: list[Speaker]                 # 適用後の話者リスト
+    added: list[str]
+    removed: list[Speaker]
+    affected_segments: int                  # 削除によって未確定に戻る区間数
+
+    def apply(self, proj: Project) -> None:
+        removed_ids = {sp.id for sp in self.removed}
+        proj.speakers = self.speakers
+        if removed_ids:
+            for seg in proj.segments:
+                if seg.speaker_id in removed_ids:
+                    seg.speaker_id = None
+                    seg.reviewed = False
+
+
+def plan_roster_text(proj: Project, text: str) -> RosterPlan:
+    """出席者リストのテキストから変更計画を作る(この時点では何も変えない)。
+
+    既存の話者 ID は名前一致で保持する。ID を振り直すと、確定済み区間が
+    別人を指してしまうため。同姓の人が複数いても 1 人ずつ対応付ける。
     """
     wanted = parse_roster(text)
-    by_name = {sp.name: sp for sp in proj.speakers}
 
+    remaining: dict[str, list[Speaker]] = {}
+    for sp in proj.speakers:
+        remaining.setdefault(sp.name, []).append(sp)
+
+    used_ids = {sp.id for sp in proj.speakers}
     new_list: list[Speaker] = []
-    added = 0
-    for i, w in enumerate(wanted):
-        existing = by_name.pop(w.name, None)
-        if existing:
-            existing.note = w.note
-            existing.order = i
-            new_list.append(existing)
+    added: list[str] = []
+
+    for w in wanted:
+        pool = remaining.get(w.name)
+        if pool:
+            src = pool.pop(0)
+            new_list.append(Speaker(id=src.id, name=src.name, note=w.note, order=0))
         else:
-            sid = _fresh_id(proj, new_list)
-            new_list.append(Speaker(id=sid, name=w.name, note=w.note, order=i))
-            added += 1
+            i = 1
+            while f"sp{i:02d}" in used_ids:
+                i += 1
+            sid = f"sp{i:02d}"
+            used_ids.add(sid)
+            new_list.append(Speaker(id=sid, name=w.name, note=w.note, order=0))
+            added.append(w.name)
 
-    removed_names = [sp.name for sp in by_name.values()]
-    removed_ids = {sp.id for sp in by_name.values()}
-    proj.speakers = new_list
-    if removed_ids:
-        for seg in proj.segments:
-            if seg.speaker_id in removed_ids:
-                seg.speaker_id = None
-                seg.reviewed = False
-    return added, len(removed_names), removed_names
+    removed = [sp for pool in remaining.values() for sp in pool]
+    for i, sp in enumerate(new_list):
+        sp.order = i
 
-
-def _fresh_id(proj: Project, pending: list[Speaker]) -> str:
-    used = {sp.id for sp in proj.speakers} | {sp.id for sp in pending}
-    i = 1
-    while f"sp{i:02d}" in used:
-        i += 1
-    return f"sp{i:02d}"
+    removed_ids = {sp.id for sp in removed}
+    affected = sum(1 for s in proj.segments if s.speaker_id in removed_ids)
+    return RosterPlan(speakers=new_list, added=added, removed=removed,
+                      affected_segments=affected)
 
 
 class AssignWindow(tk.Toplevel):
@@ -113,10 +148,13 @@ class AssignWindow(tk.Toplevel):
         self.var_speed = tk.StringVar(value="1.0x")
         self.var_autoplay = tk.BooleanVar(value=True)
         self.var_advance = tk.BooleanVar(value=True)
-        self.var_apply_cluster = tk.BooleanVar(value=False)
-        self.var_only_unassigned = tk.BooleanVar(value=False)
+        # 一括適用は既定で ON。これが推奨の進め方で、これを使わないと
+        # 90 分の会議で数百回の判断が必要になる。
+        self.var_apply_cluster = tk.BooleanVar(value=True)
+        self.var_filter = tk.StringVar(value=FILTER_ALL)
         self.var_status = tk.StringVar(value="")
         self.var_seginfo = tk.StringVar(value="")
+        self.var_action = tk.StringVar(value="")
         self.var_backend = tk.StringVar(value="")
 
         self._build_ui()
@@ -166,10 +204,11 @@ class AssignWindow(tk.Toplevel):
 
         filt = ttk.Frame(left)
         filt.grid(row=0, column=0, sticky="ew", pady=(0, 4))
-        ttk.Checkbutton(filt, text="未確定のみ表示", variable=self.var_only_unassigned,
-                        command=self.reload_tree).pack(side="left")
-        ttk.Label(filt, text="  (↑↓ で移動 / Tab で次の未確定へ)", foreground="#777")\
-            .pack(side="left")
+        for label, value in FILTER_LABELS:
+            ttk.Radiobutton(
+                filt, text=label, value=value, variable=self.var_filter,
+                command=self._on_filter_change, takefocus=False,
+            ).pack(side="left", padx=(0, 8))
 
         cols = ("time", "cluster", "speaker", "text")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
@@ -187,6 +226,7 @@ class AssignWindow(tk.Toplevel):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.tag_configure("unassigned", background="#FFF8E1")
+        self.tree.tag_configure("bulk", background="#F1F6FB")
         self.tree.tag_configure("special", foreground="#8A8A8A")
 
         right = ttk.Frame(body)
@@ -220,10 +260,13 @@ class AssignWindow(tk.Toplevel):
         ttk.Label(frm_play, text="速度:").grid(row=0, column=2, padx=(12, 2))
         ttk.Combobox(frm_play, values=SPEEDS, textvariable=self.var_speed,
                      state="readonly", width=6).grid(row=0, column=3)
-        ttk.Checkbutton(frm_play, text="移動したら自動再生", variable=self.var_autoplay)\
-            .grid(row=0, column=4, padx=(12, 4))
+        ttk.Button(frm_play, text="この先30秒▶",
+                   command=lambda: self.play_current(extend=30.0, explicit=True))\
+            .grid(row=0, column=4, padx=4, pady=6)
+        ttk.Checkbutton(frm_play, text="移動したら自動再生", variable=self.var_autoplay,
+                        takefocus=False).grid(row=0, column=5, padx=(12, 4))
         ttk.Label(frm_play, textvariable=self.var_backend, foreground="#888")\
-            .grid(row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
+            .grid(row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
 
         # --- 候補者リスト ----------------------------------------------
         frm_cand = ttk.LabelFrame(right, text="話者を選ぶ(数字キーで即確定・可能性の高い順)")
@@ -234,22 +277,30 @@ class AssignWindow(tk.Toplevel):
         self.cand_holder.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
         self.cand_holder.columnconfigure(0, weight=1)
 
+        # 直前の操作の結果。区間を移動しても消えないように専用の行にする
+        # (一括適用が何区間に効いたのかが分からないと、事故に気づけない)
+        ttk.Label(frm_cand, textvariable=self.var_action, foreground="#1B5E20",
+                  wraplength=560).grid(row=1, column=0, sticky="w", padx=8, pady=(2, 0))
+
         opts = ttk.Frame(frm_cand)
-        opts.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 6))
+        opts.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
         ttk.Checkbutton(opts, text="同じ声のまとまり全体に適用 (A)",
-                        variable=self.var_apply_cluster).pack(side="left")
-        ttk.Checkbutton(opts, text="確定したら次の未確定へ", variable=self.var_advance)\
-            .pack(side="left", padx=12)
-        ttk.Button(opts, text="不明にする (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))\
+                        variable=self.var_apply_cluster, takefocus=False).pack(side="left")
+        ttk.Checkbutton(opts, text="確定したら次へ", variable=self.var_advance,
+                        takefocus=False).pack(side="left", padx=12)
+        ttk.Button(opts, text="不明 (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))\
             .pack(side="right")
-        ttk.Button(opts, text="取り消し (Ctrl+Z)", command=self.undo).pack(side="right", padx=6)
+        ttk.Button(opts, text="未確定に戻す (D)", command=self.unassign).pack(side="right", padx=6)
+        ttk.Button(opts, text="取り消し (Ctrl+Z)", command=self.undo).pack(side="right")
 
         # --- 下部: ボタン ----------------------------------------------
         bottom = ttk.Frame(self, padding=(10, 4, 10, 10))
         bottom.grid(row=3, column=0, sticky="ew")
         ttk.Button(bottom, text="出席者を編集...", command=self.edit_roster).pack(side="left")
-        ttk.Button(bottom, text="未確定を一覧...", command=self.show_remaining).pack(side="left", padx=6)
-        ttk.Button(bottom, text="Word で出力", command=self.export_docx).pack(side="right")
+        ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
+        ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
+            .pack(side="left")
+        ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
         self.var_backend.set({
@@ -264,18 +315,23 @@ class AssignWindow(tk.Toplevel):
         self.bind("<Return>", lambda e: self._key_enter())
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-s>", lambda e: self.save())
-        self.bind("<Tab>", lambda e: self._goto_next_unassigned())
-        self.bind("<Shift-Tab>", lambda e: self._goto_next_unassigned(forward=False))
+        self.bind("<Tab>", lambda e: self._guarded_break(self._goto_next_target))
+        self.bind("<Shift-Tab>",
+                  lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
         # X11 では Shift+Tab は ISO_Left_Tab として届く
-        self.bind("<ISO_Left_Tab>", lambda e: self._goto_next_unassigned(forward=False))
+        self.bind("<ISO_Left_Tab>",
+                  lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
         for ch in QUICK_KEYS:
             self.bind(ch, self._key_digit)
-        self.bind("u", lambda e: self._guarded(lambda: self.assign(SPECIAL_UNKNOWN)))
-        self.bind("U", lambda e: self._guarded(lambda: self.assign(SPECIAL_UNKNOWN)))
-        self.bind("a", lambda e: self._guarded(self._toggle_cluster_mode))
-        self.bind("A", lambda e: self._guarded(self._toggle_cluster_mode))
-        self.bind("j", lambda e: self._guarded(lambda: self.move(1)))
-        self.bind("k", lambda e: self._guarded(lambda: self.move(-1)))
+        for key, fn in (
+            ("u", lambda: self.assign(SPECIAL_UNKNOWN)),
+            ("d", self.unassign),
+            ("a", self._toggle_cluster_mode),
+            ("j", lambda: self.move(1)),
+            ("k", lambda: self.move(-1)),
+        ):
+            self.bind(key, lambda e, f=fn: self._guarded(f))
+            self.bind(key.upper(), lambda e, f=fn: self._guarded(f))
 
     def _typing(self) -> bool:
         """本文編集中はショートカットを無効にする"""
@@ -286,6 +342,17 @@ class AssignWindow(tk.Toplevel):
             return None
         fn()
         return "break"
+
+    def _guarded_break(self, fn) -> Optional[str]:
+        """Tab のように、本文編集中は既定動作(フォーカス移動)を残したいもの用。"""
+        if self._typing():
+            return None
+        fn()
+        return "break"
+
+    def _set_action(self, message: str) -> None:
+        """直前の操作の結果を、区間を移動しても消えない場所に表示する。"""
+        self.var_action.set(message)
 
     def _key_space(self, event) -> Optional[str]:
         if self._typing():
@@ -332,15 +399,51 @@ class AssignWindow(tk.Toplevel):
         self.show_current()
 
     def update_status(self) -> None:
-        done, total = self.proj.assigned_count, self.proj.total_count
+        total = self.proj.total_count
+        done = self.proj.assigned_count
+        heard = self.proj.reviewed_count
+        bulk = self.proj.unreviewed_count
         pct = (done / total * 100) if total else 0
         self.progress.configure(maximum=max(1, total), value=done)
-        self.var_status.set(f"{done} / {total} 区間 確定 ({pct:.0f}%)")
+        text = f"確定 {done}/{total} ({pct:.0f}%)  聴いて確定 {heard}"
+        if bulk:
+            text += f" / まとめて適用 {bulk}"
+        self.var_status.set(text)
+
+    # -------------------------------------------------- 絞り込みと移動
+    def _match_filter(self, seg) -> bool:
+        mode = self.var_filter.get()
+        if mode == FILTER_UNASSIGNED:
+            return not seg.speaker_id
+        if mode == FILTER_UNREVIEWED:
+            return not (seg.speaker_id and seg.reviewed)
+        return True
 
     def _visible_indexes(self) -> list[int]:
-        if self.var_only_unassigned.get():
-            return [s.index for s in self.proj.segments if not s.speaker_id]
-        return [s.index for s in self.proj.segments]
+        if self.var_filter.get() == FILTER_ALL:
+            return [s.index for s in self.proj.segments]
+        return [s.index for s in self.proj.segments if self._match_filter(s)]
+
+    def _remaining_count(self) -> int:
+        """今の絞り込み基準で、まだ手を付けていない区間の数。"""
+        if self.var_filter.get() == FILTER_UNREVIEWED:
+            return self.proj.total_count - self.proj.reviewed_count
+        return self.proj.total_count - self.proj.assigned_count
+
+    def _next_target(self, from_index: int, forward: bool = True) -> Optional[int]:
+        """次に処理すべき区間。絞り込みが『未確認のみ』なら未確認を、
+        それ以外なら未確定を探す。"""
+        if self.var_filter.get() == FILTER_UNREVIEWED:
+            return next_unreviewed(self.proj, from_index, forward)
+        return next_unassigned(self.proj, from_index, forward)
+
+    def _on_filter_change(self) -> None:
+        self.reload_tree()
+        vis = self._visible_indexes()
+        if vis and self.current not in vis:
+            self.goto(vis[0])
+        label = dict((v, k) for k, v in FILTER_LABELS).get(self.var_filter.get(), "")
+        self._set_action(f"表示: {label}({len(vis)} 区間)")
 
     def reload_tree(self) -> None:
         sel = self.current
@@ -352,35 +455,34 @@ class AssignWindow(tk.Toplevel):
         self._draw_timeline()
         self._select_index(sel, scroll=True)
 
-    def _insert_row(self, seg) -> str:
+    def _row_values(self, seg) -> tuple[tuple, tuple]:
         name = self.proj.speaker_name(seg.speaker_id)
-        tags = []
+        mark = ""
+        tags: list[str] = []
         if not seg.speaker_id:
             tags.append("unassigned")
-        elif seg.speaker_id in (SPECIAL_UNKNOWN, SPECIAL_MULTI, SPECIAL_NOISE):
-            tags.append("special")
-        return self.tree.insert(
-            "", "end", iid=f"s{seg.index}",
-            values=(fmt_hms(seg.start), seg.cluster_label, name or "—", seg.preview(70)),
-            tags=tuple(tags),
-        )
+        else:
+            if seg.speaker_id in (SPECIAL_UNKNOWN, SPECIAL_MULTI, SPECIAL_NOISE):
+                tags.append("special")
+            if not seg.reviewed:
+                tags.append("bulk")
+                mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
+            else:
+                mark = "✓"
+        values = (fmt_hms(seg.start), seg.cluster_label,
+                  f"{mark}{name}" if name else "—", seg.preview(70))
+        return values, tuple(tags)
+
+    def _insert_row(self, seg) -> str:
+        values, tags = self._row_values(seg)
+        return self.tree.insert("", "end", iid=f"s{seg.index}", values=values, tags=tags)
 
     def _update_row(self, index: int) -> None:
         iid = f"s{index}"
         if not self.tree.exists(iid):
             return
-        seg = self.proj.segments[index]
-        name = self.proj.speaker_name(seg.speaker_id)
-        tags = []
-        if not seg.speaker_id:
-            tags.append("unassigned")
-        elif seg.speaker_id in (SPECIAL_UNKNOWN, SPECIAL_MULTI, SPECIAL_NOISE):
-            tags.append("special")
-        self.tree.item(
-            iid,
-            values=(fmt_hms(seg.start), seg.cluster_label, name or "—", seg.preview(70)),
-            tags=tuple(tags),
-        )
+        values, tags = self._row_values(self.proj.segments[index])
+        self.tree.item(iid, values=values, tags=tags)
 
     def _speaker_color(self, speaker_id: Optional[str]) -> str:
         if not speaker_id:
@@ -461,34 +563,52 @@ class AssignWindow(tk.Toplevel):
             self.play_current()
 
     def move(self, delta: int) -> None:
+        """一覧上で delta 件ぶん移動する。
+
+        現在位置が絞り込みで隠れている場合は、まず進行方向の最寄りに
+        「吸い付く」だけにする(そこから更に delta 進めると 1 件飛ばしになる)。
+        """
         vis = self._visible_indexes()
         if not vis:
             return
         if self.current in vis:
             pos = vis.index(self.current)
+            target = vis[max(0, min(pos + delta, len(vis) - 1))]
+        elif delta >= 0:
+            later = [i for i in vis if i > self.current]
+            target = later[0] if later else vis[-1]
         else:
-            pos = min(range(len(vis)), key=lambda i: abs(vis[i] - self.current))
-        self.goto(vis[max(0, min(pos + delta, len(vis) - 1))])
+            earlier = [i for i in vis if i < self.current]
+            target = earlier[-1] if earlier else vis[0]
+        self.goto(target)
 
-    def _goto_next_unassigned(self, forward: bool = True) -> str:
-        nxt = next_unassigned(self.proj, self.current, forward)
+    def _goto_next_target(self, forward: bool = True) -> None:
+        """次に手を付けるべき区間へ。絞り込みの基準に従う。"""
+        nxt = self._next_target(self.current, forward)
         if nxt is None:
             self.bell()
-            self.var_seginfo.set(self.var_seginfo.get() + "   ← これ以降に未確定はありません")
+            direction = "この先" if forward else "ここより前"
+            remaining = self._remaining_count()
+            if remaining:
+                self._set_action(f"{direction}に対象はありません(全体ではあと {remaining} 区間)。")
+            else:
+                self._set_action("残りの区間はありません。")
         else:
             self.goto(nxt)
-        return "break"
 
     def show_current(self) -> None:
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
         pos = self.current + 1
+        state = "未確定"
+        if seg.speaker_id:
+            state = "確認済み" if seg.reviewed else "△まとめて適用(未確認)"
         self.var_seginfo.set(
             f"区間 {pos}/{len(self.proj.segments)}   "
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒   "
-            f"声のまとまり {seg.cluster_label}  "
-            f"({self.suggester.cluster_summary(seg.cluster)})"
+            f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
+            f"{state}"
         )
         self.txt_body.delete("1.0", "end")
         self.txt_body.insert("1.0", seg.text)
@@ -502,6 +622,7 @@ class AssignWindow(tk.Toplevel):
         seg = self.proj.segments[self.current]
         if new != seg.text:
             seg.text = new
+            seg.text_edited = True      # 再実行時に上書きされないよう印を付ける
             self._dirty = True
             self._update_row(seg.index)
 
@@ -551,14 +672,30 @@ class AssignWindow(tk.Toplevel):
     # ==================================================================
     # 割当
     # ==================================================================
-    def assign(self, speaker_id: str) -> None:
+    def assign(self, speaker_id: Optional[str]) -> None:
+        """現在の区間(設定によっては同じクラスタ全体)に話者を割り当てる。
+
+        speaker_id=None なら未確定に戻す。
+        一括適用したぶんは reviewed=False のままにする。「確定はしたが
+        自分の耳では聴いていない」区間をあとから見直せるようにするため。
+        """
         if not self.proj.segments:
             return
         self._commit_text()
         seg = self.proj.segments[self.current]
 
+        bulk = self.var_apply_cluster.get() and speaker_id is not None
+        if bulk and seg.is_pseudo_cluster:
+            messagebox.showwarning(
+                "一括適用できません",
+                f"{seg.cluster_label} は「判別できなかった/複数人が重なった」区間の寄せ集めで、"
+                "同じ声のまとまりではありません。\n\nこの区間だけを確定します。",
+                parent=self,
+            )
+            bulk = False
+
         targets = [seg]
-        if self.var_apply_cluster.get():
+        if bulk:
             targets = [
                 s for s in self.proj.cluster_segments(seg.cluster)
                 if s.index == seg.index or not s.speaker_id
@@ -570,7 +707,8 @@ class AssignWindow(tk.Toplevel):
 
         for s in targets:
             s.speaker_id = speaker_id
-            s.reviewed = True
+            # 自分で聴いた区間だけ「確認済み」。まとめて埋めた分は未確認扱い。
+            s.reviewed = bool(speaker_id) and s.index == seg.index
         self._dirty = True
 
         self.suggester.refresh()
@@ -579,21 +717,75 @@ class AssignWindow(tk.Toplevel):
         self.update_status()
         self._draw_timeline()
 
+        name = self.proj.speaker_name(speaker_id) or "未確定"
         if len(targets) > 1:
-            name = self.proj.speaker_name(speaker_id)
-            self.var_seginfo.set(f"「{name}」を {len(targets)} 区間にまとめて適用しました。")
+            self._set_action(
+                f"「{name}」を {len(targets)} 区間にまとめて適用しました"
+                f"(うち {len(targets) - 1} 区間は未確認)。取り消しは Ctrl+Z。"
+            )
+        else:
+            self._set_action(f"[{fmt_hms(seg.start)}] を「{name}」に確定しました。")
 
+        self._after_change()
+
+    def unassign(self) -> None:
+        """未確定に戻す。一括適用を間違えたときの復旧に使う。"""
+        self.assign(None)
+
+    def unassign_cluster(self) -> None:
+        """現在のクラスタの割当をまとめて未確定に戻す。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        targets = [s for s in self.proj.cluster_segments(seg.cluster) if s.speaker_id]
+        if not targets:
+            self._set_action("このまとまりに確定済みの区間はありません。")
+            return
+        if not messagebox.askyesno(
+            "確認",
+            f"{seg.cluster_label} の {len(targets)} 区間をすべて未確定に戻します。よろしいですか?",
+            parent=self,
+        ):
+            return
+        self._undo.append([(s.index, s.speaker_id, s.reviewed) for s in targets])
+        del self._undo[:-200]
+        for s in targets:
+            s.speaker_id = None
+            s.reviewed = False
+        self._dirty = True
+        self.suggester.refresh()
+        self.update_status()
+        self._set_action(f"{seg.cluster_label} の {len(targets)} 区間を未確定に戻しました。")
+        self.reload_tree()
+        self.show_current()
+
+    def _after_change(self) -> None:
+        """割当後の移動・再描画。"""
         if self.var_advance.get():
-            nxt = next_unassigned(self.proj, self.current, True)
+            nxt = self._next_target(self.current)
             if nxt is not None:
-                if self.var_only_unassigned.get():
+                if self.var_filter.get() != FILTER_ALL:
                     self.reload_tree()
                 self.goto(nxt)
                 return
-            self.player.stop()
-            self._rebuild_candidates()
-            messagebox.showinfo("完了", "未確定の区間がなくなりました。\nWord で出力できます。", parent=self)
-        if self.var_only_unassigned.get():
+            # 前方に対象が無い。ファイル全体で本当に終わっているかを確認する
+            if self._remaining_count() == 0:
+                self.player.stop()
+                self._rebuild_candidates()
+                messagebox.showinfo(
+                    "完了",
+                    "すべての区間の話者が確定しました。\nWord で出力できます。",
+                    parent=self,
+                )
+            else:
+                back = self._next_target(self.current, forward=False)
+                if back is not None:
+                    self._set_action("ここから先は対象がありません。前方の残りへ戻りました。")
+                    if self.var_filter.get() != FILTER_ALL:
+                        self.reload_tree()
+                    self.goto(back)
+                    return
+        if self.var_filter.get() != FILTER_ALL:
             self.reload_tree()
         else:
             self._rebuild_candidates()
@@ -601,6 +793,7 @@ class AssignWindow(tk.Toplevel):
     def undo(self) -> None:
         if not self._undo:
             self.bell()
+            self._set_action("取り消せる操作がありません。")
             return
         snapshot = self._undo.pop()
         for index, sid, reviewed in snapshot:
@@ -609,12 +802,13 @@ class AssignWindow(tk.Toplevel):
             seg.reviewed = reviewed
         self._dirty = True
         self.suggester.refresh()
-        if self.var_only_unassigned.get():
+        if self.var_filter.get() != FILTER_ALL:
             self.reload_tree()
         else:
             for index, _, _ in snapshot:
                 self._update_row(index)
         self.update_status()
+        self._set_action(f"{len(snapshot)} 区間の操作を取り消しました。")
         self.goto(snapshot[0][0])
 
     # ==================================================================
@@ -633,7 +827,13 @@ class AssignWindow(tk.Toplevel):
         else:
             self.play_current(explicit=True)
 
-    def play_current(self, back: float = 0.0, explicit: bool = False) -> None:
+    def play_current(self, back: float = 0.0, extend: float = 0.0,
+                     explicit: bool = False) -> None:
+        """現在区間を再生する。
+
+        back: 開始を何秒さかのぼるか(文脈を聴きたいとき)
+        extend: 終了を何秒延ばすか(区切りが早すぎたと感じたとき)
+        """
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
@@ -656,7 +856,7 @@ class AssignWindow(tk.Toplevel):
             self.player.play(
                 audio,
                 start=max(0.0, seg.start - back),
-                end=seg.end,
+                end=seg.end + extend,
                 speed=self._speed(),
             )
             self.btn_play.configure(text="■ 停止 (Space)")
@@ -715,16 +915,18 @@ class AssignWindow(tk.Toplevel):
         btns.grid(row=2, column=0, sticky="ew", padx=10, pady=10)
 
         def ok() -> None:
-            text = txt.get("1.0", "end")
-            added, removed, names = _apply_roster_text(self.proj, text)
-            if removed:
-                if not messagebox.askyesno(
-                    "確認",
-                    "次の出席者が削除されます。その人に割り当てていた区間は未確定に戻ります。\n\n"
-                    + "、".join(names),
-                    parent=dlg,
-                ):
-                    return
+            plan = plan_roster_text(self.proj, txt.get("1.0", "end"))
+            if plan.removed:
+                names = "、".join(sp.display for sp in plan.removed)
+                detail = (
+                    f"次の出席者が削除されます:\n\n{names}\n\n"
+                    + (f"この人たちに割り当てていた {plan.affected_segments} 区間は未確定に戻ります。\n"
+                       if plan.affected_segments else "")
+                    + "続けますか?"
+                )
+                if not messagebox.askyesno("確認", detail, parent=dlg):
+                    return          # ここまで何も変更していないので、そのまま編集を続けられる
+            plan.apply(self.proj)
             self._dirty = True
             dlg.destroy()
             self.refresh_all()
@@ -734,17 +936,35 @@ class AssignWindow(tk.Toplevel):
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     def show_remaining(self) -> None:
-        remaining = [s for s in self.proj.segments if not s.speaker_id]
-        by_cluster: dict[str, int] = {}
-        for s in remaining:
-            by_cluster[s.cluster_label] = by_cluster.get(s.cluster_label, 0) + 1
-        if not remaining:
-            messagebox.showinfo("未確定", "未確定の区間はありません。", parent=self)
+        """残作業の内訳。未確定と「まとめて適用しただけ(未確認)」を分けて出す。"""
+        unassigned = [s for s in self.proj.segments if not s.speaker_id]
+        unreviewed = [s for s in self.proj.segments if s.speaker_id and not s.reviewed]
+
+        if not unassigned and not unreviewed:
+            messagebox.showinfo(
+                "残作業", "すべての区間を聴いて確定済みです。", parent=self)
             return
-        lines = [f"未確定 {len(remaining)} 区間", ""]
-        lines += [f"  {k}: {v} 区間" for k, v in sorted(by_cluster.items(), key=lambda x: -x[1])]
-        lines += ["", "「同じ声のまとまり全体に適用」を使うと、まとまり単位で一気に確定できます。"]
-        messagebox.showinfo("未確定の内訳", "\n".join(lines), parent=self)
+
+        def breakdown(segs) -> list[str]:
+            counts: dict[str, int] = {}
+            for s in segs:
+                counts[s.cluster_label] = counts.get(s.cluster_label, 0) + 1
+            return [f"    {k}: {v} 区間"
+                    for k, v in sorted(counts.items(), key=lambda x: -x[1])]
+
+        lines: list[str] = []
+        if unassigned:
+            lines += [f"■ 未確定(話者が入っていない): {len(unassigned)} 区間"]
+            lines += breakdown(unassigned)
+            lines += ["", "  「同じ声のまとまり全体に適用」で、まとまり単位に一気に確定できます。", ""]
+        if unreviewed:
+            lines += [f"■ 未確認(まとめて適用しただけ): {len(unreviewed)} 区間"]
+            lines += breakdown(unreviewed)
+            lines += ["",
+                      "  左上の「未確認のみ」に切り替えると、この区間だけを Tab で",
+                      "  たどって聴き直せます。正しければ同じ話者をもう一度選べば",
+                      "  「確認済み」になります。"]
+        messagebox.showinfo("残作業の内訳", "\n".join(lines), parent=self)
 
     def save(self) -> None:
         self._commit_text()
@@ -772,20 +992,66 @@ class AssignWindow(tk.Toplevel):
     def export_docx(self) -> None:
         self._commit_text()
         self.save()
+
+        dlg = tk.Toplevel(self)
+        dlg.title("出力の設定")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.columnconfigure(1, weight=1)
+
+        warn = []
         unassigned = self.proj.total_count - self.proj.assigned_count
         if unassigned:
-            if not messagebox.askyesno(
-                "未確定があります",
-                f"未確定の区間が {unassigned} 件あります。\n"
-                "未確定は【発言者不明】として出力されます。続けますか?",
-                parent=self,
-            ):
-                return
+            warn.append(f"未確定 {unassigned} 区間は【発言者不明】(赤字)になります。")
+        if self.proj.unreviewed_count:
+            warn.append(
+                f"まとめて適用しただけで未確認の区間が {self.proj.unreviewed_count} あります。")
+        if warn:
+            ttk.Label(dlg, text="\n".join(warn), foreground="#B71C1C", justify="left")\
+                .grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        ttk.Label(dlg, text="表題:").grid(row=1, column=0, sticky="w", padx=(12, 4), pady=4)
+        var_title = tk.StringVar(value=Path(self.proj.audio_path).stem)
+        ent = ttk.Entry(dlg, textvariable=var_title, width=42)
+        ent.grid(row=1, column=1, sticky="ew", padx=(0, 12), pady=4)
+        ent.focus_set()
+
+        var_ts = tk.BooleanVar(value=True)
+        var_merge = tk.BooleanVar(value=True)
+        var_attend = tk.BooleanVar(value=True)
+        var_noise = tk.BooleanVar(value=True)
+        var_txt = tk.BooleanVar(value=False)
+        for i, (text, var) in enumerate((
+            ("段落の先頭に時刻を入れる", var_ts),
+            ("同じ話者の連続発言をまとめる", var_merge),
+            ("冒頭に出席者一覧を入れる", var_attend),
+            ("「発言なし・雑音」と印を付けた区間を省く", var_noise),
+            ("同じ内容のテキストファイル(.txt)も出す", var_txt),
+        )):
+            ttk.Checkbutton(dlg, text=text, variable=var)\
+                .grid(row=2 + i, column=0, columnspan=2, sticky="w", padx=12, pady=1)
+
+        result: dict[str, object] = {}
+
+        def ok() -> None:
+            result["go"] = True
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.grid(row=8, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
+        ttk.Button(btns, text="保存先を選ぶ...", command=ok).pack(side="right")
+        ttk.Button(btns, text="キャンセル", command=dlg.destroy).pack(side="right", padx=6)
+        dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        self.wait_window(dlg)
+        if not result.get("go"):
+            return
+
         default_dir = str(Path(self.proj.json_path or self.proj.audio_path).parent)
         path = filedialog.asksaveasfilename(
             title="Word ファイルの保存先",
             initialdir=default_dir,
-            initialfile=f"{Path(self.proj.audio_path).stem}.docx",
+            initialfile=f"{var_title.get() or Path(self.proj.audio_path).stem}.docx",
             defaultextension=".docx",
             filetypes=[("Word 文書", "*.docx")],
             parent=self,
@@ -793,7 +1059,17 @@ class AssignWindow(tk.Toplevel):
         if not path:
             return
         try:
-            out = write_docx(self.proj, path)
+            out = write_docx(
+                self.proj, path,
+                title=var_title.get() or None,
+                with_timestamps=var_ts.get(),
+                merge_consecutive=var_merge.get(),
+                include_attendees=var_attend.get(),
+                drop_noise=var_noise.get(),
+            )
+            if var_txt.get():
+                write_text(self.proj, Path(path).with_suffix(".txt"),
+                           merge_consecutive=var_merge.get(), drop_noise=var_noise.get())
         except Exception:
             messagebox.showerror("出力エラー", traceback.format_exc(), parent=self)
             return

@@ -134,6 +134,64 @@ def run() -> int:
             check("引き継ぎ先が正しい話者",
                   all(s.speaker_id == sid for s in proj2.segments[:5]))
 
+            # --- 名簿を並べ替えて再実行しても人が入れ替わらないこと ---------
+            # 話者 ID を振り直すと、確定済みの区間が別人を指してしまう
+            proj3 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False,
+                roster="鈴木\n佐藤(理事長)\n田中",      # 並べ替え + 先頭に別人
+            )
+            assert proj3 is not None
+            check("名簿を並べ替えても名前が入れ替わらない",
+                  all(proj3.speaker_name(s.speaker_id) == "佐藤"
+                      for s in proj3.segments[:5]))
+            check("並べ替えが反映される",
+                  [s.name for s in proj3.speakers] == ["鈴木", "佐藤", "田中"])
+            check("話者 ID が重複しない",
+                  len({s.id for s in proj3.speakers}) == len(proj3.speakers))
+
+            # --- 名簿から消した人も、割当が残っていれば保持される -----------
+            proj4 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False,
+                roster="田中",
+            )
+            assert proj4 is not None
+            check("名簿から外れても割当済みの人は残る",
+                  all(proj4.speaker_name(s.speaker_id) == "佐藤"
+                      for s in proj4.segments[:5]))
+
+            # --- 本文の手直しは再実行でも失われない -------------------------
+            proj4.segments[7].text = "訂正した本文です"
+            proj4.segments[7].text_edited = True
+            proj4.save()
+            proj5 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="田中",
+            )
+            assert proj5 is not None
+            check("手直しした本文が復元される",
+                  proj5.segments[7].text == "訂正した本文です")
+
+            # --- チャンク長を変えたらキャッシュを使い回さない ---------------
+            calls["n"] = 0
+            proj6 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=2,    # 1分 → 2分
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="田中",
+            )
+            assert proj6 is not None
+            check("チャンク長を変えたら転写し直す", calls["n"] == 2)
+            check("音声全体が区間で覆われる",
+                  abs(proj6.segments[-1].end - proj6.duration) < 1.5)
+
             # --- キャンセル ------------------------------------------------
             proj3 = pipeline.run_segment_pipeline(
                 audio_path=audio, output_dir=tmp, api_key="dummy",
