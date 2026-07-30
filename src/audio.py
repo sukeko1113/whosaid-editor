@@ -1,6 +1,7 @@
 """ffmpeg を呼び出して音声ファイルを分割・調査するモジュール"""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -47,6 +48,39 @@ def hide_console_kwargs() -> dict:
 
 # 後方互換(旧名)
 _hide_console_kwargs = hide_console_kwargs
+
+
+def audio_fingerprint(input_path: Path, on_progress=None) -> str:
+    """音声ファイルの中身から指紋(16桁)を作る。
+
+    ファイル名だけで作業ファイルやキャッシュを識別すると、
+    「音声を編集したのに名前が同じ」というときに古い結果を再利用してしまう。
+    中身が 1 バイトでも変われば別物として扱えるように、全体をハッシュする。
+
+    1GB の WAV でも数秒で終わる。取得できない場合は空文字を返す
+    (指紋なしとして扱い、再利用の判断は継続時間の比較にフォールバックする)。
+    """
+    try:
+        size = input_path.stat().st_size
+    except OSError:
+        return ""
+
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(size).encode("ascii"))
+    read = 0
+    try:
+        with open(input_path, "rb") as f:
+            while True:
+                block = f.read(4 * 1024 * 1024)
+                if not block:
+                    break
+                h.update(block)
+                read += len(block)
+                if on_progress and size:
+                    on_progress(read, size)
+    except OSError:
+        return ""
+    return h.hexdigest()
 
 
 _DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d+))?")

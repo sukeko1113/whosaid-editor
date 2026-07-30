@@ -221,6 +221,119 @@ def run() -> int:
 
             reloaded = Project.load(Path(proj.json_path or ""))
             check("保存済み JSON を読み直せる", reloaded.total_count == 12)
+            check("音声の指紋が記録される", len(reloaded.audio_fingerprint) == 16)
+
+        # ==============================================================
+        # 同じファイル名のまま音声を差し替えたら、古い結果を再利用しない
+        # ==============================================================
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 120)                 # 2分 → 1分チャンクで 2 個
+
+            calls["n"] = 0
+            proj_a = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+            )
+            assert proj_a is not None
+            fp_a = proj_a.audio_fingerprint
+            sid = proj_a.speakers[0].id
+            for seg in proj_a.segments:
+                seg.speaker_id = sid
+                seg.reviewed = True
+            proj_a.save()
+            check("1本目: 全区間を確定した", proj_a.assigned_count == proj_a.total_count)
+
+            # 同じ名前のまま、中身の違う音声に差し替える(編集した想定)
+            audio.unlink()
+            make_tone(audio, 180)                 # 長さも中身も変わる
+            calls["n"] = 0
+            logs3: list[str] = []
+            proj_b = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=logs3.append, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+            )
+            assert proj_b is not None
+            check("差し替えたら指紋が変わる", proj_b.audio_fingerprint != fp_a)
+            # チャンク数は ffmpeg の切れ目次第なので、実際の個数と突き合わせる
+            chunk_count = len({sg.chunk for sg in proj_b.segments})
+            check("差し替えたら全チャンクを転写し直す(キャッシュを使わない)",
+                  calls["n"] == chunk_count and chunk_count > 0)
+            check("差し替えたら古い割当を引き継がない", proj_b.assigned_count == 0)
+            check("差し替えを検知したログが出る",
+                  any("音声の内容が変わっています" in m for m in logs3))
+            check("出席者だけは引き継ぐ",
+                  [s.name for s in proj_b.speakers] == ["佐藤", "田中"])
+            check("古い作業ファイルを退避している",
+                  any(p.name.endswith(".bak.json") for p in tmp.glob("*.bak.json")))
+            check("新しい音声の長さで区間が作られる",
+                  abs(proj_b.duration - 180) < 1.5)
+
+            # 同じ音声で再実行すれば、これまでどおり引き継ぐ
+            for seg in proj_b.segments[:3]:
+                seg.speaker_id = proj_b.speakers[1].id
+                seg.reviewed = True
+            proj_b.save()
+            calls["n"] = 0
+            proj_c = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+            )
+            assert proj_c is not None
+            check("同じ音声ならキャッシュも割当も生きている",
+                  calls["n"] == 0 and proj_c.assigned_count == 3)
+
+            # 強制やり直しならキャッシュを使わない(割当は保持する)
+            calls["n"] = 0
+            proj_d = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+                force_retranscribe=True,
+            )
+            assert proj_d is not None
+            check("強制やり直しは全チャンクを転写し直す",
+                  calls["n"] == len({sg.chunk for sg in proj_d.segments}))
+            check("強制やり直しでも割当は残る", proj_d.assigned_count == 3)
+
+        # ==============================================================
+        # 指紋の無い古い作業ファイルは、継続時間で差し替えを判定する
+        # ==============================================================
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 120)
+            proj_e = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            assert proj_e is not None
+            sid = proj_e.speakers[0].id
+            for seg in proj_e.segments:
+                seg.speaker_id = sid
+            proj_e.audio_fingerprint = ""          # 旧形式を再現
+            proj_e.save()
+
+            audio.unlink()
+            make_tone(audio, 180)
+            proj_f = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            assert proj_f is not None
+            check("旧形式でも長さの違いで差し替えを検知", proj_f.assigned_count == 0)
     finally:
         pipeline.transcribe_audio = real_transcribe
         pipeline.genai = real_genai

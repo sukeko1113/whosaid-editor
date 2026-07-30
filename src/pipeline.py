@@ -6,12 +6,13 @@ GUI から別スレッドで run_pipeline() を呼ぶ想定。
 from __future__ import annotations
 
 import hashlib
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
 from google import genai
 
-from .audio import probe_duration, split_audio
+from .audio import audio_fingerprint, probe_duration, split_audio
 from .segments import Project, Segment, Speaker, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
@@ -47,6 +48,7 @@ def _cache_suffix(
     verbatim: bool,
     roster: str,
     chunk_seconds: int = 0,
+    fingerprint: str = "",
 ) -> str:
     """設定の組み合わせごとに別キャッシュにする(混在を防ぐ)。
 
@@ -54,10 +56,13 @@ def _cache_suffix(
     名簿を書き換えたのに古い結果が再利用される事故を防ぐため、
     名簿本文のハッシュ(先頭8桁)をサフィックスに埋め込む。
 
-    v2.0.0: チャンク長も含める。チャンクのファイル名は長さによらず
-    chunk_0000.m4a なので、含めないと別の長さの転写を使い回してしまう。
+    v2.0.0: チャンク長と音声の指紋も含める。チャンクのファイル名は長さに
+    よらず chunk_0000.m4a なので、含めないと別の長さ・別の中身の転写を
+    使い回してしまう(音声を編集してもファイル名が同じなら再利用される)。
     """
     parts: list[str] = []
+    if fingerprint:
+        parts.append(fingerprint)
     if chunk_seconds:
         parts.append(f"c{chunk_seconds}")
     if with_diarization:
@@ -87,6 +92,7 @@ def run_pipeline(
     with_diarization: bool = False,
     roster: str = "",
     verbatim: bool = False,
+    force_retranscribe: bool = False,
 ) -> Optional[Path]:
     """音声ファイル → docx を生成。キャンセル時は None を返す。"""
     # 話者識別が ON の場合、タイムスタンプも自動的に ON にする
@@ -129,7 +135,8 @@ def run_pipeline(
 
     chunk_seconds = chunk_minutes * 60
     cache_suffix = _cache_suffix(
-        with_timestamps, with_diarization, verbatim, roster, chunk_seconds)
+        with_timestamps, with_diarization, verbatim, roster, chunk_seconds,
+        audio_fingerprint(audio_path))
 
     # docx 冒頭の注意書きの選択
     note: str | None = None
@@ -145,7 +152,7 @@ def run_pipeline(
         label = f"[{i + 1}/{len(chunks)}] {chunk.name}"
         offset = i * chunk_seconds
 
-        if cache_path.exists():
+        if cache_path.exists() and not force_retranscribe:
             on_log(f"{label} (キャッシュから復元)")
             text = cache_path.read_text(encoding="utf-8")
         else:
@@ -186,6 +193,33 @@ def run_pipeline(
 # ======================================================================
 
 MATCH_TOLERANCE_SECONDS = 2.0
+
+# 指紋が無い(古い形式の)作業ファイルについて、
+# 「別の音声に差し替わった」と判断する継続時間の差
+DURATION_MISMATCH_SECONDS = 1.0
+
+
+def _backup_stale_project(json_path: Path, on_log: LogFn) -> None:
+    """中身の違う音声の作業ファイルを退避する。上書きで消さない。"""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = json_path.with_name(f"{json_path.stem}.{stamp}.bak.json")
+    try:
+        json_path.replace(backup)
+        on_log(f"以前の作業ファイルは {backup.name} に退避しました。")
+    except OSError as e:
+        on_log(f"以前の作業ファイルを退避できませんでした({e})。上書きします。")
+
+
+def _is_same_audio(old: Project, fingerprint: str, duration: float) -> bool:
+    """作業ファイルが、いま処理している音声と同じ中身のものか。
+
+    指紋があれば指紋で判定する。無い(古い形式の)場合は継続時間で代用する。
+    """
+    if old.audio_fingerprint and fingerprint:
+        return old.audio_fingerprint == fingerprint
+    if old.duration and duration:
+        return abs(old.duration - duration) <= DURATION_MISMATCH_SECONDS
+    return True     # どちらも判定材料が無いときは従来どおり引き継ぐ
 
 
 def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
@@ -285,8 +319,12 @@ def run_segment_pipeline(
     is_cancelled: CancelFn,
     verbatim: bool = False,
     roster: str = "",
+    force_retranscribe: bool = False,
 ) -> Optional[Project]:
-    """音声 → セグメント JSON(話者未確定)を生成して Project を返す。"""
+    """音声 → セグメント JSON(話者未確定)を生成して Project を返す。
+
+    force_retranscribe=True なら、キャッシュを無視して必ず転写し直す。
+    """
     audio_path = Path(audio_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -302,10 +340,19 @@ def run_segment_pipeline(
     on_log("方式: 話者は A/B/C… に分けるだけで、実名は後の割当画面で確定します。")
     if verbatim:
         on_log("逐語モード: 有効(フィラー・言い直しを保持し、整文しません)")
+    if force_retranscribe:
+        on_log("キャッシュを使わず、最初から転写し直します。")
 
     duration = probe_duration(audio_path)
     if duration:
         on_log(f"音声長: {int(duration // 60)}分{int(duration % 60)}秒")
+
+    # 音声の中身から指紋を取る。ファイル名が同じでも中身が変わっていれば
+    # 別物として扱い、古い転写や割当を引き継がない。
+    on_log("音声の内容を確認しています...")
+    fingerprint = audio_fingerprint(audio_path)
+    if fingerprint:
+        on_log(f"音声の指紋: {fingerprint}")
 
     on_log(f"音声を {chunk_minutes} 分単位で分割します...")
     chunks = split_audio(audio_path, chunks_dir, chunk_minutes * 60)
@@ -319,9 +366,13 @@ def run_segment_pipeline(
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
-    # チャンク長をキャッシュ名に含める。含めないと、分割サイズを変えたときに
-    # 別の長さで作った転写を使い回してしまい、音声とテキストがずれる。
-    cache_suffix = f".cluster.c{chunk_seconds}{'.vb' if verbatim else ''}.txt"
+    # キャッシュ名には「音声の指紋」と「チャンク長」を含める。
+    #   - 指紋が無いと、音声を編集してもファイル名が同じなら古い転写を再利用する
+    #   - チャンク長が無いと、分割サイズを変えたとき音声とテキストがずれる
+    cache_suffix = (
+        f".cluster{'.' + fingerprint if fingerprint else ''}"
+        f".c{chunk_seconds}{'.vb' if verbatim else ''}.txt"
+    )
 
     all_segments: list[Segment] = []
     for i, chunk in enumerate(chunks):
@@ -333,7 +384,7 @@ def run_segment_pipeline(
         label = f"[{i + 1}/{len(chunks)}] {chunk.name}"
         offset = i * chunk_seconds
 
-        if cache_path.exists():
+        if cache_path.exists() and not force_retranscribe:
             on_log(f"{label} (キャッシュから復元)")
             raw_text = cache_path.read_text(encoding="utf-8")
         else:
@@ -380,9 +431,22 @@ def run_segment_pipeline(
     if json_path.exists():
         try:
             old = Project.load(json_path)
-            # 話者リストを先に統合してから割当を移す(ID を保存するのが要点)
-            speakers = _merge_speakers(old.speakers, roster)
-            _carry_over_assignments(old, all_segments, on_log)
+            if not _is_same_audio(old, fingerprint, duration):
+                # 同じファイル名でも中身が違う。前回の割当を引き継ぐと
+                # 別の音声の話者が乗ってしまうので、作り直す。
+                on_log(
+                    "同じ名前の作業ファイルがありますが、音声の内容が変わっています。"
+                    "前回の割当は引き継がず、新しく作り直します。"
+                )
+                _backup_stale_project(json_path, on_log)
+                # 出席者(候補者リスト)だけは引き継ぐ。録り直しでも顔ぶれは
+                # 同じことが多く、入力し直す手間だけが増えるため。
+                # 区間の割当は引き継がない。
+                speakers = _merge_speakers(old.speakers, roster)
+            else:
+                # 話者リストを先に統合してから割当を移す(ID を保存するのが要点)
+                speakers = _merge_speakers(old.speakers, roster)
+                _carry_over_assignments(old, all_segments, on_log)
         except Exception as e:  # 壊れた JSON は無視して作り直す
             on_log(f"既存の作業ファイルを読めませんでした({e})。新規作成します。")
             speakers = parse_roster(roster)
@@ -393,6 +457,7 @@ def run_segment_pipeline(
         chunk_seconds=chunk_seconds,
         model=model,
         verbatim=verbatim,
+        audio_fingerprint=fingerprint,
         speakers=speakers,
         segments=all_segments,
     )

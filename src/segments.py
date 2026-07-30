@@ -204,6 +204,9 @@ class Project:
     chunk_seconds: int = 600
     model: str = ""
     verbatim: bool = False
+    # 音声の中身から作った指紋。ファイル名が同じでも中身が変われば別物として
+    # 扱うために使う(空文字なら未記録 = 古い形式の作業ファイル)。
+    audio_fingerprint: str = ""
     speakers: list[Speaker] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     json_path: Optional[str] = None      # 保存先(load 時に設定)
@@ -282,6 +285,7 @@ class Project:
             "chunk_seconds": self.chunk_seconds,
             "model": self.model,
             "verbatim": self.verbatim,
+            "audio_fingerprint": self.audio_fingerprint,
             "speakers": [sp.to_dict() for sp in self.speakers],
             "segments": [sg.to_dict() for sg in self.segments],
         }
@@ -294,6 +298,7 @@ class Project:
             chunk_seconds=int(d.get("chunk_seconds", 600)),
             model=str(d.get("model", "")),
             verbatim=bool(d.get("verbatim", False)),
+            audio_fingerprint=str(d.get("audio_fingerprint", "")),
             speakers=[Speaker.from_dict(x) for x in d.get("speakers", [])],
             segments=[Segment.from_dict(x) for x in d.get("segments", [])],
         )

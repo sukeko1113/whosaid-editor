@@ -12,6 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .assign_gui import open_assign_window
+from .audio import audio_fingerprint
 from .config import load_config, save_config
 from .pipeline import run_pipeline, run_segment_pipeline
 from .segments import Project
@@ -168,7 +169,16 @@ class App(tk.Tk):
             text="逐語モード(「えー」等のフィラー・言い直しを残し、整文しない。反訳・記録用)",
             variable=self.var_verbatim,
         )
-        self.chk_verbatim.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        self.chk_verbatim.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
+
+        # やり直しチェックボックス(v2.0.1)
+        # 通常は音声の指紋で自動判定するが、手動で強制できる逃げ道も用意する。
+        self.var_force = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm_adv,
+            text="キャッシュを使わず最初からやり直す(結果がおかしいときに)",
+            variable=self.var_force,
+        ).grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
         # === 出席者(候補者リスト) ===
         self.frm_roster = ttk.LabelFrame(self, text="出席者(候補者リスト)")
@@ -295,7 +305,31 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("読み込みエラー", f"作業ファイルを読めませんでした。\n\n{e}")
             return
+        if not self._warn_if_audio_changed(proj):
+            return
         self._open_assign(proj)
+
+    def _warn_if_audio_changed(self, proj: Project) -> bool:
+        """作業ファイルが作られたときの音声と、いまの音声が別物なら警告する。
+
+        音声を録り直した・編集したのに同じ名前で保存した場合、区間の時刻が
+        ずれているので、聴いている音とテキストが食い違ったまま作業が進む。
+        """
+        audio = Path(proj.audio_path)
+        if not proj.audio_fingerprint or not audio.exists():
+            return True    # 判定材料がないので、そのまま開く
+        current = audio_fingerprint(audio)
+        if not current or current == proj.audio_fingerprint:
+            return True
+        return messagebox.askyesno(
+            "音声が変わっています",
+            f"この作業ファイルが作られたときと、音声ファイルの内容が変わっています。\n"
+            f"{audio.name}\n\n"
+            "区間の時刻がずれている可能性が高く、聴いている音と表示されている\n"
+            "テキストが食い違ったまま作業を進めることになります。\n\n"
+            "メイン画面から文字起こしをやり直すことをおすすめします。\n"
+            "それでもこのまま開きますか?",
+        )
 
     def _open_assign(self, proj: Project) -> None:
         try:
@@ -397,6 +431,7 @@ class App(tk.Tk):
         with_ts = bool(self.var_timestamps.get())
         with_diar = bool(self.var_diarization.get())
         verbatim = bool(self.var_verbatim.get())
+        force = bool(self.var_force.get())
         roster = self._get_roster()
         if with_diar:
             with_ts = True  # 強制
@@ -445,6 +480,7 @@ class App(tk.Tk):
                 roster,
                 verbatim,
                 mode,
+                force,
             ),
             daemon=True,
         )
@@ -468,6 +504,7 @@ class App(tk.Tk):
         roster: str,
         verbatim: bool,
         mode: str = MODE_AUTO,
+        force_retranscribe: bool = False,
     ) -> None:
         try:
             if mode == MODE_MANUAL:
@@ -482,6 +519,7 @@ class App(tk.Tk):
                     is_cancelled=self._cancel_flag.is_set,
                     verbatim=verbatim,
                     roster=roster,
+                    force_retranscribe=force_retranscribe,
                 )
             else:
                 result = run_pipeline(
@@ -497,6 +535,7 @@ class App(tk.Tk):
                     with_diarization=with_diarization,
                     roster=roster,
                     verbatim=verbatim,
+                    force_retranscribe=force_retranscribe,
                 )
             self._post("done", result)
         except Exception:
