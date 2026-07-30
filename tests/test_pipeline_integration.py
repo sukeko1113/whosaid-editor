@@ -334,6 +334,98 @@ def run() -> int:
             )
             assert proj_f is not None
             check("旧形式でも長さの違いで差し替えを検知", proj_f.assigned_count == 0)
+
+        # ==============================================================
+        # API のエラーで中途半端な結果を作らない
+        # ==============================================================
+        from src.transcribe import FatalTranscriptionError
+
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 120)
+
+            # 残高切れ: 1 チャンク目で即中断し、リトライもしない
+            calls["n"] = 0
+
+            def depleted(client, audio_path, model, **kwargs):
+                calls["n"] += 1
+                from src.transcribe import classify_api_error
+                exc = Exception(
+                    "429 RESOURCE_EXHAUSTED. {'error': {'message': "
+                    "'Your prepayment credits are depleted.'}}")
+                raise FatalTranscriptionError(classify_api_error(exc) or "")
+
+            pipeline.transcribe_audio = depleted
+            fatal_msg = ""
+            try:
+                pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, api_key="dummy",
+                    model="gemini-2.5-flash", chunk_minutes=1,
+                    on_log=lambda m: None, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤",
+                )
+            except FatalTranscriptionError as e:
+                fatal_msg = str(e)
+            check("残高切れは中断して例外を投げる", "残高が尽きています" in fatal_msg)
+            check("残高切れは1チャンク目で止まる(全部試さない)", calls["n"] == 1)
+            check("残高切れでは作業ファイルを作らない",
+                  not Project.default_json_path(tmp, audio).exists())
+
+            # 全チャンク失敗(再試行対象のエラー): 割当画面を開かせない
+            def always_fail(client, audio_path, model, **kwargs):
+                raise RuntimeError("network unreachable")
+
+            pipeline.transcribe_audio = always_fail
+            err = ""
+            try:
+                pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, api_key="dummy",
+                    model="gemini-2.5-flash", chunk_minutes=1,
+                    on_log=lambda m: None, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤",
+                )
+            except RuntimeError as e:
+                err = str(e)
+            check("全チャンク失敗なら例外を投げる", "すべてのチャンク" in err)
+            check("失敗の原因が添えられる", "network unreachable" in err)
+
+            # 一部だけ失敗なら、成功したぶんで作業を続けられる
+            state = {"n": 0}
+
+            def fail_first(client, audio_path, model, **kwargs):
+                state["n"] += 1
+                if state["n"] == 1:
+                    raise RuntimeError("temporary glitch")
+                return FAKE_CHUNK_OUTPUT
+
+            pipeline.transcribe_audio = fail_first
+            logs4: list[str] = []
+            proj_g = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=logs4.append, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            check("一部失敗なら続行できる", proj_g is not None)
+            check("失敗件数を知らせる", any("失敗しました" in m for m in logs4))
+
+            # 失敗したチャンクはキャッシュされないので、再実行で取得し直す
+            state["n"] = 99
+            calls["n"] = 0
+            pipeline.transcribe_audio = fake_transcribe
+            proj_h = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            assert proj_h is not None
+            check("失敗したチャンクだけ取り直す", calls["n"] == 1)
+            check("再実行後は失敗の痕跡が残らない",
+                  not any("文字起こし失敗" in s.text for s in proj_h.segments))
+
+        pipeline.transcribe_audio = fake_transcribe
     finally:
         pipeline.transcribe_audio = real_transcribe
         pipeline.genai = real_genai

@@ -234,6 +234,67 @@ def shift_timestamps(text: str, offset_seconds: int) -> str:
 
 
 # ======================================================================
+# API エラーの分類
+#
+# 残高切れ・キー不正は何度やり直しても直らない。再試行で時間を浪費した
+# うえに、エラーの生 JSON を本文として書き込んでしまうと、割当画面には
+# 「文字起こし失敗: ... RESOURCE_EXHAUSTED ...」という区間だけが並ぶ。
+# 直せないエラーは即座に、何をすればよいかを添えて中断する。
+# ======================================================================
+
+class FatalTranscriptionError(RuntimeError):
+    """再試行しても解消しないエラー(残高切れ・APIキー不正など)"""
+
+
+_MSG_DEPLETED = (
+    "Gemini API の残高が尽きています。\n\n"
+    "Google AI Studio (https://aistudio.google.com/) を開き、"
+    "課金設定と残高を確認して補充してください。\n\n"
+    "補充後に同じ設定で実行し直せば続きから再開できます"
+    "(失敗したチャンクはキャッシュされていません)。"
+)
+
+_MSG_QUOTA = (
+    "Gemini API の利用上限に達しています。\n\n"
+    "しばらく待ってから実行し直すか、Google AI Studio "
+    "(https://aistudio.google.com/) で上限と課金設定を確認してください。\n\n"
+    "実行し直せば続きから再開できます。"
+)
+
+_MSG_AUTH = (
+    "Gemini API キーが正しくないか、このキーでは使えないモデルです。\n\n"
+    "https://aistudio.google.com/apikey で発行し直し、"
+    "詳細設定の「API キー」に貼り直して「保存」を押してください。"
+)
+
+
+def classify_api_error(exc: Exception) -> str | None:
+    """再試行しても無駄なエラーなら、利用者向けの説明文を返す。
+
+    再試行する価値があるエラー(一時的な通信断・分あたりのレート上限など)
+    では None を返す。
+    """
+    text = str(exc).lower()
+
+    if any(k in text for k in ("credits are depleted", "prepayment", "billing")):
+        return _MSG_DEPLETED
+    if "exceeded your current quota" in text or "quota_exceeded" in text:
+        return _MSG_QUOTA
+    if any(k in text for k in (
+        "api key not valid", "api_key_invalid", "invalid api key",
+        "unauthenticated", "permission_denied", "permission denied",
+    )):
+        return _MSG_AUTH
+    return None
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """分あたりのレート上限。待てば通るので、長めに待って再試行する。"""
+    text = str(exc).lower()
+    return "429" in text or "resource_exhausted" in text or "rate limit" in text
+
+
+# ======================================================================
 # 文字起こし本体
 # ======================================================================
 
@@ -301,9 +362,17 @@ def transcribe_audio(
             return text
 
         except Exception as e:
+            fatal = classify_api_error(e)
+            if fatal:
+                # 直せないエラー。再試行せず、原因と対処を添えて中断する。
+                log(f"  中断: {fatal.splitlines()[0]}")
+                raise FatalTranscriptionError(fatal) from e
+
             last_error = e
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
+                # レート上限は数秒では抜けない。長めに待つ。
+                wait = (20 * (attempt + 1)) if _is_rate_limited(e) else (2 ** attempt)
+                log(f"  失敗({e}) — {wait}秒待って再試行します")
                 time.sleep(wait)
 
     assert last_error is not None

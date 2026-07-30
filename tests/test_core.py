@@ -147,6 +147,47 @@ def test_parse_segments_empty():
     assert parse_segments("", 0, 0, 600) == []
 
 
+def test_classify_api_error():
+    """再試行しても直らないエラーを見分けられること"""
+    from src.transcribe import classify_api_error
+
+    depleted = (
+        "429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': "
+        "'Your prepayment credits are depleted. Please go to AI Studio at "
+        "https://ai.studio/projects to manage your project and billing.', "
+        "'status': 'RESOURCE_EXHAUSTED'}}"
+    )
+    msg = classify_api_error(Exception(depleted))
+    assert msg is not None
+    assert "残高が尽きています" in msg
+    assert "aistudio.google.com" in msg
+
+    quota = classify_api_error(Exception("You exceeded your current quota, please check your plan"))
+    assert quota is not None and "利用上限" in quota
+
+    for key_err in ("API key not valid. Please pass a valid API key.",
+                    "403 PERMISSION_DENIED",
+                    "UNAUTHENTICATED: request is missing credentials"):
+        m = classify_api_error(Exception(key_err))
+        assert m is not None, key_err
+        assert "API キー" in m
+
+    # 一時的なものは再試行させる(None)
+    assert classify_api_error(Exception("Connection reset by peer")) is None
+    assert classify_api_error(Exception("503 Service Unavailable")) is None
+    assert classify_api_error(Exception("500 Internal error")) is None
+    # 素の 429(分あたりのレート上限)は待てば通るので再試行対象
+    assert classify_api_error(Exception("429 Too Many Requests")) is None
+
+
+def test_rate_limit_detection():
+    from src.transcribe import _is_rate_limited
+
+    assert _is_rate_limited(Exception("429 Too Many Requests")) is True
+    assert _is_rate_limited(Exception("RESOURCE_EXHAUSTED")) is True
+    assert _is_rate_limited(Exception("Connection reset")) is False
+
+
 def test_build_prompt_cluster_only_has_no_names():
     p = build_prompt(True, True, roster="佐藤(理事長)", verbatim=False, cluster_only=True)
     assert "佐藤" not in p              # 名簿は渡さない

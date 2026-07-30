@@ -15,6 +15,7 @@ from .assign_gui import open_assign_window
 from .audio import audio_fingerprint
 from .config import load_config, save_config
 from .pipeline import run_pipeline, run_segment_pipeline
+from .transcribe import FatalTranscriptionError
 from .segments import Project
 
 
@@ -538,6 +539,9 @@ class App(tk.Tk):
                     force_retranscribe=force_retranscribe,
                 )
             self._post("done", result)
+        except FatalTranscriptionError as e:
+            # 残高切れ・APIキー不正。traceback ではなく対処方法を見せる。
+            self._post("fatal", str(e))
         except Exception:
             self._post("error", traceback.format_exc())
 
@@ -559,6 +563,8 @@ class App(tk.Tk):
                     self.var_status.set(f"{cur}/{total}")
                 elif kind == "done":
                     self._on_done(data)  # type: ignore[arg-type]
+                elif kind == "fatal":
+                    self._on_fatal(str(data))
                 elif kind == "error":
                     self._on_error(str(data))
         except queue.Empty:
@@ -598,6 +604,14 @@ class App(tk.Tk):
                     subprocess.run(["xdg-open", str(result)])
             except Exception as e:
                 messagebox.showerror("エラー", str(e))
+
+    def _on_fatal(self, message: str) -> None:
+        """再試行しても直らないエラー。原因と対処だけを見せる。"""
+        self.btn_start.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
+        self.var_status.set("中断")
+        self._append_log("=== 中断 ===\n" + message)
+        messagebox.showerror("処理を中断しました", message)
 
     def _on_error(self, tb: str) -> None:
         self.btn_start.configure(state="normal")

@@ -17,6 +17,7 @@ from .segments import Project, Segment, Speaker, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
     ROSTER_NOTE,
+    FatalTranscriptionError,
     parse_segments,
     shift_timestamps,
     transcribe_audio,
@@ -169,6 +170,8 @@ def run_pipeline(
                 # チャンク内相対時刻 [MM:SS] を絶対時刻 [HH:MM:SS] に変換
                 text = shift_timestamps(raw, offset) if with_timestamps else raw
                 cache_path.write_text(text, encoding="utf-8")
+            except FatalTranscriptionError:
+                raise      # 残高切れ・キー不正は続けても同じ結果になる
             except Exception as e:
                 on_log(f"  失敗: {e}")
                 text = f"【文字起こし失敗: {chunk.name} - {e}】"
@@ -375,6 +378,8 @@ def run_segment_pipeline(
     )
 
     all_segments: list[Segment] = []
+    failed_chunks = 0
+    last_failure: str = ""
     for i, chunk in enumerate(chunks):
         if is_cancelled():
             on_log("キャンセルされました。")
@@ -400,9 +405,15 @@ def run_segment_pipeline(
                     cluster_only=True,
                 )
                 cache_path.write_text(raw_text, encoding="utf-8")
+            except FatalTranscriptionError:
+                # 残高切れ・キー不正。続けても全チャンク同じ結果になるので、
+                # 中途半端な結果を作らずにここで止める。
+                raise
             except Exception as e:
                 on_log(f"  失敗: {e}")
-                raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name} - {e}】"
+                failed_chunks += 1
+                last_failure = str(e)
+                raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name}】"
 
         # このチャンクの実際の長さ(最終チャンクは短い)
         this_len = chunk_seconds
@@ -422,6 +433,20 @@ def run_segment_pipeline(
 
     if not all_segments:
         raise RuntimeError("発言区間が 1 つも取得できませんでした。音声とモデル設定を確認してください。")
+
+    if failed_chunks == len(chunks):
+        # 全滅。割当画面を開いてもエラー文言が並ぶだけなので、開かせない。
+        raise RuntimeError(
+            f"すべてのチャンク({len(chunks)}個)で文字起こしに失敗しました。\n"
+            "割当画面は開きません。原因を解消してから実行し直してください。\n\n"
+            f"最後のエラー:\n{last_failure}"
+        )
+    if failed_chunks:
+        on_log(
+            f"※ {len(chunks)} 個中 {failed_chunks} 個のチャンクで文字起こしに失敗しました。"
+            "該当区間は【文字起こし失敗】と表示されます。"
+            "原因を解消して再実行すると、失敗したぶんだけ取得し直します。"
+        )
 
     # 通し番号を振り直す
     for n, seg in enumerate(all_segments):
