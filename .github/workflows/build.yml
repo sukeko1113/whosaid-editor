@@ -26,12 +26,36 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Download ffmpeg + ffplay (essentials build)
+      - name: Download ffmpeg + ffplay
         shell: pwsh
         run: |
-          $url = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
-          Write-Host "Downloading ffmpeg from $url"
-          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing
+          # 配布元を 1 つに頼らない。gyan.dev は共有ホスト上にあり、
+          # 503 (resource limitation) でビルドが止まる事例が実際にあった。
+          # 失敗したら少し待って再試行し、それでも駄目なら
+          # GitHub 上でホストされている BtbN のビルドに切り替える。
+          # どちらも bin/ 配下に ffmpeg.exe / ffplay.exe を含む LGPL 版。
+          $sources = @(
+            'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
+            'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip'
+          )
+
+          $ok = $false
+          foreach ($url in $sources) {
+            foreach ($attempt in 1..3) {
+              try {
+                Write-Host "Downloading ffmpeg from $url (attempt $attempt)"
+                Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip -UseBasicParsing -TimeoutSec 600
+                $ok = $true
+                break
+              } catch {
+                Write-Warning "  failed: $($_.Exception.Message)"
+                if ($attempt -lt 3) { Start-Sleep -Seconds (15 * $attempt) }
+              }
+            }
+            if ($ok) { break }
+          }
+          if (-not $ok) { throw 'ffmpeg をどの配布元からも取得できませんでした' }
+
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extracted -Force
           New-Item -ItemType Directory -Path ffmpeg -Force | Out-Null
           foreach ($name in @('ffmpeg.exe', 'ffplay.exe')) {
@@ -39,6 +63,7 @@ jobs:
             if (-not $exe) { throw "$name not found in archive" }
             Copy-Item -Path $exe.FullName -Destination "ffmpeg/$name" -Force
           }
+          Get-ChildItem ffmpeg | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
           & ffmpeg/ffmpeg.exe -version
 
       - name: Install Python dependencies
