@@ -48,15 +48,22 @@ SPEEDS = ["0.8x", "1.0x", "1.2x", "1.5x", "2.0x"]
 #   - 逆に相づちが重なると長い発言が切られる(こちらは区間側で解決済み)
 # 再生は本文に見合う長さ + 余裕、とする。
 PREVIEW_MAX_SECONDS = 60.0     # 上限。長い発言でも先頭だけで判別できる
-PREVIEW_MIN_SECONDS = 8.0      # 下限。短い相づちでも聞き取れる長さは要る
+PREVIEW_MIN_SECONDS = 8.0      # 本文が短いときに確保する長さ
 PREVIEW_SLACK_SECONDS = 5.0    # Gemini の時刻推定がずれる分の余裕
+PREVIEW_FLOOR_SECONDS = 1.5    # 区間自体が極端に短いときの最低再生時間
 
 
 def preview_length(text: str, duration: float) -> float:
-    """この区間を何秒再生するか。"""
+    """この区間を何秒再生するか。
+
+    詰まった箇所では 1 区間が 0.5 秒ということもある。そのまま鳴らしても
+    聞き取れないので、区間より少しだけ長く再生する。
+    """
     need = estimate_speech_seconds(text) + PREVIEW_SLACK_SECONDS
     need = max(PREVIEW_MIN_SECONDS, min(PREVIEW_MAX_SECONDS, need))
-    return min(duration, need) if duration > 0 else need
+    if duration <= 0:
+        return need
+    return min(max(duration, PREVIEW_FLOOR_SECONDS), need)
 
 # 話者ごとの色(タイムライン帯・一覧の色分け用)
 PALETTE = [

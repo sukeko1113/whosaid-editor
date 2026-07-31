@@ -30,6 +30,7 @@ from src.assign_gui import (  # noqa: E402
     FILTER_ALL,
     FILTER_UNASSIGNED,
     FILTER_UNREVIEWED,
+    PREVIEW_FLOOR_SECONDS,
     PREVIEW_MAX_SECONDS,
     PREVIEW_MIN_SECONDS,
     AssignWindow,
@@ -78,8 +79,10 @@ def run() -> int:
         # --- 再生する長さ -------------------------------------------------
         check("短い相づちは区間が長くても再生を切り上げる",
               preview_length("うん。", 26.0) == PREVIEW_MIN_SECONDS)
-        check("区間が短ければそれ以上は再生しない",
-              preview_length("うん。", 1.0) == 1.0)
+        check("極端に短い区間でも聞き取れる長さは鳴らす",
+              preview_length("うん。", 0.4) == PREVIEW_FLOOR_SECONDS)
+        check("区間が下限より長ければその長さで鳴らす",
+              preview_length("うん。", 3.0) == 3.0)
         check("長い発言は本文に見合う長さを再生する",
               10.0 < preview_length("あ" * 60, 60.0) < 30.0)
         check("極端に長い区間でも上限で止まる",

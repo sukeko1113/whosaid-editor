@@ -233,7 +233,11 @@ def test_merge_keeps_absolute_times_with_offset():
 
 
 # ======================================================================
-# 重なった相づちで発言が切られない(v2.0.4)
+# 時刻が詰まった箇所の割り振り直し(v2.0.4 / v2.0.6)
+#
+# Gemini は発言が立て込むと 1 秒刻みで時刻を振る。そのまま使うと
+# 長い発言が 1 秒で切られ、単に延ばすと隣同士の再生窓が重なって
+# 同じ音声が聞こえる。本文の長さで按分して、重ならないようにする。
 # ======================================================================
 
 def test_estimate_speech_seconds():
@@ -262,13 +266,47 @@ def test_overlapping_backchannel_does_not_truncate():
     long_seg = next(s for s in segs if "院外理事" in s["text"])
     # 次の開始(07:04)で切られず、本文に見合う長さが確保されている
     assert long_seg["end"] - long_seg["start"] > 6.0, long_seg
-    # 開始時刻は動かさない(Gemini の推定をそのまま使う)
+    # 後ろに余裕があるので開始は動かない
     assert long_seg["start"] == 2700 + 7 * 60 + 3
+    # 余裕があっても必要以上には伸ばさない
+    assert long_seg["end"] - long_seg["start"] < 12.0
 
-    # 短い相づちの終わりは伸ばさない(次の区間の開始のまま)
-    aizuchi = next(s for s in segs if s["text"].strip() == "うん。")
-    assert aizuchi["start"] == 2700 + 7 * 60 + 4
-    assert aizuchi["end"] == 2700 + 7 * 60 + 30
+
+def test_no_overlapping_playback_windows():
+    """隣り合う区間が重なると、再生したときに同じ音声が聞こえてしまう。
+
+    実機報告: 51:47 と 51:48、51:50 と 51:51、52:03 と 52:04 で
+    同じ音声が流れた。
+    """
+    text = """[06:47] 【B】 それができればいいんだけど。
+[06:48] 【A】 理事がもう。
+[06:49] 【B】 はい。
+[06:50] 【A】 ま、梅田さんとあともう1人の県議以外は全部内部理事。
+[06:51] 【C】 うん。
+[06:56] 【B】 県議で。
+[06:57] 【A】 はい。
+"""
+    segs = parse_segments(text, chunk_index=5, offset_seconds=2700, chunk_seconds=540)
+    for a, b in zip(segs, segs[1:]):
+        assert b["start"] >= a["end"] - 0.01, (a["text"], b["text"], a["end"], b["start"])
+    # 詰まった範囲でも、長い発言には短い相づちより多くの時間が割り当てられる
+    # (最後の区間はチャンク末尾まで伸びるので比較から外す)
+    long_seg = next(s for s in segs if "梅田" in s["text"])
+    short = [s for s in segs[:-1] if s["text"].strip() in ("はい。", "うん。")]
+    assert short, "比較対象の相づちが無い"
+    assert all(long_seg["end"] - long_seg["start"] > s["end"] - s["start"] for s in short)
+    assert long_seg["end"] - long_seg["start"] > 3.0
+
+
+def test_roomy_timestamps_are_left_alone():
+    """余裕がある箇所は Gemini の時刻をそのまま使う"""
+    text = """[00:00] 【A】 短い。
+[00:30] 【B】 これも短い。
+[01:00] 【A】 やはり短い。
+"""
+    segs = parse_segments(text, 0, 0, 600)
+    assert [s["start"] for s in segs] == [0.0, 30.0, 60.0]
+    assert segs[0]["end"] == 30.0 and segs[1]["end"] == 60.0
 
 
 def test_extension_is_clamped_to_chunk_end():
@@ -278,19 +316,35 @@ def test_extension_is_clamped_to_chunk_end():
     assert segs[-1]["end"] == 540.0
 
 
-def test_all_segments_fit_their_text():
-    """どの区間も、本文を読み上げるのに足りる長さを持つ"""
-    from src.transcribe import estimate_speech_seconds
+def test_time_is_shared_in_proportion_to_text():
+    """詰まった範囲では、時間を本文の長さの比で分け合う。
 
+    実際より時間が足りない以上、全員に必要な長さを与えることはできない。
+    せめて長い発言に多く、短い相づちに少なく配ることで、
+    再生したときに隣と同じ音にならないようにする。
+    """
     text = """[00:00] 【A】 これはかなり長い発言でして、相づちが重なっても最後まで再生できる必要があります。
 [00:01] 【B】 うん。
 [00:02] 【A】 続けてもう一つ、これも長めの発言をしておきます。切られては困ります。
 [00:03] 【C】 はい。
+[00:20] 【A】 次の発言です。
 """
+    from src.transcribe import estimate_speech_seconds
+
     segs = parse_segments(text, 0, 0, 600)
-    for s in segs:
-        need = estimate_speech_seconds(s["text"])
-        assert s["end"] - s["start"] >= need - 0.01, (s["text"][:20], s["end"] - s["start"], need)
+    dur = {s["text"][:8]: s["end"] - s["start"] for s in segs}
+
+    # 0〜2 秒に 2 発言。時間が足りないので比で分ける
+    assert dur["これはかなり長い"] > dur["うん。"] * 3
+
+    # 後ろに余裕がある発言は、必要な長さを丸ごと確保できる
+    need2 = estimate_speech_seconds(
+        "続けてもう一つ、これも長めの発言をしておきます。切られては困ります。")
+    assert dur["続けてもう一つ、"] >= need2 - 0.05
+
+    # 隙間なく敷き詰められ、重ならない
+    for a, b in zip(segs, segs[1:]):
+        assert abs(b["start"] - a["end"]) < 0.02
 
 
 def test_cluster_prompt_forbids_fragmenting():

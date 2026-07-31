@@ -457,6 +457,75 @@ def estimate_speech_seconds(text: str) -> float:
     return min(MAX_ESTIMATED_SECONDS,
                max(MIN_SEGMENT_SECONDS, n / SPEECH_CHARS_PER_SECOND))
 
+
+def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
+    """時刻が詰まりすぎている区間を、本文の長さで按分し直す。
+
+    Gemini は発言が立て込むと 1 秒刻みで機械的に時刻を振ってくる。
+
+        [06:47] 【B】 それができればいいんだけど。   ← 13文字
+        [06:48] 【A】 理事がもう。                   ←  6文字
+        [06:49] 【B】 はい。
+        [06:50] 【A】 ま、梅田さんとあともう1人の県議以外は全部内部理事。 ← 25文字
+        [06:51] 【C】 うん。
+        [06:56] 【B】 県議で。
+
+    4 秒に 5 発言。25 文字の発言が 1 秒で終わるはずがないので、この範囲の
+    時刻は信用できない。一方 [06:51]→[06:56] のように次まで余裕がある区間は
+    信用してよい。
+
+    そこで「次まで余裕がある区間」を目印(アンカー)とみなし、詰まっている
+    部分はアンカーまでの時間を本文の長さで按分する。
+
+    単純に終わりを延ばすだけだと(v2.0.4)、隣り合う区間の再生窓が重なって
+    同じ音声が聞こえてしまう。按分なら重ならない。
+    """
+    n = len(raw)
+    if n == 0:
+        return raw
+
+    needs = [estimate_speech_seconds(r["text"]) for r in raw]
+    starts = [float(r["rel"]) for r in raw]
+
+    def next_start(k: int) -> float:
+        return starts[k + 1] if k + 1 < n else chunk_len
+
+    i = 0
+    while i < n:
+        if next_start(i) - starts[i] >= needs[i] - 0.01:
+            # 余裕がある。従来どおり「次の始まり」まで
+            raw[i]["rel_end"] = next_start(i)
+            i += 1
+            continue
+
+        # 詰まっている。余裕のある区間(アンカー)までをひとまとまりにする。
+        # アンカー自身も含めることで、詰まった区間が時間を借りられる。
+        j = i
+        while j < n - 1 and next_start(j) - starts[j] < needs[j] - 0.01:
+            j += 1
+
+        span_start = starts[i]
+        span_end = next_start(j)
+        span = max(0.3, span_end - span_start)
+        total = sum(needs[i:j + 1]) or 1.0
+
+        # 余裕がある場合に必要以上へ引き伸ばさない。
+        # 足りない場合だけ、全体を同じ割合で縮める。
+        scale = min(1.0, span / total)
+
+        cursor = span_start
+        for k in range(i, j + 1):
+            share = needs[k] * scale
+            raw[k]["rel"] = round(cursor, 3)
+            raw[k]["rel_end"] = round(cursor + share, 3)
+            cursor += share
+        # 余った時間は最後の区間に付ける(どの区間にも属さない音声を残さない)
+        if raw[j]["rel_end"] < span_end:
+            raw[j]["rel_end"] = round(span_end, 3)
+        i = j + 1
+
+    return raw
+
 # 連結時、直前がこれらで終わっていれば読点を足さない
 _SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
 
@@ -589,18 +658,13 @@ def parse_segments(
     if merge_same_speaker:
         raw = merge_consecutive(raw)
 
-    # 連結が済んでから、最後の区間をチャンク末尾まで伸ばす
-    # (末尾の音声が どの区間にも属さない状態を作らないため)
+    # 連結が済んでから、時刻を割り振り直す。
+    # (詰まっている箇所を本文の長さで按分。区間どうしは重ならない)
+    raw = redistribute_times(raw, chunk_len)
+
+    # 末尾の音声がどの区間にも属さない状態を作らない
     if raw and chunk_len > raw[-1]["rel_end"]:
         raw[-1]["rel_end"] = chunk_len
-
-    # 相づちが重なって潰された区間の終わりを、本文の長さから伸ばす。
-    # 区間どうしが時間的に重なることになるが、実際の会話が重なっている
-    # のだから、これで正しい。再生窓が本文に見合う長さになる。
-    for r in raw:
-        need = estimate_speech_seconds(r["text"])
-        if r["rel_end"] - r["rel"] < need:
-            r["rel_end"] = min(chunk_len, r["rel"] + need)
 
     out: list[dict] = []
     for i, r in enumerate(raw):
