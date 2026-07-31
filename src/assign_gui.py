@@ -40,6 +40,10 @@ from .suggest import SpeakerSuggester, next_unassigned, next_unreviewed
 
 SPEEDS = ["0.8x", "1.0x", "1.2x", "1.5x", "2.0x"]
 
+# 1 区間の再生はここで打ち切る。話者の判別には先頭だけで足りるうえ、
+# 同じ話者の連続をまとめた結果、数分に及ぶ区間ができるため。
+PREVIEW_MAX_SECONDS = 60.0
+
 # 話者ごとの色(タイムライン帯・一覧の色分け用)
 PALETTE = [
     "#3E7CB1", "#C1666B", "#4F9D69", "#B07B2F", "#7A5AA8",
@@ -604,9 +608,11 @@ class AssignWindow(tk.Toplevel):
         state = "未確定"
         if seg.speaker_id:
             state = "確認済み" if seg.reviewed else "△まとめて適用(未確認)"
+        long_note = (f"(再生は先頭{PREVIEW_MAX_SECONDS:.0f}秒まで)"
+                     if seg.duration > PREVIEW_MAX_SECONDS else "")
         self.var_seginfo.set(
             f"区間 {pos}/{len(self.proj.segments)}   "
-            f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒   "
+            f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
         )
@@ -837,6 +843,11 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
+        # 長い区間を丸ごと流すと待たされる。話者の判別には先頭だけで足りるので、
+        # 既定では頭 PREVIEW_MAX_SECONDS 秒で切る(「この先30秒▶」で続きを聴ける)。
+        preview_end = seg.end
+        if extend <= 0 and seg.duration > PREVIEW_MAX_SECONDS:
+            preview_end = seg.start + PREVIEW_MAX_SECONDS
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
@@ -856,7 +867,7 @@ class AssignWindow(tk.Toplevel):
             self.player.play(
                 audio,
                 start=max(0.0, seg.start - back),
-                end=seg.end + extend,
+                end=preview_end + extend,
                 speed=self._speed(),
             )
             self.btn_play.configure(text="■ 停止 (Space)")

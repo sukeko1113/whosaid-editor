@@ -147,6 +147,97 @@ def test_parse_segments_empty():
     assert parse_segments("", 0, 0, 600) == []
 
 
+# ======================================================================
+# 同じ話者の連続をまとめる(v2.0.3)
+#
+# Gemini は指示しても息継ぎごとに行を分けてくることがある。
+# 実機では 52 分の音声が 615 区間に割れ、割当作業が現実的でなくなった。
+# ======================================================================
+
+FRAGMENTED = """[00:00] 【A】 吉沢と申しますけども
+[00:01] 【A】 えー、まずその6つのですね
+[00:24] 【A】 工程表
+[00:26] 【A】 えー、財源計画
+[00:29] 【A】 年度別資金繰り
+[00:47] 【A】 あの、第1の、あの、お願いでございます。
+[01:05] 【B】 はい。
+[01:06] 【A】 はい、以上です。
+[01:06] 【B】 で、は、あの、代わりまして西村と申します。
+[01:11] 【B】 えー、校長をしておりました。はい。
+"""
+
+
+def test_merge_collapses_same_speaker_run():
+    merged = parse_segments(FRAGMENTED, 0, 0, 600)
+    clusters = [s["cluster"] for s in merged]
+    assert clusters == ["0:A", "0:B", "0:A", "0:B"], clusters
+    # 1件目は 6 行分がまとまり、開始と終了が run 全体を覆う
+    assert merged[0]["start"] == 0.0
+    assert merged[0]["end"] == 65.0
+    assert "吉沢と申しますけども" in merged[0]["text"]
+    assert "お願いでございます。" in merged[0]["text"]
+
+
+def test_merge_can_be_disabled():
+    raw = parse_segments(FRAGMENTED, 0, 0, 600, merge_same_speaker=False)
+    assert len(raw) == 10
+
+
+def test_merge_inserts_reading_comma():
+    """断片をそのまま繋ぐと「けどもえー」になる。間には読点を補う。"""
+    merged = parse_segments(FRAGMENTED, 0, 0, 600)
+    text = merged[0]["text"]
+    assert "けども、えー" in text
+    assert "けどもえー" not in text
+    # 既に句読点で終わっていれば二重にしない
+    assert "。、" not in text
+
+
+def test_merge_skips_pseudo_clusters():
+    """【?】【*】は中身がばらばらなので連結しない"""
+    text = """[00:00] 【?】 うん
+[00:02] 【?】 ええ
+[00:04] 【*】 (重なり)
+[00:06] 【*】 (重なり)
+"""
+    merged = parse_segments(text, 0, 0, 600)
+    assert len(merged) == 4
+
+
+def test_merge_respects_gap_and_max_length():
+    from src.transcribe import merge_consecutive
+
+    raw = [
+        {"rel": 0.0, "rel_end": 10.0, "cluster": "A", "text": "あ"},
+        {"rel": 60.0, "rel_end": 70.0, "cluster": "A", "text": "い"},   # 50秒の間
+    ]
+    assert len(merge_consecutive(raw, max_gap=20.0)) == 2
+    assert len(merge_consecutive(raw, max_gap=90.0)) == 1
+
+    long_run = [
+        {"rel": float(i * 30), "rel_end": float(i * 30 + 30), "cluster": "A", "text": f"t{i}"}
+        for i in range(10)      # 合計 300 秒
+    ]
+    out = merge_consecutive(long_run, max_seconds=120.0)
+    assert len(out) > 1
+    assert all(s["rel_end"] - s["rel"] <= 130.0 for s in out)
+
+
+def test_merge_keeps_absolute_times_with_offset():
+    merged = parse_segments(FRAGMENTED, chunk_index=2, offset_seconds=1200,
+                            chunk_seconds=600)
+    assert merged[0]["start"] == 1200.0
+    assert merged[0]["cluster"] == "2:A"
+    starts = [s["start"] for s in merged]
+    assert starts == sorted(starts)
+
+
+def test_cluster_prompt_forbids_fragmenting():
+    p = build_prompt(True, True, cluster_only=True)
+    assert "同じ人が話し続けている間は、絶対に行を分けない" in p
+    assert "息継ぎ" in p
+
+
 def test_classify_api_error():
     """再試行しても直らないエラーを見分けられること"""
     from src.transcribe import classify_api_error

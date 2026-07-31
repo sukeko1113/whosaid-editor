@@ -48,18 +48,23 @@ _TAIL = "- 説明や前置き、Markdown 装飾は不要。書き起こし本文
 
 # v2.0.0: 手動割当モード用。名簿は渡さず、声質だけで区間に切り分けさせる。
 # 実名の推定をやめたので、プロンプトが短くなり応答も安定する。
-_RULES_CLUSTER = """- **話者が変わるごとに必ず改行し、1行1発言とする**
+_RULES_CLUSTER = """- **行を分けるのは「話す人が変わったとき」だけ**
 - **各行は必ず次の形式で始める**:
   [MM:SS] 【A】 本文...
   (時刻はこの音声の先頭からの 分:秒。ゼロ埋め2桁。ミリ秒は付けない)
 - 話者ラベルは A, B, C, ... のアルファベット1文字のみ。**名前や役職は絶対に書かない**
 - 同じ声の人物には常に同じラベルを使う。声が変われば必ず別のラベルにする
-- 話者が同じでも、30秒以上続く長い発言は話題の区切りで行を分けてよい
+- **同じ人が話し続けている間は、絶対に行を分けない**。
+  息継ぎ・間・読点・言いよどみで区切ってはいけない。
+  文がいくつ続いても、次の人が話し始めるまでは 1 行に書く。
+  (悪い例: 「工程表」「えー、財源計画」「年度別資金繰り」と 3 行に分ける
+   → 正しくは 1 行に「工程表、えー、財源計画、年度別資金繰り…」と続ける)
+- 同じ人が 3 分以上話し続けた場合のみ、話題の切れ目で行を分けてよい
 - 短い相づち(「はい」「うん」程度)も、別の人物の声なら独立した行にする
 - 誰の声か判別できない場合は 【?】、複数人が同時に話している場合は 【*】 とする"""
 
 _EXAMPLE_CLUSTER = """出力例:
-[00:00] 【A】 本日はお忙しい中お集まりいただきありがとうございます。それでは議事を始めます。
+[00:00] 【A】 本日はお忙しい中お集まりいただきありがとうございます。それでは議事を始めます。まず、お手元の資料をご覧ください。えー、本日の議題は、予算と、あの、人事の二点になります。
 [00:25] 【B】 すみません、確認ですが、前回の議事録は配布済みですか?
 [00:32] 【A】 はい、配布済みです。修正点も反映されています。
 [00:40] 【C】 その件、私からも補足させてください。"""
@@ -419,12 +424,73 @@ def normalize_cluster_label(label: str | None) -> str:
     return s[:3]
 
 
+# 同じ話者の連続をまとめるときの上限
+MERGE_MAX_SECONDS = 180.0    # これを超えたら区切る(聴き直しが辛くなるため)
+MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
+
+# 連結時、直前がこれらで終わっていれば読点を足さない
+_SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
+
+
+def _join_fragments(left: str, right: str) -> str:
+    """断片を連結する。日本語なので空白は挟まない。
+
+    Gemini が行を分けた位置は、話者が息を継いだ位置に対応している。
+    そのまま連結すると「吉沢と申しますけどもえー、まず…」と読みにくいので、
+    直前が句読点で終わっていなければ読点を補う。
+    (逐語での「間」の表現であり、発話内容そのものは変えない)
+    """
+    left = left.rstrip()
+    right = right.lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1] in _SENTENCE_ENDS or right[0] in _SENTENCE_ENDS:
+        return left + right
+    return left + "、" + right
+
+
+def merge_consecutive(
+    raw: list[dict],
+    max_seconds: float = MERGE_MAX_SECONDS,
+    max_gap: float = MERGE_MAX_GAP,
+) -> list[dict]:
+    """同じ話者ラベルが連続する行をひとつの発言にまとめる。
+
+    Gemini は指示しても、息継ぎや読点のたびに行を分けてくることがある。
+    (「工程表」「えー、財源計画」「年度別資金繰り」…と 1 文が 7 行に割れる)
+    そのままだと 52 分の音声で 600 区間を超え、割当作業が現実的でなくなる。
+    話者が変わらない限り 1 件にまとめる。
+
+    まとめない例外:
+      - 【?】【*】(判別不能・複数人同時) … 中身がばらばらなので連結しない
+      - 直前の終わりから max_gap 秒以上空いている … 別の発言とみなす
+      - まとめると max_seconds を超える … 聴き直せる長さに保つ
+    """
+    out: list[dict] = []
+    for r in raw:
+        if out:
+            prev = out[-1]
+            same = prev["cluster"] == r["cluster"]
+            pseudo = r["cluster"] in (CLUSTER_UNKNOWN, CLUSTER_MULTI)
+            gap = r["rel"] - prev["rel_end"]
+            span = r["rel_end"] - prev["rel"]
+            if same and not pseudo and gap <= max_gap and span <= max_seconds:
+                prev["text"] = _join_fragments(prev["text"], r["text"])
+                prev["rel_end"] = r["rel_end"]
+                continue
+        out.append(dict(r))
+    return out
+
+
 def parse_segments(
     text: str,
     chunk_index: int = 0,
     offset_seconds: float = 0.0,
     chunk_seconds: float | None = None,
     start_index: int = 0,
+    merge_same_speaker: bool = True,
 ) -> list[dict]:
     """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
 
@@ -473,12 +539,36 @@ def parse_segments(
 
     # 本文が空の区間は落とす(直前に吸収されなかったもの)
     raw = [r for r in raw if r["text"]]
+    if not raw:
+        return []
 
-    chunk_end = offset_seconds + (chunk_seconds if chunk_seconds else (raw[-1]["rel"] if raw else 0))
+    # 各行の終わりを「次の行の開始」として先に決める。
+    # まとめる判定に終了時刻が要るため、連結より前に確定させる。
+    #
+    # 最後の行だけは暫定値を入れておく。ここでチャンク末尾まで伸ばすと、
+    # 末尾の無音ぶんまで長さに数えてしまい、最後の一続きが
+    # 「長すぎる」と判定されて連結されなくなる。
+    chunk_len = float(chunk_seconds) if chunk_seconds else raw[-1]["rel"]
+    for i, r in enumerate(raw):
+        if i + 1 < len(raw):
+            r["rel_end"] = raw[i + 1]["rel"]
+        else:
+            r["rel_end"] = min(chunk_len, r["rel"] + 2.0)
+        if r["rel_end"] <= r["rel"]:
+            r["rel_end"] = r["rel"] + 1.0
+
+    if merge_same_speaker:
+        raw = merge_consecutive(raw)
+
+    # 連結が済んでから、最後の区間をチャンク末尾まで伸ばす
+    # (末尾の音声が どの区間にも属さない状態を作らないため)
+    if raw and chunk_len > raw[-1]["rel_end"]:
+        raw[-1]["rel_end"] = chunk_len
+
     out: list[dict] = []
     for i, r in enumerate(raw):
         start = offset_seconds + r["rel"]
-        end = offset_seconds + raw[i + 1]["rel"] if i + 1 < len(raw) else chunk_end
+        end = offset_seconds + r["rel_end"]
         if end <= start:
             end = start + 1.0
         out.append({
