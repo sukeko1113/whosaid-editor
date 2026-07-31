@@ -85,6 +85,19 @@ def run() -> int:
         check("極端に長い区間でも上限で止まる",
               preview_length("あ" * 3000, 900.0) == PREVIEW_MAX_SECONDS)
 
+        # --- ずれ補正 -------------------------------------------------------
+        check("ずれ補正の初期値は 0", proj.time_offset == 0.0)
+        win._set_offset(1.4)
+        win.update()
+        check("ずれ補正を設定できる", proj.time_offset == 1.4)
+        check("ずれ補正が保存対象になる", win._dirty is True)
+        win._nudge_offset(-0.2)
+        check("キーで微調整できる", abs(proj.time_offset - 1.2) < 1e-6)
+        win._set_offset(99.0)
+        check("上限で頭打ちになる", proj.time_offset == 10.0)
+        win._set_offset(0.0)
+        check("0 に戻せる", proj.time_offset == 0.0)
+
         check("初期表示: 区間 40 件", len(win.tree.get_children()) == 40)
         check("初期表示: 候補は名簿順", [c.speaker.name for c in win._candidates][:3]
               == ["佐藤", "田中", "鈴木"])
@@ -222,6 +235,10 @@ def run() -> int:
         reloaded = Project.load(proj.json_path)
         check("保存と再読込", reloaded.total_count == 40
               and reloaded.segments[5].text == "編集しました")
+        win._set_offset(-0.6)
+        win.save()
+        check("ずれ補正が JSON に残る",
+              abs(Project.load(proj.json_path).time_offset + 0.6) < 1e-6)
 
         # --- タイムライン描画 --------------------------------------------
         win._draw_timeline()

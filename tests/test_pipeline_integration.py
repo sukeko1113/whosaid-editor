@@ -105,7 +105,10 @@ def run() -> int:
 
             starts = [s.start for s in proj.segments]
             check("開始時刻が単調増加", starts == sorted(starts))
-            check("チャンク 2 のオフセットが効いている", proj.segments[4].start == 60.0)
+            # 開始位置は各チャンクの実測長を積み上げて決めるので、
+            # 分割の端数(AAC のフレーム境界)ぶんだけ 60.0 からずれる
+            check("チャンク 2 のオフセットが効いている",
+                  abs(proj.segments[4].start - 60.0) < 0.5)
             check("クラスタがチャンクごとに分かれている",
                   proj.segments[0].cluster == "0:A" and proj.segments[4].cluster == "1:A")
             check("最終チャンクは音声末尾で終わる",

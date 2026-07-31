@@ -174,6 +174,7 @@ class AssignWindow(tk.Toplevel):
         self.var_seginfo = tk.StringVar(value="")
         self.var_action = tk.StringVar(value="")
         self.var_backend = tk.StringVar(value="")
+        self.var_offset = tk.DoubleVar(value=float(project.time_offset))
 
         self._build_ui()
         self._bind_keys()
@@ -283,8 +284,25 @@ class AssignWindow(tk.Toplevel):
             .grid(row=0, column=4, padx=4, pady=6)
         ttk.Checkbutton(frm_play, text="移動したら自動再生", variable=self.var_autoplay,
                         takefocus=False).grid(row=0, column=5, padx=(12, 4))
+
+        # --- ずれ補正 ---------------------------------------------------
+        # 文字と音声がずれて聞こえるときに使う。Gemini の時刻推定は
+        # 実音声と一致しないことがあり、こちらでは直せないため手動調整を置く。
+        ttk.Label(frm_play, text="ずれ補正:").grid(row=1, column=0, sticky="e", padx=(6, 2))
+        ttk.Spinbox(
+            frm_play, from_=-10.0, to=10.0, increment=0.2, width=6,
+            textvariable=self.var_offset, command=self._on_offset_change,
+        ).grid(row=1, column=1, sticky="w")
+        ttk.Button(frm_play, text="±0に戻す", command=lambda: self._set_offset(0.0))\
+            .grid(row=1, column=2, padx=4)
+        ttk.Label(
+            frm_play,
+            text="秒。音声が文字より遅れて聞こえるなら + 、早いなら −(Shift+← / Shift+→)",
+            foreground="#666",
+        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=4)
+
         ttk.Label(frm_play, textvariable=self.var_backend, foreground="#888")\
-            .grid(row=1, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
+            .grid(row=2, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 4))
 
         # --- 候補者リスト ----------------------------------------------
         frm_cand = ttk.LabelFrame(right, text="話者を選ぶ(数字キーで即確定・可能性の高い順)")
@@ -333,6 +351,8 @@ class AssignWindow(tk.Toplevel):
         self.bind("<Return>", lambda e: self._key_enter())
         self.bind("<Control-z>", lambda e: self.undo())
         self.bind("<Control-s>", lambda e: self.save())
+        self.bind("<Shift-Left>", lambda e: self._guarded(lambda: self._nudge_offset(-0.2)))
+        self.bind("<Shift-Right>", lambda e: self._guarded(lambda: self._nudge_offset(+0.2)))
         self.bind("<Tab>", lambda e: self._guarded_break(self._goto_next_target))
         self.bind("<Shift-Tab>",
                   lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
@@ -367,6 +387,33 @@ class AssignWindow(tk.Toplevel):
             return None
         fn()
         return "break"
+
+    def _on_offset_change(self) -> None:
+        """ずれ補正の値が変わったら保存し、その場で聴き直せるようにする。"""
+        try:
+            value = float(self.var_offset.get())
+        except (tk.TclError, ValueError):
+            return
+        value = max(-10.0, min(10.0, round(value, 2)))
+        if abs(value - self.proj.time_offset) < 1e-6:
+            return
+        self.proj.time_offset = value
+        self._dirty = True
+        sign = "遅らせて" if value > 0 else "早めて"
+        self._set_action(
+            f"ずれ補正を {value:+.1f} 秒にしました"
+            + (f"(音声を{sign}再生します)" if value else "(補正なし)")
+        )
+        self.show_current()
+        if self.var_autoplay.get():
+            self.play_current()
+
+    def _set_offset(self, value: float) -> None:
+        self.var_offset.set(round(value, 2))
+        self._on_offset_change()
+
+    def _nudge_offset(self, delta: float) -> None:
+        self._set_offset(self.proj.time_offset + delta)
 
     def _set_action(self, message: str) -> None:
         """直前の操作の結果を、区間を移動しても消えない場所に表示する。"""
@@ -629,6 +676,7 @@ class AssignWindow(tk.Toplevel):
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
+            + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒" if self.proj.time_offset else "")
         )
         self.txt_body.delete("1.0", "end")
         self.txt_body.insert("1.0", seg.text)
@@ -861,6 +909,13 @@ class AssignWindow(tk.Toplevel):
         preview_end = seg.end
         if extend <= 0:
             preview_end = seg.start + preview_length(seg.text, seg.duration)
+
+        # 短い区間で先読みを固定 0.4 秒にすると、再生窓の大半が前の発言に
+        # なってしまう(1 秒の区間なら 4 割)。区間の長さに応じて縮める。
+        pre_roll = min(0.4, max(0.05, seg.duration * 0.25))
+
+        # ずれ補正: Gemini の時刻推定が実音声とずれている場合の手動調整。
+        shift = self.proj.time_offset
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
@@ -879,9 +934,10 @@ class AssignWindow(tk.Toplevel):
         try:
             self.player.play(
                 audio,
-                start=max(0.0, seg.start - back),
-                end=preview_end + extend,
+                start=max(0.0, seg.start + shift - back),
+                end=preview_end + shift + extend,
                 speed=self._speed(),
+                pre_roll=pre_roll,
             )
             self.btn_play.configure(text="■ 停止 (Space)")
         except Exception as e:

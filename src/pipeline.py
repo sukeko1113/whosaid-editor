@@ -365,6 +365,19 @@ def run_segment_pipeline(
         on_log("キャンセルされました。")
         return None
 
+    # 各チャンクの実際の長さを測り、開始位置を積み上げる。
+    # 「i × チャンク長」で決め打つと、分割の端数(AAC のフレーム境界)が
+    # 積み上がって後半ほど時刻がずれる。ずれ自体は 0.1 秒未満だが、
+    # 測るのは一瞬なので決め打ちにする理由がない。
+    chunk_starts: list[float] = []
+    chunk_lengths: list[float] = []
+    acc = 0.0
+    for c in chunks:
+        chunk_starts.append(acc)
+        d = probe_duration(c) or float(chunk_minutes * 60)
+        chunk_lengths.append(d)
+        acc += d
+
     client = genai.Client(api_key=api_key)
     on_progress(0, len(chunks))
 
@@ -387,7 +400,7 @@ def run_segment_pipeline(
 
         cache_path = cache_dir / f"{chunk.stem}{cache_suffix}"
         label = f"[{i + 1}/{len(chunks)}] {chunk.name}"
-        offset = i * chunk_seconds
+        offset = chunk_starts[i]
 
         if cache_path.exists() and not force_retranscribe:
             on_log(f"{label} (キャッシュから復元)")
@@ -416,9 +429,9 @@ def run_segment_pipeline(
                 raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name}】"
 
         # このチャンクの実際の長さ(最終チャンクは短い)
-        this_len = chunk_seconds
+        this_len = chunk_lengths[i]
         if duration:
-            this_len = max(1.0, min(chunk_seconds, duration - offset))
+            this_len = max(1.0, min(this_len, duration - offset))
 
         parsed = parse_segments(
             raw_text,

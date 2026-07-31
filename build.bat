@@ -104,7 +104,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  完了!
-echo  インストーラ: Output\GeminiTranscriberSetup-2.0.4.exe
+echo  インストーラ: Output\GeminiTranscriberSetup-2.0.5.exe
 echo ============================================================
 pause
 endlocal

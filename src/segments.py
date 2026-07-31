@@ -207,6 +207,9 @@ class Project:
     # 音声の中身から作った指紋。ファイル名が同じでも中身が変われば別物として
     # 扱うために使う(空文字なら未記録 = 古い形式の作業ファイル)。
     audio_fingerprint: str = ""
+    # 再生位置のずれ補正(秒)。Gemini の時刻推定が実音声より早い/遅いときに
+    # 使う。録音ごとに傾向が違うので、設定ではなく作業ファイルに持たせる。
+    time_offset: float = 0.0
     speakers: list[Speaker] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     json_path: Optional[str] = None      # 保存先(load 時に設定)
@@ -286,6 +289,7 @@ class Project:
             "model": self.model,
             "verbatim": self.verbatim,
             "audio_fingerprint": self.audio_fingerprint,
+            "time_offset": self.time_offset,
             "speakers": [sp.to_dict() for sp in self.speakers],
             "segments": [sg.to_dict() for sg in self.segments],
         }
@@ -299,6 +303,7 @@ class Project:
             model=str(d.get("model", "")),
             verbatim=bool(d.get("verbatim", False)),
             audio_fingerprint=str(d.get("audio_fingerprint", "")),
+            time_offset=float(d.get("time_offset", 0.0) or 0.0),
             speakers=[Speaker.from_dict(x) for x in d.get("speakers", [])],
             segments=[Segment.from_dict(x) for x in d.get("segments", [])],
         )
