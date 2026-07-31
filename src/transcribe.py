@@ -428,6 +428,35 @@ def normalize_cluster_label(label: str | None) -> str:
 MERGE_MAX_SECONDS = 180.0    # これを超えたら区切る(聴き直しが辛くなるため)
 MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
 
+# ----------------------------------------------------------------------
+# 発言の長さの見積もり
+#
+# 区間の終わりは「次の区間の始まり」で決めているが、会話では相づちが
+# 発言に重なるため、これだけだと長い発言の再生窓が 1 秒に潰れる。
+#
+#   [07:03] 【A】 彼が要するに院外理事で、あの、理事で、あとはみんな…
+#   [07:04] 【C】 うん。      ← A がまだ話している最中の相づち
+#
+# 実際に確認された事例では、37 文字の発言が 1 秒で切られ、
+# 再生すると「彼」だけ聞こえて終わっていた。
+# 文字数から必要な秒数を見積もり、足りなければ終わりを延ばす。
+# ----------------------------------------------------------------------
+
+# 日本語の話速の目安。逐語では言いよどみが多く実測 4〜6 文字/秒。
+# 短く見積もると発言が途中で切れるので、遅めに見ておく。
+SPEECH_CHARS_PER_SECOND = 4.5
+MIN_SEGMENT_SECONDS = 1.0
+MAX_ESTIMATED_SECONDS = 120.0
+
+
+def estimate_speech_seconds(text: str) -> float:
+    """本文の文字数から、その発言に必要な秒数を見積もる。"""
+    n = len(text.strip())
+    if not n:
+        return MIN_SEGMENT_SECONDS
+    return min(MAX_ESTIMATED_SECONDS,
+               max(MIN_SEGMENT_SECONDS, n / SPEECH_CHARS_PER_SECOND))
+
 # 連結時、直前がこれらで終わっていれば読点を足さない
 _SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
 
@@ -564,6 +593,14 @@ def parse_segments(
     # (末尾の音声が どの区間にも属さない状態を作らないため)
     if raw and chunk_len > raw[-1]["rel_end"]:
         raw[-1]["rel_end"] = chunk_len
+
+    # 相づちが重なって潰された区間の終わりを、本文の長さから伸ばす。
+    # 区間どうしが時間的に重なることになるが、実際の会話が重なっている
+    # のだから、これで正しい。再生窓が本文に見合う長さになる。
+    for r in raw:
+        need = estimate_speech_seconds(r["text"])
+        if r["rel_end"] - r["rel"] < need:
+            r["rel_end"] = min(chunk_len, r["rel"] + need)
 
     out: list[dict] = []
     for i, r in enumerate(raw):

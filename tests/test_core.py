@@ -232,6 +232,67 @@ def test_merge_keeps_absolute_times_with_offset():
     assert starts == sorted(starts)
 
 
+# ======================================================================
+# 重なった相づちで発言が切られない(v2.0.4)
+# ======================================================================
+
+def test_estimate_speech_seconds():
+    from src.transcribe import MIN_SEGMENT_SECONDS, estimate_speech_seconds
+
+    assert estimate_speech_seconds("") == MIN_SEGMENT_SECONDS
+    assert estimate_speech_seconds("うん。") == MIN_SEGMENT_SECONDS   # 短い相づちは下限
+    long_line = "彼が要するに院外理事で、あの、理事で、あとはみんな学園の教授の方とか。"
+    assert 6.0 < estimate_speech_seconds(long_line) < 12.0
+    # 長さに比例する
+    assert estimate_speech_seconds("あ" * 100) > estimate_speech_seconds("あ" * 50)
+
+
+def test_overlapping_backchannel_does_not_truncate():
+    """相づちが発言に重なると、終了時刻が次の開始で潰されていた。
+
+    実機で確認された事例: 37文字の発言の再生窓が 1 秒になり、
+    再生すると「彼」だけ聞こえて切れた。
+    """
+    text = """[07:02] 【C】 卒業生。
+[07:03] 【A】 彼が要するに院外理事で、あの、理事で、あとはみんな学園の教授の方とか。
+[07:04] 【C】 うん。
+[07:30] 【A】 次の発言。
+"""
+    segs = parse_segments(text, chunk_index=5, offset_seconds=2700, chunk_seconds=540)
+    long_seg = next(s for s in segs if "院外理事" in s["text"])
+    # 次の開始(07:04)で切られず、本文に見合う長さが確保されている
+    assert long_seg["end"] - long_seg["start"] > 6.0, long_seg
+    # 開始時刻は動かさない(Gemini の推定をそのまま使う)
+    assert long_seg["start"] == 2700 + 7 * 60 + 3
+
+    # 短い相づちの終わりは伸ばさない(次の区間の開始のまま)
+    aizuchi = next(s for s in segs if s["text"].strip() == "うん。")
+    assert aizuchi["start"] == 2700 + 7 * 60 + 4
+    assert aizuchi["end"] == 2700 + 7 * 60 + 30
+
+
+def test_extension_is_clamped_to_chunk_end():
+    """チャンク(音声)の末尾を越えて伸ばさない"""
+    text = "[08:58] 【A】 " + "あ" * 300 + "\n"
+    segs = parse_segments(text, chunk_index=0, offset_seconds=0, chunk_seconds=540)
+    assert segs[-1]["end"] == 540.0
+
+
+def test_all_segments_fit_their_text():
+    """どの区間も、本文を読み上げるのに足りる長さを持つ"""
+    from src.transcribe import estimate_speech_seconds
+
+    text = """[00:00] 【A】 これはかなり長い発言でして、相づちが重なっても最後まで再生できる必要があります。
+[00:01] 【B】 うん。
+[00:02] 【A】 続けてもう一つ、これも長めの発言をしておきます。切られては困ります。
+[00:03] 【C】 はい。
+"""
+    segs = parse_segments(text, 0, 0, 600)
+    for s in segs:
+        need = estimate_speech_seconds(s["text"])
+        assert s["end"] - s["start"] >= need - 0.01, (s["text"][:20], s["end"] - s["start"], need)
+
+
 def test_cluster_prompt_forbids_fragmenting():
     p = build_prompt(True, True, cluster_only=True)
     assert "同じ人が話し続けている間は、絶対に行を分けない" in p

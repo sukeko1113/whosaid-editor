@@ -36,13 +36,27 @@ from .segments import (
     write_text,
 )
 from .suggest import SpeakerSuggester, next_unassigned, next_unreviewed
+from .transcribe import estimate_speech_seconds
 
 
 SPEEDS = ["0.8x", "1.0x", "1.2x", "1.5x", "2.0x"]
 
-# 1 区間の再生はここで打ち切る。話者の判別には先頭だけで足りるうえ、
-# 同じ話者の連続をまとめた結果、数分に及ぶ区間ができるため。
-PREVIEW_MAX_SECONDS = 60.0
+# 1 区間の再生の長さ。
+#
+# 区間の終わりは「次の区間の始まり」で決めているため、
+#   - 次の発言が遠いと、「うん。」の再生窓が数十秒になる(待たされる)
+#   - 逆に相づちが重なると長い発言が切られる(こちらは区間側で解決済み)
+# 再生は本文に見合う長さ + 余裕、とする。
+PREVIEW_MAX_SECONDS = 60.0     # 上限。長い発言でも先頭だけで判別できる
+PREVIEW_MIN_SECONDS = 8.0      # 下限。短い相づちでも聞き取れる長さは要る
+PREVIEW_SLACK_SECONDS = 5.0    # Gemini の時刻推定がずれる分の余裕
+
+
+def preview_length(text: str, duration: float) -> float:
+    """この区間を何秒再生するか。"""
+    need = estimate_speech_seconds(text) + PREVIEW_SLACK_SECONDS
+    need = max(PREVIEW_MIN_SECONDS, min(PREVIEW_MAX_SECONDS, need))
+    return min(duration, need) if duration > 0 else need
 
 # 話者ごとの色(タイムライン帯・一覧の色分け用)
 PALETTE = [
@@ -608,8 +622,8 @@ class AssignWindow(tk.Toplevel):
         state = "未確定"
         if seg.speaker_id:
             state = "確認済み" if seg.reviewed else "△まとめて適用(未確認)"
-        long_note = (f"(再生は先頭{PREVIEW_MAX_SECONDS:.0f}秒まで)"
-                     if seg.duration > PREVIEW_MAX_SECONDS else "")
+        plen = preview_length(seg.text, seg.duration)
+        long_note = (f"(再生は先頭{plen:.0f}秒)" if plen < seg.duration - 0.5 else "")
         self.var_seginfo.set(
             f"区間 {pos}/{len(self.proj.segments)}   "
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
@@ -843,11 +857,10 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
-        # 長い区間を丸ごと流すと待たされる。話者の判別には先頭だけで足りるので、
-        # 既定では頭 PREVIEW_MAX_SECONDS 秒で切る(「この先30秒▶」で続きを聴ける)。
+        # 本文に見合う長さだけ再生する(「この先30秒▶」で続きを聴ける)。
         preview_end = seg.end
-        if extend <= 0 and seg.duration > PREVIEW_MAX_SECONDS:
-            preview_end = seg.start + PREVIEW_MAX_SECONDS
+        if extend <= 0:
+            preview_end = seg.start + preview_length(seg.text, seg.duration)
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
