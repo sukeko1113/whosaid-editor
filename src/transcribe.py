@@ -363,6 +363,10 @@ def transcribe_audio(
     for attempt in range(max_retries):
         try:
             check_cancel()
+            # 再試行時はアップロードからやり直すので、何回目かを添えないと
+            # 「なぜまた最初に戻ったのか」が利用者に分からない。
+            suffix = "" if attempt == 0 else f" ({attempt + 1}/{max_retries}回目)"
+            log(f"  音声をアップロード中...{suffix}")
             uploaded = client.files.upload(file=str(audio_path))
 
             waited = 0
@@ -370,6 +374,8 @@ def transcribe_audio(
                 check_cancel()
                 time.sleep(1)
                 waited += 1
+                if waited % 15 == 0:
+                    log(f"  Gemini 側でファイル処理待ち... ({waited}秒経過)")
                 if waited > 300:  # 5分タイムアウト
                     raise RuntimeError("ファイル処理がタイムアウトしました。")
                 uploaded = client.files.get(name=uploaded.name)
@@ -380,6 +386,7 @@ def transcribe_audio(
             text = ""
             for temp in _TEMPERATURES:
                 check_cancel()
+                log("  文字起こしを生成中...(長いチャンクでは数分かかります)")
                 response = client.models.generate_content(
                     model=model,
                     contents=[uploaded, prompt],
@@ -416,8 +423,12 @@ def transcribe_audio(
             last_error = e
             if attempt < max_retries - 1:
                 # レート上限は数秒では抜けない。長めに待つ。
-                wait = (20 * (attempt + 1)) if _is_rate_limited(e) else (2 ** attempt)
-                log(f"  失敗({e}) — {wait}秒待って再試行します")
+                # それ以外の通信エラーも 1→2秒 では短すぎて再試行が空振りする
+                # ことが多かったため 5→10秒 にしてある(2026-07 実戦投入で確認)。
+                wait = (20 * (attempt + 1)) if _is_rate_limited(e) else (5 * (2 ** attempt))
+                # 例外の文字列は非常に長いことがあるので頭だけ出す。
+                log(f"  通信エラー: {type(e).__name__}: {str(e)[:200]}")
+                log(f"  {wait}秒後に再試行します ({attempt + 2}/{max_retries}回目)...")
                 sleep_cancellable(wait)
 
     assert last_error is not None
