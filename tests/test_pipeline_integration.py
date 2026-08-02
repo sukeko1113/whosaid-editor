@@ -46,7 +46,8 @@ def make_tone(path: Path, seconds: int) -> None:
 
 def run() -> int:
     if not shutil.which("ffmpeg"):
-        print("ffmpeg が無いためスキップします。")
+        print("SKIPPED: ffmpeg が見つからないため、このテストは実行されていません。")
+        print("         (ALL PASSED ではありません。CI では ffmpeg が入るので実行されます)")
         return 0
 
     failures = []

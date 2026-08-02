@@ -363,9 +363,16 @@ class AssignWindow(tk.Toplevel):
         self.bind("<Tab>", lambda e: self._guarded_break(self._goto_next_target))
         self.bind("<Shift-Tab>",
                   lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
-        # X11 では Shift+Tab は ISO_Left_Tab として届く
-        self.bind("<ISO_Left_Tab>",
-                  lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
+        # X11 では Shift+Tab が ISO_Left_Tab として届く。
+        # ただしこのキーシムを知らない Tk(Windows の一部のバージョン)では
+        # bind した時点で TclError になり、割当画面が開かなくなる。
+        # Shift+Tab 自体は上の <Shift-Tab> で拾えているので、
+        # ここは「使えるなら足す」程度の扱いにする。
+        try:
+            self.bind("<ISO_Left_Tab>",
+                      lambda e: self._guarded_break(lambda: self._goto_next_target(forward=False)))
+        except tk.TclError:
+            pass
         for ch in QUICK_KEYS:
             self.bind(ch, self._key_digit)
         for key, fn in (
