@@ -251,6 +251,15 @@ class FatalTranscriptionError(RuntimeError):
     """再試行しても解消しないエラー(残高切れ・APIキー不正など)"""
 
 
+class CancelledError(Exception):
+    """利用者の操作による中止。
+
+    transcribe_audio の中では、汎用の `except Exception` より前に
+    `except CancelledError: raise` で抜けている。この順序を崩すと
+    中止が「通信エラー」と誤認されて再試行に回るので注意。
+    """
+
+
 _MSG_DEPLETED = (
     "Gemini API の残高が尽きています。\n\n"
     "Google AI Studio (https://aistudio.google.com/) を開き、"
@@ -314,11 +323,16 @@ def transcribe_audio(
     max_retries: int = 3,
     on_log=None,
     cluster_only: bool = False,
+    is_cancelled=None,
 ) -> str:
     """1チャンクをGeminiで文字起こし。
 
     - 通信エラー等は指数バックオフで再試行(従来どおり)
     - 暴走ループを検出したら temperature を上げて再生成(v1.3.0)
+    - is_cancelled が True を返したら CancelledError を送出する。
+      チャンク1つが10分近くかかるので、待ち時間の途中でも中止できる
+      ようにしてある(呼び出し側の「チャンクとチャンクの間」の判定だけ
+      だと、押してから止まるまで数分待たされる)。
     """
     last_error: Exception | None = None
     prompt = build_prompt(with_timestamps, with_diarization, roster, verbatim, cluster_only)
@@ -327,12 +341,33 @@ def transcribe_audio(
         if on_log:
             on_log(msg)
 
+    def cancelled() -> bool:
+        return bool(is_cancelled and is_cancelled())
+
+    def check_cancel() -> None:
+        if cancelled():
+            raise CancelledError()
+
+    def sleep_cancellable(seconds: float) -> None:
+        """1秒ごとに中止を確認しながら待つ。
+
+        time.sleep(20) をそのまま使うと、その20秒間は中止ボタンが効かない。
+        """
+        for _ in range(int(seconds)):
+            check_cancel()
+            time.sleep(1)
+        rest = seconds - int(seconds)
+        if rest > 0:
+            time.sleep(rest)
+
     for attempt in range(max_retries):
         try:
+            check_cancel()
             uploaded = client.files.upload(file=str(audio_path))
 
             waited = 0
             while uploaded.state.name == "PROCESSING":
+                check_cancel()
                 time.sleep(1)
                 waited += 1
                 if waited > 300:  # 5分タイムアウト
@@ -344,6 +379,7 @@ def transcribe_audio(
 
             text = ""
             for temp in _TEMPERATURES:
+                check_cancel()
                 response = client.models.generate_content(
                     model=model,
                     contents=[uploaded, prompt],
@@ -353,7 +389,7 @@ def transcribe_audio(
                 if not is_degenerate(text):
                     break
                 log(f"  ※ 出力の暴走を検出 (temp={temp})。設定を変えて再生成します...")
-                time.sleep(2)
+                sleep_cancellable(2)
             else:
                 # 全温度で暴走。最後の結果に警告を付けて返す(処理は止めない)
                 log("  ※ 再生成でも暴走が解消しませんでした。このチャンクは要確認です。")
@@ -366,6 +402,10 @@ def transcribe_audio(
 
             return text
 
+        except CancelledError:
+            # 汎用ハンドラより前に置くこと。後ろだと中止が「通信エラー」
+            # と誤認されて再試行に回り、中止が効かなくなる。
+            raise
         except Exception as e:
             fatal = classify_api_error(e)
             if fatal:
@@ -378,7 +418,7 @@ def transcribe_audio(
                 # レート上限は数秒では抜けない。長めに待つ。
                 wait = (20 * (attempt + 1)) if _is_rate_limited(e) else (2 ** attempt)
                 log(f"  失敗({e}) — {wait}秒待って再試行します")
-                time.sleep(wait)
+                sleep_cancellable(wait)
 
     assert last_error is not None
     raise last_error

@@ -18,6 +18,7 @@ from .segments import Project, Segment, Speaker, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
     ROSTER_NOTE,
+    CancelledError,
     FatalTranscriptionError,
     parse_segments,
     shift_timestamps,
@@ -185,10 +186,14 @@ def run_pipeline(
                     roster=roster,
                     verbatim=verbatim,
                     on_log=on_log,
+                    is_cancelled=is_cancelled,
                 )
                 # チャンク内相対時刻 [MM:SS] を絶対時刻 [HH:MM:SS] に変換
                 text = shift_timestamps(raw, offset) if with_timestamps else raw
                 cache_path.write_text(text, encoding="utf-8")
+            except CancelledError:
+                on_log("キャンセルされました。(完了済みチャンクはキャッシュに保存されています)")
+                return None
             except FatalTranscriptionError:
                 raise      # 残高切れ・キー不正は続けても同じ結果になる
             except Exception as e:
@@ -435,8 +440,12 @@ def run_segment_pipeline(
                     verbatim=verbatim,
                     on_log=on_log,
                     cluster_only=True,
+                    is_cancelled=is_cancelled,
                 )
                 cache_path.write_text(raw_text, encoding="utf-8")
+            except CancelledError:
+                on_log("キャンセルされました。(完了済みチャンクはキャッシュに保存されています)")
+                return None
             except FatalTranscriptionError:
                 # 残高切れ・キー不正。続けても全チャンク同じ結果になるので、
                 # 中途半端な結果を作らずにここで止める。
