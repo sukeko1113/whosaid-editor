@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from google import genai
+from google.genai import types as genai_types
 
 from .audio import audio_fingerprint, probe_duration, split_audio
 from .segments import Project, Segment, Speaker, parse_roster
@@ -28,6 +29,24 @@ from .transcribe import (
 LogFn = Callable[[str], None]
 ProgressFn = Callable[[int, int], None]   # (current, total)
 CancelFn = Callable[[], bool]
+
+
+# 1回の HTTP リクエストの上限(ミリ秒)。
+# これが無いと、通信が滞留したとき応答を無限に待ち続けて
+# 処理が「止まったように見える」問題が起きる(2026-07 実戦投入で確認)。
+# タイムアウトすると例外になり、transcribe_audio 側の再試行に乗る。
+REQUEST_TIMEOUT_MS = 8 * 60 * 1000  # 8分
+
+
+def _make_client(api_key: str) -> genai.Client:
+    """タイムアウトを設定した Gemini クライアントを作る。
+
+    Client の生成箇所が複数あるので、設定漏れを防ぐために関数にしてある。
+    """
+    return genai.Client(
+        api_key=api_key,
+        http_options=genai_types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+    )
 
 
 def _unique_path(base: Path) -> Path:
@@ -130,7 +149,7 @@ def run_pipeline(
         on_log("キャンセルされました。")
         return None
 
-    client = genai.Client(api_key=api_key)
+    client = _make_client(api_key)
     transcripts: list[str] = []
     on_progress(0, len(chunks))
 
@@ -378,7 +397,7 @@ def run_segment_pipeline(
         chunk_lengths.append(d)
         acc += d
 
-    client = genai.Client(api_key=api_key)
+    client = _make_client(api_key)
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
