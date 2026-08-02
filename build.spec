@@ -3,17 +3,24 @@
 
 ビルド前提:
 - ffmpeg/ffmpeg.exe を配置済み(Windows)
+- ffmpeg/ffplay.exe も配置しておくと、話者割当画面の区間再生が高速になる
+  (無い場合は winsound による簡易再生にフォールバックする)
 - resources/icon.ico があれば自動でアイコン適用(なくてもOK)
 """
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
 
-# ffmpeg.exe の同梱(Windows のみ)
+# ffmpeg / ffplay の同梱(Windows のみ)
 binaries = []
-ffmpeg_exe = ROOT / "ffmpeg" / "ffmpeg.exe"
-if ffmpeg_exe.exists():
-    binaries.append((str(ffmpeg_exe), "."))
+for name in ("ffmpeg.exe", "ffplay.exe"):
+    exe = ROOT / "ffmpeg" / name
+    if exe.exists():
+        binaries.append((str(exe), "."))
+    elif name == "ffmpeg.exe":
+        raise SystemExit("ffmpeg/ffmpeg.exe が見つかりません。README のビルド手順を参照してください。")
+    else:
+        print(f"[warn] ffmpeg/{name} が見つかりません。区間再生は簡易モードになります。")
 
 # アイコン(任意)
 icon_path = ROOT / "resources" / "icon.ico"

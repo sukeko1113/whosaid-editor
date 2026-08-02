@@ -46,6 +46,29 @@ _RULES_DIAR = """- **話者が変わるごとに新しい行として書き出�
 
 _TAIL = "- 説明や前置き、Markdown 装飾は不要。書き起こし本文のみを出力する。"
 
+# v2.0.0: 手動割当モード用。名簿は渡さず、声質だけで区間に切り分けさせる。
+# 実名の推定をやめたので、プロンプトが短くなり応答も安定する。
+_RULES_CLUSTER = """- **行を分けるのは「話す人が変わったとき」だけ**
+- **各行は必ず次の形式で始める**:
+  [MM:SS] 【A】 本文...
+  (時刻はこの音声の先頭からの 分:秒。ゼロ埋め2桁。ミリ秒は付けない)
+- 話者ラベルは A, B, C, ... のアルファベット1文字のみ。**名前や役職は絶対に書かない**
+- 同じ声の人物には常に同じラベルを使う。声が変われば必ず別のラベルにする
+- **同じ人が話し続けている間は、絶対に行を分けない**。
+  息継ぎ・間・読点・言いよどみで区切ってはいけない。
+  文がいくつ続いても、次の人が話し始めるまでは 1 行に書く。
+  (悪い例: 「工程表」「えー、財源計画」「年度別資金繰り」と 3 行に分ける
+   → 正しくは 1 行に「工程表、えー、財源計画、年度別資金繰り…」と続ける)
+- 同じ人が 3 分以上話し続けた場合のみ、話題の切れ目で行を分けてよい
+- 短い相づち(「はい」「うん」程度)も、別の人物の声なら独立した行にする
+- 誰の声か判別できない場合は 【?】、複数人が同時に話している場合は 【*】 とする"""
+
+_EXAMPLE_CLUSTER = """出力例:
+[00:00] 【A】 本日はお忙しい中お集まりいただきありがとうございます。それでは議事を始めます。まず、お手元の資料をご覧ください。えー、本日の議題は、予算と、あの、人事の二点になります。
+[00:25] 【B】 すみません、確認ですが、前回の議事録は配布済みですか?
+[00:32] 【A】 はい、配布済みです。修正点も反映されています。
+[00:40] 【C】 その件、私からも補足させてください。"""
+
 
 def _roster_block(roster: str) -> str:
     return f"""この音声の参加者は以下のとおり事前に判明しています。話者の判別には、声質に加えて、
@@ -78,9 +101,24 @@ def build_prompt(
     with_diarization: bool,
     roster: str = "",
     verbatim: bool = False,
+    cluster_only: bool = False,
 ) -> str:
-    """設定に応じて文字起こしプロンプトを組み立てる。"""
+    """設定に応じて文字起こしプロンプトを組み立てる。
+
+    cluster_only=True のときは v2.0.0 の手動割当モード用。
+    名簿を渡さず、声質だけで A/B/C… に切り分けた区間リストを作らせる。
+    """
     parts: list[str] = ["この音声を日本語で書き起こしてください。", ""]
+
+    if cluster_only:
+        parts.append("ルール:")
+        parts.append(_RULES_CLUSTER)
+        parts.append(_RULES_VERBATIM if verbatim else _RULES_CLEANUP)
+        if verbatim:
+            parts.append("- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)")
+        parts.append(_TAIL)
+        parts += ["", _EXAMPLE_CLUSTER]
+        return "\n".join(parts)
 
     if with_diarization and roster.strip():
         parts += [_roster_block(roster), ""]
@@ -201,6 +239,76 @@ def shift_timestamps(text: str, offset_seconds: int) -> str:
 
 
 # ======================================================================
+# API エラーの分類
+#
+# 残高切れ・キー不正は何度やり直しても直らない。再試行で時間を浪費した
+# うえに、エラーの生 JSON を本文として書き込んでしまうと、割当画面には
+# 「文字起こし失敗: ... RESOURCE_EXHAUSTED ...」という区間だけが並ぶ。
+# 直せないエラーは即座に、何をすればよいかを添えて中断する。
+# ======================================================================
+
+class FatalTranscriptionError(RuntimeError):
+    """再試行しても解消しないエラー(残高切れ・APIキー不正など)"""
+
+
+class CancelledError(Exception):
+    """利用者の操作による中止。
+
+    transcribe_audio の中では、汎用の `except Exception` より前に
+    `except CancelledError: raise` で抜けている。この順序を崩すと
+    中止が「通信エラー」と誤認されて再試行に回るので注意。
+    """
+
+
+_MSG_DEPLETED = (
+    "Gemini API の残高が尽きています。\n\n"
+    "Google AI Studio (https://aistudio.google.com/) を開き、"
+    "課金設定と残高を確認して補充してください。\n\n"
+    "補充後に同じ設定で実行し直せば続きから再開できます"
+    "(失敗したチャンクはキャッシュされていません)。"
+)
+
+_MSG_QUOTA = (
+    "Gemini API の利用上限に達しています。\n\n"
+    "しばらく待ってから実行し直すか、Google AI Studio "
+    "(https://aistudio.google.com/) で上限と課金設定を確認してください。\n\n"
+    "実行し直せば続きから再開できます。"
+)
+
+_MSG_AUTH = (
+    "Gemini API キーが正しくないか、このキーでは使えないモデルです。\n\n"
+    "https://aistudio.google.com/apikey で発行し直し、"
+    "詳細設定の「API キー」に貼り直して「保存」を押してください。"
+)
+
+
+def classify_api_error(exc: Exception) -> str | None:
+    """再試行しても無駄なエラーなら、利用者向けの説明文を返す。
+
+    再試行する価値があるエラー(一時的な通信断・分あたりのレート上限など)
+    では None を返す。
+    """
+    text = str(exc).lower()
+
+    if any(k in text for k in ("credits are depleted", "prepayment", "billing")):
+        return _MSG_DEPLETED
+    if "exceeded your current quota" in text or "quota_exceeded" in text:
+        return _MSG_QUOTA
+    if any(k in text for k in (
+        "api key not valid", "api_key_invalid", "invalid api key",
+        "unauthenticated", "permission_denied", "permission denied",
+    )):
+        return _MSG_AUTH
+    return None
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """分あたりのレート上限。待てば通るので、長めに待って再試行する。"""
+    text = str(exc).lower()
+    return "429" in text or "resource_exhausted" in text or "rate limit" in text
+
+
+# ======================================================================
 # 文字起こし本体
 # ======================================================================
 
@@ -214,27 +322,60 @@ def transcribe_audio(
     verbatim: bool = False,
     max_retries: int = 3,
     on_log=None,
+    cluster_only: bool = False,
+    is_cancelled=None,
 ) -> str:
     """1チャンクをGeminiで文字起こし。
 
     - 通信エラー等は指数バックオフで再試行(従来どおり)
     - 暴走ループを検出したら temperature を上げて再生成(v1.3.0)
+    - is_cancelled が True を返したら CancelledError を送出する。
+      チャンク1つが10分近くかかるので、待ち時間の途中でも中止できる
+      ようにしてある(呼び出し側の「チャンクとチャンクの間」の判定だけ
+      だと、押してから止まるまで数分待たされる)。
     """
     last_error: Exception | None = None
-    prompt = build_prompt(with_timestamps, with_diarization, roster, verbatim)
+    prompt = build_prompt(with_timestamps, with_diarization, roster, verbatim, cluster_only)
 
     def log(msg: str) -> None:
         if on_log:
             on_log(msg)
 
+    def cancelled() -> bool:
+        return bool(is_cancelled and is_cancelled())
+
+    def check_cancel() -> None:
+        if cancelled():
+            raise CancelledError()
+
+    def sleep_cancellable(seconds: float) -> None:
+        """1秒ごとに中止を確認しながら待つ。
+
+        time.sleep(20) をそのまま使うと、その20秒間は中止ボタンが効かない。
+        """
+        for _ in range(int(seconds)):
+            check_cancel()
+            time.sleep(1)
+        rest = seconds - int(seconds)
+        if rest > 0:
+            time.sleep(rest)
+
     for attempt in range(max_retries):
         try:
+            check_cancel()
+            # 再試行時はアップロードからやり直すので、何回目かを添えないと
+            # 「なぜまた最初に戻ったのか」が利用者に分からない。
+            suffix = "" if attempt == 0 else f" ({attempt + 1}/{max_retries}回目)"
+            log(f"  音声をアップロード中...{suffix}")
             uploaded = client.files.upload(file=str(audio_path))
 
             waited = 0
             while uploaded.state.name == "PROCESSING":
+                check_cancel()
                 time.sleep(1)
                 waited += 1
+                if waited % 15 == 0:
+                    log(f"  Gemini 側でファイル処理待ち... ({waited}秒経過)")
                 if waited > 300:  # 5分タイムアウト
                     raise RuntimeError("ファイル処理がタイムアウトしました。")
                 uploaded = client.files.get(name=uploaded.name)
@@ -244,6 +385,8 @@ def transcribe_audio(
 
             text = ""
             for temp in _TEMPERATURES:
+                check_cancel()
+                log("  文字起こしを生成中...(長いチャンクでは数分かかります)")
                 response = client.models.generate_content(
                     model=model,
                     contents=[uploaded, prompt],
@@ -253,7 +396,7 @@ def transcribe_audio(
                 if not is_degenerate(text):
                     break
                 log(f"  ※ 出力の暴走を検出 (temp={temp})。設定を変えて再生成します...")
-                time.sleep(2)
+                sleep_cancellable(2)
             else:
                 # 全温度で暴走。最後の結果に警告を付けて返す(処理は止めない)
                 log("  ※ 再生成でも暴走が解消しませんでした。このチャンクは要確認です。")
@@ -266,14 +409,329 @@ def transcribe_audio(
 
             return text
 
+        except CancelledError:
+            # 汎用ハンドラより前に置くこと。後ろだと中止が「通信エラー」
+            # と誤認されて再試行に回り、中止が効かなくなる。
+            raise
         except Exception as e:
+            fatal = classify_api_error(e)
+            if fatal:
+                # 直せないエラー。再試行せず、原因と対処を添えて中断する。
+                log(f"  中断: {fatal.splitlines()[0]}")
+                raise FatalTranscriptionError(fatal) from e
+
             last_error = e
             if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                time.sleep(wait)
+                # レート上限は数秒では抜けない。長めに待つ。
+                # それ以外の通信エラーも 1→2秒 では短すぎて再試行が空振りする
+                # ことが多かったため 5→10秒 にしてある(2026-07 実戦投入で確認)。
+                wait = (20 * (attempt + 1)) if _is_rate_limited(e) else (5 * (2 ** attempt))
+                # 例外の文字列は非常に長いことがあるので頭だけ出す。
+                log(f"  通信エラー: {type(e).__name__}: {str(e)[:200]}")
+                log(f"  {wait}秒後に再試行します ({attempt + 2}/{max_retries}回目)...")
+                sleep_cancellable(wait)
 
     assert last_error is not None
     raise last_error
+
+
+# ======================================================================
+# v2.0.0: 出力テキスト → セグメント(発言区間)への変換
+# ======================================================================
+
+# チャンク内相対時刻 + 話者ラベルの行頭パターン
+_SEG_LINE = re.compile(
+    r"^\s*[\[［(（]\s*"
+    r"(?:(\d{1,2})\s*[:：]\s*)?"        # 任意の「時」
+    r"(\d{1,3})\s*[:：]\s*(\d{1,2})"     # 分:秒
+    r"(?:[.,]\d+)?"                      # ミリ秒(あれば捨てる)
+    r"\s*[\]］)）]\s*"
+    r"(?:[【\[]\s*(?P<label>[^】\]]{1,24}?)\s*[】\]])?"   # 任意の話者ラベル
+    r"\s*(?P<body>.*)$"
+)
+
+# ラベルの正規化: 「発言者A」「話者A」「Speaker A」→ "A"
+_LABEL_STRIP = re.compile(r"^\s*(?:発言者|話者|speaker)\s*[::\-]?\s*", re.IGNORECASE)
+
+CLUSTER_UNKNOWN = "?"
+CLUSTER_MULTI = "*"
+
+
+def normalize_cluster_label(label: str | None) -> str:
+    """Gemini が返した話者ラベルを 1〜3 文字のクラスタ記号に正規化する。"""
+    if not label:
+        return CLUSTER_UNKNOWN
+    s = _LABEL_STRIP.sub("", label.strip())
+    if not s:
+        return CLUSTER_UNKNOWN
+    if any(k in s for k in ("複数", "重複", "同時")) or s in ("*", "＊"):
+        return CLUSTER_MULTI
+    if any(k in s for k in ("不明", "不詳", "unknown")) or s in ("?", "？"):
+        return CLUSTER_UNKNOWN
+    # 先頭の英字 1 文字を採用(「A」「A(男性)」「A さん」など)
+    m = re.match(r"[A-Za-z]", s)
+    if m:
+        return m.group(0).upper()
+    return s[:3]
+
+
+# 同じ話者の連続をまとめるときの上限
+MERGE_MAX_SECONDS = 180.0    # これを超えたら区切る(聴き直しが辛くなるため)
+MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
+
+# ----------------------------------------------------------------------
+# 発言の長さの見積もり
+#
+# 区間の終わりは「次の区間の始まり」で決めているが、会話では相づちが
+# 発言に重なるため、これだけだと長い発言の再生窓が 1 秒に潰れる。
+#
+#   [07:03] 【A】 彼が要するに院外理事で、あの、理事で、あとはみんな…
+#   [07:04] 【C】 うん。      ← A がまだ話している最中の相づち
+#
+# 実際に確認された事例では、37 文字の発言が 1 秒で切られ、
+# 再生すると「彼」だけ聞こえて終わっていた。
+# 文字数から必要な秒数を見積もり、足りなければ終わりを延ばす。
+# ----------------------------------------------------------------------
+
+# 日本語の話速の目安。逐語では言いよどみが多く実測 4〜6 文字/秒。
+# 短く見積もると発言が途中で切れるので、遅めに見ておく。
+SPEECH_CHARS_PER_SECOND = 4.5
+MIN_SEGMENT_SECONDS = 1.0
+MAX_ESTIMATED_SECONDS = 120.0
+
+
+def estimate_speech_seconds(text: str) -> float:
+    """本文の文字数から、その発言に必要な秒数を見積もる。"""
+    n = len(text.strip())
+    if not n:
+        return MIN_SEGMENT_SECONDS
+    return min(MAX_ESTIMATED_SECONDS,
+               max(MIN_SEGMENT_SECONDS, n / SPEECH_CHARS_PER_SECOND))
+
+
+def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
+    """時刻が詰まりすぎている区間を、本文の長さで按分し直す。
+
+    Gemini は発言が立て込むと 1 秒刻みで機械的に時刻を振ってくる。
+
+        [06:47] 【B】 それができればいいんだけど。   ← 13文字
+        [06:48] 【A】 理事がもう。                   ←  6文字
+        [06:49] 【B】 はい。
+        [06:50] 【A】 ま、梅田さんとあともう1人の県議以外は全部内部理事。 ← 25文字
+        [06:51] 【C】 うん。
+        [06:56] 【B】 県議で。
+
+    4 秒に 5 発言。25 文字の発言が 1 秒で終わるはずがないので、この範囲の
+    時刻は信用できない。一方 [06:51]→[06:56] のように次まで余裕がある区間は
+    信用してよい。
+
+    そこで「次まで余裕がある区間」を目印(アンカー)とみなし、詰まっている
+    部分はアンカーまでの時間を本文の長さで按分する。
+
+    単純に終わりを延ばすだけだと(v2.0.4)、隣り合う区間の再生窓が重なって
+    同じ音声が聞こえてしまう。按分なら重ならない。
+    """
+    n = len(raw)
+    if n == 0:
+        return raw
+
+    needs = [estimate_speech_seconds(r["text"]) for r in raw]
+    starts = [float(r["rel"]) for r in raw]
+
+    def next_start(k: int) -> float:
+        return starts[k + 1] if k + 1 < n else chunk_len
+
+    i = 0
+    while i < n:
+        if next_start(i) - starts[i] >= needs[i] - 0.01:
+            # 余裕がある。従来どおり「次の始まり」まで
+            raw[i]["rel_end"] = next_start(i)
+            i += 1
+            continue
+
+        # 詰まっている。余裕のある区間(アンカー)までをひとまとまりにする。
+        # アンカー自身も含めることで、詰まった区間が時間を借りられる。
+        j = i
+        while j < n - 1 and next_start(j) - starts[j] < needs[j] - 0.01:
+            j += 1
+
+        span_start = starts[i]
+        span_end = next_start(j)
+        span = max(0.3, span_end - span_start)
+        total = sum(needs[i:j + 1]) or 1.0
+
+        # 余裕がある場合に必要以上へ引き伸ばさない。
+        # 足りない場合だけ、全体を同じ割合で縮める。
+        scale = min(1.0, span / total)
+
+        cursor = span_start
+        for k in range(i, j + 1):
+            share = needs[k] * scale
+            raw[k]["rel"] = round(cursor, 3)
+            raw[k]["rel_end"] = round(cursor + share, 3)
+            cursor += share
+        # 余った時間は最後の区間に付ける(どの区間にも属さない音声を残さない)
+        if raw[j]["rel_end"] < span_end:
+            raw[j]["rel_end"] = round(span_end, 3)
+        i = j + 1
+
+    return raw
+
+# 連結時、直前がこれらで終わっていれば読点を足さない
+_SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
+
+
+def _join_fragments(left: str, right: str) -> str:
+    """断片を連結する。日本語なので空白は挟まない。
+
+    Gemini が行を分けた位置は、話者が息を継いだ位置に対応している。
+    そのまま連結すると「吉沢と申しますけどもえー、まず…」と読みにくいので、
+    直前が句読点で終わっていなければ読点を補う。
+    (逐語での「間」の表現であり、発話内容そのものは変えない)
+    """
+    left = left.rstrip()
+    right = right.lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    if left[-1] in _SENTENCE_ENDS or right[0] in _SENTENCE_ENDS:
+        return left + right
+    return left + "、" + right
+
+
+def merge_consecutive(
+    raw: list[dict],
+    max_seconds: float = MERGE_MAX_SECONDS,
+    max_gap: float = MERGE_MAX_GAP,
+) -> list[dict]:
+    """同じ話者ラベルが連続する行をひとつの発言にまとめる。
+
+    Gemini は指示しても、息継ぎや読点のたびに行を分けてくることがある。
+    (「工程表」「えー、財源計画」「年度別資金繰り」…と 1 文が 7 行に割れる)
+    そのままだと 52 分の音声で 600 区間を超え、割当作業が現実的でなくなる。
+    話者が変わらない限り 1 件にまとめる。
+
+    まとめない例外:
+      - 【?】【*】(判別不能・複数人同時) … 中身がばらばらなので連結しない
+      - 直前の終わりから max_gap 秒以上空いている … 別の発言とみなす
+      - まとめると max_seconds を超える … 聴き直せる長さに保つ
+    """
+    out: list[dict] = []
+    for r in raw:
+        if out:
+            prev = out[-1]
+            same = prev["cluster"] == r["cluster"]
+            pseudo = r["cluster"] in (CLUSTER_UNKNOWN, CLUSTER_MULTI)
+            gap = r["rel"] - prev["rel_end"]
+            span = r["rel_end"] - prev["rel"]
+            if same and not pseudo and gap <= max_gap and span <= max_seconds:
+                prev["text"] = _join_fragments(prev["text"], r["text"])
+                prev["rel_end"] = r["rel_end"]
+                continue
+        out.append(dict(r))
+    return out
+
+
+def parse_segments(
+    text: str,
+    chunk_index: int = 0,
+    offset_seconds: float = 0.0,
+    chunk_seconds: float | None = None,
+    start_index: int = 0,
+    merge_same_speaker: bool = True,
+) -> list[dict]:
+    """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
+
+    - 時刻はチャンク内相対値として読み、offset_seconds を足して絶対秒にする
+    - 時刻が巻き戻っている行は直前の時刻に合わせる(Gemini が稀に乱す)
+    - 行頭が時刻でない行は、直前の区間の続きとして連結する
+    - 区間の終了時刻は「次の区間の開始」、最後だけチャンク末尾
+
+    戻り値の各要素は Segment(...) にそのまま渡せるキーを持つ。
+    """
+    raw: list[dict] = []
+    prev_rel = 0.0
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _SEG_LINE.match(line)
+        if not m:
+            if raw:
+                raw[-1]["text"] = (raw[-1]["text"] + " " + line).strip()
+            else:
+                raw.append({
+                    "rel": 0.0,
+                    "cluster": CLUSTER_UNKNOWN,
+                    "text": line,
+                })
+            continue
+
+        h, mm, ss = m.group(1), m.group(2), m.group(3)
+        rel = (int(h) * 3600 if h else 0) + int(mm) * 60 + int(ss)
+        rel = max(0.0, float(rel))
+        if chunk_seconds:
+            rel = min(rel, float(chunk_seconds))
+        if rel < prev_rel:
+            rel = prev_rel
+        prev_rel = rel
+
+        body = (m.group("body") or "").strip()
+        cluster = normalize_cluster_label(m.group("label"))
+
+        # 話者ラベルも本文も無い行(区切りだけ)はスキップ
+        if not body and m.group("label") is None:
+            continue
+        raw.append({"rel": rel, "cluster": cluster, "text": body})
+
+    # 本文が空の区間は落とす(直前に吸収されなかったもの)
+    raw = [r for r in raw if r["text"]]
+    if not raw:
+        return []
+
+    # 各行の終わりを「次の行の開始」として先に決める。
+    # まとめる判定に終了時刻が要るため、連結より前に確定させる。
+    #
+    # 最後の行だけは暫定値を入れておく。ここでチャンク末尾まで伸ばすと、
+    # 末尾の無音ぶんまで長さに数えてしまい、最後の一続きが
+    # 「長すぎる」と判定されて連結されなくなる。
+    chunk_len = float(chunk_seconds) if chunk_seconds else raw[-1]["rel"]
+    for i, r in enumerate(raw):
+        if i + 1 < len(raw):
+            r["rel_end"] = raw[i + 1]["rel"]
+        else:
+            r["rel_end"] = min(chunk_len, r["rel"] + 2.0)
+        if r["rel_end"] <= r["rel"]:
+            r["rel_end"] = r["rel"] + 1.0
+
+    if merge_same_speaker:
+        raw = merge_consecutive(raw)
+
+    # 連結が済んでから、時刻を割り振り直す。
+    # (詰まっている箇所を本文の長さで按分。区間どうしは重ならない)
+    raw = redistribute_times(raw, chunk_len)
+
+    # 末尾の音声がどの区間にも属さない状態を作らない
+    if raw and chunk_len > raw[-1]["rel_end"]:
+        raw[-1]["rel_end"] = chunk_len
+
+    out: list[dict] = []
+    for i, r in enumerate(raw):
+        start = offset_seconds + r["rel"]
+        end = offset_seconds + r["rel_end"]
+        if end <= start:
+            end = start + 1.0
+        out.append({
+            "index": start_index + i,
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "text": r["text"],
+            "cluster": f"{chunk_index}:{r['cluster']}",
+            "chunk": chunk_index,
+        })
+    return out
 
 
 # ======================================================================

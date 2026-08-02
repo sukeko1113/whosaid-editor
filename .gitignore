@@ -39,3 +39,14 @@ desktop.ini
 .env
 .env.*
 config.local.json
+
+# tests
+__pycache__/
+.pytest_cache/
+
+# 動作確認用に repo 直下へ展開したポータブル版・ビルド成果物
+# (上の build/ dist/ Output/ では拾えない位置に置かれることがある)
+GeminiTranscriber.exe
+GeminiTranscriberSetup-*.exe
+_internal/
+gemini-transcriber/
