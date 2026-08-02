@@ -65,8 +65,13 @@ def run() -> int:
         return FAKE_CHUNK_OUTPUT
 
     class FakeClient:
-        def __init__(self, api_key=None):
-            pass
+        def __init__(self, api_key=None, http_options=None):
+            # http_options を受け取らないと、_make_client() が渡す
+            # タイムアウト設定で TypeError になる。
+            # 併せて「タイムアウトが設定されているか」もここで検証する
+            # (設定漏れは、実行してみるまで気づけない種類の不具合なので)。
+            assert http_options is not None, "genai.Client にタイムアウトが設定されていない"
+            self.http_options = http_options
 
     real_transcribe = pipeline.transcribe_audio
     real_genai = pipeline.genai
