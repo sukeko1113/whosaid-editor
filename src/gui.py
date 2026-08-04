@@ -24,6 +24,7 @@ MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
 
 MODE_MANUAL = "manual"
 MODE_AUTO = "auto"
+MODE_NONE = "none"      # v2.0.7: 話者を分けない(v1 の話者識別オフに相当)
 
 MODE_MANUAL_DESC = (
     "AI は声質で発言者を A/B/C… に分けるだけ。実名は、区間ごとに音声を聴いて"
@@ -32,6 +33,10 @@ MODE_MANUAL_DESC = (
 MODE_AUTO_DESC = (
     "AI が名簿を見て実名まで推定します(v1 の方式)。速いが誤りが多く、"
     "後から直すのが大変です。"
+)
+MODE_NONE_DESC = (
+    "発言者を区別せず、本文だけを書き起こします。話者情報が不要な録音"
+    "(独話・メモ・講演など)向け。転写が最も速く安定します。"
 )
 ROSTER_HINT = (
     "1行に1人、「名前(役職)」の形式で入力(例: 佐藤(理事長))。"
@@ -107,9 +112,15 @@ class App(tk.Tk):
         ).grid(row=2, column=0, sticky="w", padx=6)
         ttk.Label(frm_mode, text=MODE_AUTO_DESC, foreground="#666", wraplength=700)\
             .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
+        ttk.Radiobutton(
+            frm_mode, text="分けない(最速)",
+            value=MODE_NONE, variable=self.var_mode, command=self._update_mode_state,
+        ).grid(row=4, column=0, sticky="w", padx=6)
+        ttk.Label(frm_mode, text=MODE_NONE_DESC, foreground="#666", wraplength=700)\
+            .grid(row=5, column=0, sticky="w", padx=28, pady=(0, 6))
         ttk.Button(
             frm_mode, text="保存済みの割当作業を開く...", command=self._open_saved_project,
-        ).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 8))
+        ).grid(row=6, column=0, sticky="w", padx=6, pady=(0, 8))
 
         # === 詳細設定 ===
         frm_adv = ttk.LabelFrame(self, text="詳細設定")
@@ -236,7 +247,7 @@ class App(tk.Tk):
                 self.var_chunk.set(int(chunk))
             except Exception:
                 pass
-        if self.cfg.get("mode") in (MODE_MANUAL, MODE_AUTO):
+        if self.cfg.get("mode") in (MODE_MANUAL, MODE_AUTO, MODE_NONE):
             self.var_mode.set(str(self.cfg["mode"]))
         if "with_timestamps" in self.cfg:
             self.var_timestamps.set(bool(self.cfg.get("with_timestamps")))
@@ -269,6 +280,17 @@ class App(tk.Tk):
             )
             self.txt_roster.configure(state="normal", background="white")
             self.btn_start.configure(text="文字起こし → 割当画面へ")
+        elif self.var_mode.get() == MODE_NONE:
+            # 話者を分けないモード: 話者識別は強制 OFF。
+            # タイムスタンプは任意(段落ごとの [時:分:秒] は話者と無関係に有用)。
+            self.var_diarization.set(False)
+            self.chk_diarization.configure(state="disabled")
+            self.chk_timestamps.configure(state="normal")
+            self.lbl_diar_note.configure(
+                text="※ 発言者を区別せず本文だけを書き起こします。名簿は使いません。"
+            )
+            self.txt_roster.configure(state="disabled", background="#f0f0f0")
+            self.btn_start.configure(text="文字起こし開始")
         else:
             self.chk_diarization.configure(state="normal")
             self.lbl_diar_note.configure(
@@ -280,7 +302,7 @@ class App(tk.Tk):
 
     def _update_diarization_state(self) -> None:
         """(従来方式のみ)話者識別 ON: タイムスタンプは強制 ON。名簿欄を有効化。"""
-        if self.var_mode.get() == MODE_MANUAL:
+        if self.var_mode.get() in (MODE_MANUAL, MODE_NONE):
             return
         if self.var_diarization.get():
             self.var_timestamps.set(True)
@@ -434,6 +456,8 @@ class App(tk.Tk):
         verbatim = bool(self.var_verbatim.get())
         force = bool(self.var_force.get())
         roster = self._get_roster()
+        if mode == MODE_NONE:
+            with_diar = False   # 分けないモードでは常に OFF(UI 上も無効化済み)
         if with_diar:
             with_ts = True  # 強制
 
