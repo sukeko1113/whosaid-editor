@@ -50,3 +50,7 @@ GeminiTranscriber.exe
 GeminiTranscriberSetup-*.exe
 _internal/
 gemini-transcriber/
+
+# ffplay も同梱バイナリ(ローカル/CI で配置)
+ffmpeg/ffplay.exe
+ffmpeg/ffplay
