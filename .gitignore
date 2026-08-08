@@ -54,3 +54,11 @@ gemini-transcriber/
 # ffplay 繧ょ酔譴ｱ繝舌う繝翫Μ(繝ｭ繝ｼ繧ｫ繝ｫ/CI 縺ｧ驟咲ｽｮ)
 ffmpeg/ffplay.exe
 ffmpeg/ffplay
+
+# 動作確認用の音声と作業ファイル
+_tmp/
+*.m4a
+*.mp3
+*.wav
+*.WAV
+*.speakers.json
