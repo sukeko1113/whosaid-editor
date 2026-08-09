@@ -149,7 +149,7 @@ Word 上で直すのは、音声と突き合わせる作業になり非常に手
 ## ファイル構成
 
 ```
-gemini-transcriber/
+whosaid-editor/
 ├─ src/
 │  ├─ main.py        ... エントリーポイント
 │  ├─ gui.py         ... メイン画面(Tkinter)
@@ -216,7 +216,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 2. **ffmpeg.exe と ffplay.exe を配置**します。
    `ffmpeg-release-essentials.zip` を解凍 → `bin\` の 2 つをプロジェクトの `ffmpeg\` にコピー。
    ```
-   gemini-transcriber\
+   whosaid-editor\
      ├─ ffmpeg\
      │   ├─ ffmpeg.exe   ← 必須
      │   └─ ffplay.exe   ← 推奨(無いと区間再生が簡易モードになります)
