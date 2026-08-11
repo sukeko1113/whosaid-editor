@@ -112,6 +112,32 @@ def clamp_times(
     return start, end
 
 
+def move_edge(
+    base_start: float, base_end: float, which: str, value: float, duration: float
+) -> tuple[float, float]:
+    """時刻の片側を動かした結果の (開始, 終了) を返す。
+
+    もう一方へ近づく向き(開始を後ろへ / 終了を前へ)に動かしたときは、
+    長さを保ったまま区間ごと平行移動する。時刻のずれを直す操作は「区間ごと
+    ずらす」ことがほとんどで、相づちのような短い区間ほど長さより大きく
+    動かす必要があるため(1 秒の区間を 6 秒ずらす、など)。ここを動かした側
+    だけにすると、短い区間は長さぶんしか動かせず、潰れて再生もできなくなる。
+
+    離れる向き(開始を前へ / 終了を後ろへ)に動かしたときは、動かした側だけが
+    変わって区間が伸びる。頭やお尻が切れているときの継ぎ足しにあたる。
+    """
+    span = max(MIN_SEGMENT_SECONDS, base_end - base_start)
+    if which == "start":
+        start, end = value, base_end
+        if start > end - span:
+            end = start + span
+    else:
+        start, end = base_start, value
+        if end < start + span:
+            start = end - span
+    return clamp_times(start, end, duration, moved=which)
+
+
 def playback_window(
     seg: Segment, time_offset: float, back: float = 0.0, extend: float = 0.0
 ) -> tuple[float, float]:
@@ -860,8 +886,7 @@ class AssignWindow(tk.Toplevel):
     def _apply_time(self, which: str, value: float, explicit: bool = False) -> None:
         seg = self.proj.segments[self.current]
         base_start, base_end = time_edit_base(seg, self.proj.time_offset)
-        start, end = (value, base_end) if which == "start" else (base_start, value)
-        start, end = clamp_times(start, end, self.proj.duration, moved=which)
+        start, end = move_edge(base_start, base_end, which, value, self.proj.duration)
 
         changed = abs(start - base_start) > 1e-6 or abs(end - base_end) > 1e-6
         if not changed and (seg.time_edited or not explicit):
