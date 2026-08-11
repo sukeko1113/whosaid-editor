@@ -409,7 +409,7 @@ class AssignWindow(tk.Toplevel):
         row_edit.pack(side="top", anchor="w", pady=(3, 0))
         # 時刻のずれは区間ごと動かして直すことがほとんど。上の開始・終了は
         # 片側だけ動かす(長さを変える)ので、区間ごとの移動は別に用意する。
-        ttk.Label(row_edit, text="区間ごと:").pack(side="left", padx=(0, 4))
+        ttk.Label(row_edit, text="区間ごとスライド:").pack(side="left", padx=(0, 4))
         for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
             ttk.Button(row_edit, text=text, width=5, takefocus=False,
                        command=lambda d=delta: self._shift_time(d)).pack(side="left", padx=1)
