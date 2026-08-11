@@ -38,6 +38,7 @@ from src.assign_gui import (  # noqa: E402
     clamp_times,
     move_edge,
     plan_roster_text,
+    shift_span,
     playback_window,
     preview_length,
     time_edit_base,
@@ -141,21 +142,29 @@ def run() -> int:
         check("音声の長さを超えない",
               clamp_times(100.0, 9999.0, 1200.0, "end") == (100.0, 1200.0))
 
-        # 時刻のずれを直す操作は「区間ごとずらす」のがほとんど。
-        # 相づちのような短い区間ほど、長さより大きく動かす必要がある
-        check("短い区間でも開始を長さ以上に動かせる(区間ごと動く)",
-              move_edge(100.0, 101.1, "start", 106.8, 1200.0) == (106.8, 107.9))
-        check("長い区間でも同じように区間ごと動く",
-              move_edge(100.0, 110.0, "start", 106.8, 1200.0) == (106.8, 116.8))
-        check("終了を前へ動かしても区間ごと動く",
-              move_edge(100.0, 101.1, "end", 90.0, 1200.0) == (88.9, 90.0))
-        # 離れる向きは「頭やお尻の継ぎ足し」なので、動かした側だけが動く
+        # 開始・終了は片側だけ動かす(長さが変わる = 境界の微調整)
+        check("開始を後ろへ詰めると区間が縮む",
+              move_edge(100.0, 110.0, "start", 106.8, 1200.0) == (106.8, 110.0))
         check("開始を前へ出すと区間が伸びる",
               move_edge(100.0, 110.0, "start", 97.0, 1200.0) == (97.0, 110.0))
-        check("終了を後ろへ伸ばすと終了だけ動く",
+        check("終了を前へ詰めると区間が縮む",
+              move_edge(100.0, 110.0, "end", 104.0, 1200.0) == (100.0, 104.0))
+        check("終了を後ろへ伸ばすと区間が伸びる",
               move_edge(100.0, 110.0, "end", 115.0, 1200.0) == (100.0, 115.0))
-        check("平行移動でも音声の長さは超えない",
-              move_edge(100.0, 101.1, "start", 1199.5, 1200.0)[1] == 1200.0)
+        # 追い越す値を打たれたら、その値を尊重して長さを保ったままずらす
+        check("開始が終了を追い越す値なら区間ごとずれる",
+              move_edge(100.0, 101.1, "start", 106.8, 1200.0) == (106.8, 107.9))
+        check("終了が開始を下回る値なら区間ごとずれる",
+              move_edge(100.0, 101.1, "end", 90.0, 1200.0) == (88.9, 90.0))
+
+        # 「区間ごと」ボタンは長さを保ったまま前後にずらす。
+        # 相づちのような短い区間ほど、長さより大きく動かす必要がある
+        check("区間ごと後ろへずらす", shift_span(100.0, 101.1, +6.8, 1200.0) == (106.8, 107.9))
+        check("区間ごと前へずらす", shift_span(100.0, 110.0, -1.0, 1200.0) == (99.0, 109.0))
+        check("長い区間でも長さは変わらない",
+              shift_span(100.0, 130.0, +6.0, 1200.0) == (106.0, 136.0))
+        check("音声の先頭より前には出ない", shift_span(0.5, 1.6, -9.0, 1200.0) == (0.0, 1.1))
+        check("音声の末尾を超えない", shift_span(1195.0, 1196.1, +9.0, 1200.0) == (1198.9, 1200.0))
 
         # --- 区間の時刻を直す(画面操作) ----------------------------------
         keep_current = win.current
@@ -168,13 +177,11 @@ def run() -> int:
         win._commit_time("start")
         check("入力した開始時刻が入る", seg3.start == 96.5)
         check("時刻を直した印が付く", seg3.time_edited is True)
-        check("開始を後ろへ動かすと終了も付いてくる",
-              abs(seg3.end - (orig3[1] + 6.5)) < 1e-6)
+        check("終了は動かない(区間が縮む)", seg3.end == orig3[1])
         check("保存対象になる", win._dirty is True)
 
-        moved_end = seg3.end
         win._nudge_time("end", +1.0)
-        check("終了を後ろへ伸ばせる", abs(seg3.end - (moved_end + 1.0)) < 1e-6)
+        check("終了をナッジできる", abs(seg3.end - (orig3[1] + 1.0)) < 1e-6)
         check("そのとき開始は動かない", abs(seg3.start - 96.5) < 1e-6)
         check("一覧に ✎ が出る", win.tree.item("s3", "values")[0].startswith("✎"))
 
@@ -189,17 +196,22 @@ def run() -> int:
         check("元の時刻は保持されている", (seg3.orig_start, seg3.orig_end) == orig3)
         check("一覧の ✎ も消える", not win.tree.item("s3", "values")[0].startswith("✎"))
 
-        # 実データで詰まった 1.1 秒の相づちを 6.8 秒ずらす、と同じ形
+        # 実データで詰まった 1.1 秒の相づちを 6.8 秒ずらす、と同じ形。
+        # 「区間ごと」ボタンなら、長さより大きく動かしても潰れない
         win.goto(8)
         short = proj.segments[8]
         short.start, short.end = 240.0, 241.1
         short.orig_start, short.orig_end = 240.0, 241.1
         win.show_current()
-        win._nudge_time("start", +1.0)
-        check("ナッジで長さが潰れない", abs(short.duration - 1.1) < 1e-6)
-        win._apply_time("start", 246.8, explicit=True)
-        check("画面からも長さ以上に動かせる", abs(short.start - 246.8) < 1e-6)
-        check("そのとき区間の長さは保たれる", abs(short.duration - 1.1) < 1e-6)
+        for _ in range(6):
+            win._shift_time(+1.0)
+        win._shift_time(+0.8)
+        check("短い区間を長さ以上にずらせる", abs(short.start - 246.8) < 1e-6)
+        check("ずらしても長さは変わらない", abs(short.duration - 1.1) < 1e-6)
+        check("入力欄にも反映される", win.var_start.get() == "00:04:06.8")
+        # 片側だけのナッジは、この区間では長さぶんしか動けない(境界の微調整)
+        win._nudge_time("start", +0.1)
+        check("開始のナッジは区間を縮める", abs(short.duration - 1.0) < 1e-6)
         short.start, short.end = 240.0, 268.0          # 後片付け
         short.orig_start, short.orig_end = 240.0, 268.0
         short.time_edited = False

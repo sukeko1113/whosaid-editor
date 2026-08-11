@@ -117,25 +117,41 @@ def move_edge(
 ) -> tuple[float, float]:
     """時刻の片側を動かした結果の (開始, 終了) を返す。
 
-    もう一方へ近づく向き(開始を後ろへ / 終了を前へ)に動かしたときは、
-    長さを保ったまま区間ごと平行移動する。時刻のずれを直す操作は「区間ごと
-    ずらす」ことがほとんどで、相づちのような短い区間ほど長さより大きく
-    動かす必要があるため(1 秒の区間を 6 秒ずらす、など)。ここを動かした側
-    だけにすると、短い区間は長さぶんしか動かせず、潰れて再生もできなくなる。
+    動かすのは片側だけで、区間の長さは変わる(境界の微調整)。
+    ただし、もう一方を追い越すところまで指定されたときは、その値を尊重して
+    長さを保ったまま区間ごとずらす。入力欄に打った時刻を「読めないので
+    手前で止めました」と黙って書き換えるより、そのまま置くほうが分かりやすい。
 
-    離れる向き(開始を前へ / 終了を後ろへ)に動かしたときは、動かした側だけが
-    変わって区間が伸びる。頭やお尻が切れているときの継ぎ足しにあたる。
+    区間ごとずらしたいだけなら shift_span を使う(画面の「区間ごと」ボタン)。
     """
     span = max(MIN_SEGMENT_SECONDS, base_end - base_start)
     if which == "start":
         start, end = value, base_end
-        if start > end - span:
+        if start > end - MIN_SEGMENT_SECONDS:
             end = start + span
     else:
         start, end = base_start, value
-        if end < start + span:
+        if end < start + MIN_SEGMENT_SECONDS:
             start = end - span
     return clamp_times(start, end, duration, moved=which)
+
+
+def shift_span(
+    base_start: float, base_end: float, delta: float, duration: float
+) -> tuple[float, float]:
+    """区間の長さを保ったまま前後にずらした (開始, 終了) を返す。
+
+    時刻のずれを直す操作はこれがほとんど。相づちのような短い区間ほど
+    長さより大きく動かす必要がある(1 秒の区間を 6 秒ずらす、など)ので、
+    片側ずつ動かす操作とは分けてある。
+    """
+    span = max(MIN_SEGMENT_SECONDS, base_end - base_start)
+    start = max(0.0, round(base_start + delta, 1))
+    end = round(start + span, 1)
+    if duration and duration > 0 and end > duration:
+        end = round(duration, 1)
+        start = max(0.0, round(end - span, 1))
+    return start, end
 
 
 def playback_window(
@@ -384,10 +400,18 @@ class AssignWindow(tk.Toplevel):
         )
         self.btn_revert_time.pack(side="left", padx=(12, 0))
 
-        # 1 区間に 2 人の発言が順に混ざることも、同じ発言が 2 行に割れることも
-        # ある。どちらも人の目と耳でしか判断できないので、明示操作で直せるようにする。
         row_edit = ttk.Frame(frm_time)
         row_edit.pack(side="top", anchor="w", pady=(3, 0))
+        # 時刻のずれは区間ごと動かして直すことがほとんど。上の開始・終了は
+        # 片側だけ動かす(長さを変える)ので、区間ごとの移動は別に用意する。
+        ttk.Label(row_edit, text="区間ごと:").pack(side="left", padx=(0, 4))
+        for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
+            ttk.Button(row_edit, text=text, width=5, takefocus=False,
+                       command=lambda d=delta: self._shift_time(d)).pack(side="left", padx=1)
+        ttk.Separator(row_edit, orient="vertical").pack(side="left", fill="y", padx=10)
+
+        # 1 区間に 2 人の発言が順に混ざることも、同じ発言が 2 行に割れることも
+        # ある。どちらも人の目と耳でしか判断できないので、明示操作で直せるようにする。
         ttk.Button(row_edit, text="この区間を分割...", takefocus=False,
                    command=self.split_current).pack(side="left")
         ttk.Button(row_edit, text="前の区間と結合", takefocus=False,
@@ -883,11 +907,24 @@ class AssignWindow(tk.Toplevel):
             current = base[0] if which == "start" else base[1]
         self._apply_time(which, current + delta, explicit=True)
 
+    def _shift_time(self, delta: float) -> None:
+        """区間ごと前後にずらす(長さは変えない)。ずれを直す主な操作。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        base_start, base_end = time_edit_base(seg, self.proj.time_offset)
+        start, end = shift_span(base_start, base_end, delta, self.proj.duration)
+        self._commit_times(start, end, base_start, base_end, explicit=True)
+
     def _apply_time(self, which: str, value: float, explicit: bool = False) -> None:
         seg = self.proj.segments[self.current]
         base_start, base_end = time_edit_base(seg, self.proj.time_offset)
         start, end = move_edge(base_start, base_end, which, value, self.proj.duration)
+        self._commit_times(start, end, base_start, base_end, explicit)
 
+    def _commit_times(self, start: float, end: float, base_start: float,
+                      base_end: float, explicit: bool) -> None:
+        seg = self.proj.segments[self.current]
         changed = abs(start - base_start) > 1e-6 or abs(end - base_end) > 1e-6
         if not changed and (seg.time_edited or not explicit):
             # 入力欄を通り過ぎただけ。勝手に「修正済み」にはしない。
