@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -40,6 +40,11 @@ PSEUDO_MULTI = "*"
 # 人が時刻を直したり区間を分けたりするときに許す最短の長さ。
 # 0 にすると start == end の区間ができて、再生も出力も意味を失う。
 MIN_SEGMENT_SECONDS = 0.1
+
+# 時刻のずれを周りへ広げるとき、これ以上離れたアンカーどうしは結ばない。
+# ずれは局所的に生まれてしばらくすると戻るので、遠い 2 点を結ぶと外れる。
+# 実測では 32 秒しか離れていない 2 区間で ±0 秒 → +6.8 秒と不連続だった。
+INTERPOLATION_MAX_GAP = 30.0
 
 
 def fmt_hms(seconds: float) -> str:
@@ -189,6 +194,9 @@ class Segment:
     note: str = ""
     text_edited: bool = False           # ユーザーが本文を手直ししたか(再実行時に保護)
     time_edited: bool = False           # ユーザーが時刻を直したか
+    # 時刻を「自分の耳で確かめた」か。補間で推定しただけの区間と区別する。
+    # 話者の reviewed と同じ考え方で、あとから未確認だけを拾い直せるようにする。
+    time_reviewed: bool = False
     # パイプライン(AI)が出した元の時刻。start/end をユーザーが直しても動かさない。
     # 再実行したときに新旧の区間を突き合わせる鍵と、「元に戻す」の戻り先に使う。
     # None を渡すと start/end で埋める(新規生成時と、これを持たない旧ファイル)。
@@ -241,6 +249,10 @@ class Segment:
         # 渡し、__post_init__ に start / end を入れさせる(移行処理は不要)。
         orig_start = d.get("orig_start")
         orig_end = d.get("orig_end")
+        # schema 3 までは「時刻を直した = 自分の耳で合わせた」しかなかった。
+        # 補間で推定しただけの区間と区別する印は 4 で足したので、
+        # 古いファイルの time_edited は確認済みとして読む。
+        time_edited = bool(d.get("time_edited", False))
         return cls(
             index=int(d["index"]),
             start=float(d.get("start", 0.0)),
@@ -252,10 +264,21 @@ class Segment:
             reviewed=bool(d.get("reviewed", False)),
             note=str(d.get("note", "")),
             text_edited=bool(d.get("text_edited", False)),
-            time_edited=bool(d.get("time_edited", False)),
+            time_edited=time_edited,
+            time_reviewed=bool(d.get("time_reviewed", time_edited)),
             orig_start=float(orig_start) if orig_start is not None else None,
             orig_end=float(orig_end) if orig_end is not None else None,
         )
+
+
+@dataclass
+class TimeShift:
+    """補間で推定した 1 区間ぶんの時刻。適用前に中身を見せるために使う。"""
+
+    index: int
+    start: float
+    end: float
+    shift: float        # 元の時刻から何秒ずらすか
 
 
 # ----------------------------------------------------------------------
@@ -405,6 +428,71 @@ class Project:
         self.segments[index:index + 2] = [merged]
         self.renumber()
         return merged
+
+    # -------------------------------------------------- 時刻のずれを周りへ広げる
+    def plan_time_interpolation(
+        self, max_gap: float = INTERPOLATION_MAX_GAP
+    ) -> list["TimeShift"]:
+        """時刻を直した区間をアンカーに、間の未編集区間のずれを推定する。
+
+        ずれは 1 分足らずの間に 0→6→2 秒と変わるが、その中では滑らかに
+        推移する(実測: 40 秒かけて +6.8 秒から +1.0 秒へ単調に減衰)。
+        両隣が分かれば、間はかなりの精度で推定できる。
+
+        推定するだけで、適用はしない(呼び出し側が中身を見せてから決める)。
+        アンカーが max_gap より離れているところは飛ばす。外挿もしない。
+        """
+        anchors = sorted(
+            (s for s in self.segments if s.time_edited),
+            key=lambda s: float(s.orig_start),
+        )
+        if len(anchors) < 2:
+            return []
+
+        plan: list[TimeShift] = []
+        for seg in self.segments:
+            if seg.time_edited:
+                continue        # 人が決めた時刻は動かさない
+            prev_a = nxt_a = None
+            for a in anchors:
+                if float(a.orig_start) <= float(seg.orig_start):
+                    prev_a = a
+                else:
+                    nxt_a = a
+                    break
+            if prev_a is None or nxt_a is None:
+                continue        # 片側にしかアンカーが無い(外挿はしない)
+            span = float(nxt_a.orig_start) - float(prev_a.orig_start)
+            if span <= 0 or span > max_gap:
+                continue
+            d0 = prev_a.start - float(prev_a.orig_start)
+            d1 = nxt_a.start - float(nxt_a.orig_start)
+            ratio = (float(seg.orig_start) - float(prev_a.orig_start)) / span
+            shift = round(d0 + (d1 - d0) * ratio, 1)
+            if abs(shift) < MIN_SEGMENT_SECONDS:
+                continue        # 動かす意味がない
+            plan.append(TimeShift(
+                index=seg.index,
+                start=round(float(seg.orig_start) + shift, 1),
+                end=round(float(seg.orig_end) + shift, 1),
+                shift=shift,
+            ))
+        return plan
+
+    def apply_time_interpolation(self, plan: Iterable["TimeShift"]) -> int:
+        """plan_time_interpolation() の結果を反映する。
+
+        推定しただけなので time_reviewed は立てない。あとから
+        「自分の耳で確かめていない区間」だけを拾い直せるようにするため。
+        """
+        n = 0
+        for item in plan:
+            seg = self.segments[item.index]
+            seg.start, seg.end = item.start, item.end
+            seg.time_edited = True
+            seg.time_reviewed = False
+            n += 1
+        return n
 
     # -------------------------------------------------- 統計
     @property

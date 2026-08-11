@@ -26,6 +26,7 @@ from typing import Optional
 from .audio import extract_peaks
 from .player import SegmentPlayer
 from .segments import (
+    INTERPOLATION_MAX_GAP,
     MIN_SEGMENT_SECONDS,
     Project,
     SPECIAL_MULTI,
@@ -503,6 +504,8 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
             .pack(side="left")
+        ttk.Button(bottom, text="直した時刻から間を埋める...", command=self.interpolate_times)\
+            .pack(side="left", padx=6)
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
@@ -708,8 +711,11 @@ class AssignWindow(tk.Toplevel):
                 mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
             else:
                 mark = "✓"
-        # 時刻を直した区間は一覧でも分かるようにする(✓/△ と同じ考え方)
-        time_cell = ("✎ " if seg.time_edited else "") + fmt_hms(seg.start)
+        # 時刻をどこまで人が確かめたかも見えるようにする(話者の ✓/△ と同じ)
+        time_mark = ""
+        if seg.time_edited:
+            time_mark = "✎ " if seg.time_reviewed else "✎△"
+        time_cell = time_mark + fmt_hms(seg.start)
         values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", seg.preview(70))
         return values, tuple(tags)
@@ -868,7 +874,9 @@ class AssignWindow(tk.Toplevel):
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
-            + ("   ✎時刻を修正済み" if seg.time_edited else "")
+            + ("" if not seg.time_edited
+               else "   ✎時刻を修正済み" if seg.time_reviewed
+               else "   ✎△時刻は推定(未確認)")
             + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒"
                if self.proj.time_offset and not seg.time_edited else "")
         )
@@ -942,6 +950,7 @@ class AssignWindow(tk.Toplevel):
 
         seg.start, seg.end = start, end
         seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = True        # 人が画面で決めた時刻(補間の推定と区別する)
         self._dirty = True
         self._show_times()
         self._update_seginfo()
@@ -954,6 +963,90 @@ class AssignWindow(tk.Toplevel):
         if self.var_autoplay.get():
             self.play_current()
 
+    def interpolate_times(self) -> None:
+        """時刻を直した区間をアンカーに、間の未編集区間のずれを推定して埋める。
+
+        ずれは局所的に生まれるが、その中では滑らかに推移する(実測: 40 秒で
+        +6.8 → +1.0 秒へ単調に減衰)。帯の両端を耳で合わせれば、間は推定できる。
+        """
+        if not self.proj.segments:
+            return
+        self._commit_text()
+        anchors = sum(1 for s in self.proj.segments if s.time_edited)
+        plan = self.proj.plan_time_interpolation()
+        if not plan:
+            messagebox.showinfo(
+                "埋められる区間がありません",
+                "時刻を直した区間が「両隣」にある未編集区間を埋めます。\n"
+                f"(いま時刻を直した区間は {anchors} 個です)\n\n"
+                "・帯の始まりと終わりの 2 区間を先に直してください\n"
+                "・間の区間を全部直してしまうと、埋める隙間が無くなります\n"
+                f"・{INTERPOLATION_MAX_GAP:.0f} 秒以上離れた区間どうしは結びません"
+                "(ずれは局所的で、遠くでは当てになりません)",
+                parent=self,
+            )
+            return
+        if not self._confirm_interpolation(plan):
+            return
+        n = self.proj.apply_time_interpolation(plan)
+        self._dirty = True
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action(
+            f"{n} 区間の時刻を推定して埋めました(✎△)。"
+            "聴いて確かめると ✎ になります。"
+        )
+
+    def _confirm_interpolation(self, plan) -> bool:
+        """何がどれだけ動くのかを見せてから決めてもらう。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("直した時刻から間を埋める")
+        dlg.transient(self)
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            dlg,
+            text=f"{len(plan)} 区間の時刻を推定しました。"
+                 "推定しただけの区間には ✎△ が付きます(聴いて確かめると ✎)。",
+            wraplength=620,
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+
+        cols = ("time", "to", "shift", "text")
+        tree = ttk.Treeview(dlg, columns=cols, show="headings", height=14)
+        for key, label, width in (
+            ("time", "いまの時刻", 110), ("to", "推定した時刻", 110),
+            ("shift", "ずれ", 70), ("text", "発言", 380),
+        ):
+            tree.heading(key, text=label)
+            tree.column(key, width=width, anchor="w" if key == "text" else "center")
+        for item in plan:
+            seg = self.proj.segments[item.index]
+            tree.insert("", "end", values=(
+                fmt_hms_frac(seg.start), fmt_hms_frac(item.start),
+                f"{item.shift:+.1f}秒", seg.preview(60),
+            ))
+        tree.grid(row=1, column=0, sticky="nsew", padx=12)
+        sb = ttk.Scrollbar(dlg, orient="vertical", command=tree.yview)
+        sb.grid(row=1, column=1, sticky="ns", pady=0)
+        tree.configure(yscrollcommand=sb.set)
+
+        result = {"ok": False}
+
+        def ok() -> None:
+            result["ok"] = True
+            dlg.destroy()
+
+        frm = ttk.Frame(dlg)
+        frm.grid(row=2, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        ttk.Button(frm, text="この内容で埋める", command=ok).pack(side="left")
+        ttk.Button(frm, text="キャンセル", command=dlg.destroy).pack(side="left", padx=6)
+
+        dlg.grab_set()
+        self.wait_window(dlg)
+        return result["ok"]
+
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
         if not self.proj.segments:
@@ -965,6 +1058,7 @@ class AssignWindow(tk.Toplevel):
         seg.start = float(seg.orig_start)
         seg.end = float(seg.orig_end)
         seg.time_edited = False
+        seg.time_reviewed = False
         self._dirty = True
         self._show_times()
         self._update_seginfo()

@@ -774,7 +774,7 @@ def test_load_schema2_file_fills_orig_times():
         seg.time_edited = True
         proj.save(p)
         data = json.loads(p.read_text(encoding="utf-8"))
-        assert data["schema"] == SCHEMA_VERSION == 3
+        assert data["schema"] == SCHEMA_VERSION
 
         again = Project.load(p)
         s2 = again.segments[0]
@@ -892,6 +892,100 @@ def test_split_then_merge_restores_shape():
     assert (after.start, after.end) == span
     assert after.text == text
     assert (after.orig_start, after.orig_end) == span
+
+
+# ======================================================================
+# 時刻のずれを周りへ広げる(補間)
+# ======================================================================
+
+def _drifted() -> Project:
+    """10 秒ごとに区間が並ぶ。実測のドリフト(滑らかに減衰)を模したもの。"""
+    proj = Project(audio_path="a.m4a", duration=600.0)
+    proj.segments = [
+        Segment(index=i, start=i * 10.0, end=i * 10.0 + 8.0,
+                text=f"t{i}", cluster="0:A")
+        for i in range(10)
+    ]
+    return proj
+
+
+def _edit(seg: Segment, shift: float) -> None:
+    """人が耳で合わせた、という状態にする。"""
+    seg.start = seg.orig_start + shift
+    seg.end = seg.orig_end + shift
+    seg.time_edited = True
+    seg.time_reviewed = True
+
+
+def test_interpolation_fills_between_anchors():
+    proj = _drifted()
+    _edit(proj.segments[2], +6.0)      # orig 20.0
+    _edit(proj.segments[5], +3.0)      # orig 50.0 → 30 秒で 6.0 から 3.0 へ
+    plan = proj.plan_time_interpolation()
+    got = {p.index: p.shift for p in plan}
+    # 3 と 4 は 1/3、2/3 の位置なので 5.0 秒・4.0 秒
+    assert got == {3: 5.0, 4: 4.0}
+    assert proj.apply_time_interpolation(plan) == 2
+    assert proj.segments[3].start == 35.0
+    assert proj.segments[3].end == 43.0
+    # 推定しただけなので「自分の耳で確かめた」印は付けない
+    assert proj.segments[3].time_edited is True
+    assert proj.segments[3].time_reviewed is False
+    # アンカーは動かさない
+    assert proj.segments[2].start == 26.0 and proj.segments[2].time_reviewed is True
+
+
+def test_interpolation_skips_distant_anchors():
+    """離れたアンカーどうしは結ばない(ずれは局所的で、遠くでは当てにならない)。"""
+    proj = _drifted()
+    _edit(proj.segments[1], +6.0)      # orig 10.0
+    _edit(proj.segments[9], +1.0)      # orig 90.0 → 80 秒離れている
+    plan = proj.plan_time_interpolation(max_gap=30.0)
+    assert plan == []
+
+
+def test_interpolation_does_not_extrapolate():
+    """片側にしかアンカーが無い区間は動かさない。"""
+    proj = _drifted()
+    _edit(proj.segments[4], +6.0)
+    _edit(proj.segments[6], +4.0)
+    plan = proj.plan_time_interpolation()
+    assert [p.index for p in plan] == [5]      # 0-3 と 7-9 は対象外
+
+
+def test_interpolation_needs_two_anchors():
+    proj = _drifted()
+    _edit(proj.segments[3], +6.0)
+    assert proj.plan_time_interpolation() == []
+
+
+def test_interpolation_leaves_edited_segments_alone():
+    proj = _drifted()
+    _edit(proj.segments[2], +6.0)
+    _edit(proj.segments[3], +5.0)      # 間の区間も人が直している
+    _edit(proj.segments[4], +4.0)
+    plan = proj.plan_time_interpolation()
+    assert plan == []
+
+
+def test_schema3_file_treats_edited_as_reviewed():
+    """v3 までは『時刻を直した = 耳で合わせた』しかなかった。"""
+    old = {
+        "schema": 3,
+        "audio_path": "a.m4a",
+        "segments": [
+            {"index": 0, "start": 16.0, "end": 26.0, "text": "あ", "cluster": "0:A",
+             "orig_start": 10.0, "orig_end": 20.0, "time_edited": True},
+            {"index": 1, "start": 30.0, "end": 40.0, "text": "い", "cluster": "0:A",
+             "orig_start": 30.0, "orig_end": 40.0},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        proj = Project.load(p)
+    assert proj.segments[0].time_reviewed is True      # 補間ではなく手動だった
+    assert proj.segments[1].time_reviewed is False
 
 
 # ======================================================================

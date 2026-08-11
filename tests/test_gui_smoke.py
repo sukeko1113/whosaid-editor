@@ -461,6 +461,44 @@ def run() -> int:
         check("空の世代が残っていない", all(win._undo))
         win.apply_split(proj.segments[14].start + 12.0, 4)   # 数を元に戻す
 
+        # --- 直した時刻から間を埋める(補間) ------------------------------
+        # 30 秒ごとの区間なので、隣り合う 2 つをアンカーにする
+        for i in (24, 25, 26):
+            proj.segments[i].time_edited = False
+            proj.segments[i].time_reviewed = False
+        for i, shift in ((24, 6.0), (26, 4.0)):
+            s = proj.segments[i]
+            s.start, s.end = s.orig_start + shift, s.orig_end + shift
+            s.time_edited = True
+            s.time_reviewed = True
+        # この見本は区間が 30 秒間隔なので、アンカー間は 60 秒。既定の上限
+        # (30 秒)より広いため、ここでは上限を明示して補間させる
+        check("離れたアンカーは既定では結ばない", proj.plan_time_interpolation() == [])
+        plan = proj.plan_time_interpolation(max_gap=60.0)
+        check("両隣から間の区間を推定できる", [p.index for p in plan] == [25])
+        check("推定値は 2 点の中間", abs(plan[0].shift - 5.0) < 1e-6)
+        proj.apply_time_interpolation(plan)
+        win.reload_tree()
+        win.update()
+        mid = proj.segments[25]
+        check("推定した区間は時刻が入る", abs(mid.start - (mid.orig_start + 5.0)) < 1e-6)
+        check("推定しただけなので未確認のまま", mid.time_reviewed is False)
+        check("一覧では ✎△ で区別する",
+              win.tree.item("s25", "values")[0].startswith("✎△"))
+        check("耳で合わせた区間は ✎",
+              win.tree.item("s24", "values")[0].startswith("✎ "))
+        # 推定した区間を画面で直せば、確認済みに変わる
+        win.goto(25)
+        win._shift_time(+0.1)
+        check("画面で直すと確認済みになる", mid.time_reviewed is True)
+        check("一覧の印も ✎ に変わる",
+              win.tree.item("s25", "values")[0].startswith("✎ "))
+        for i in (24, 25, 26):                     # 後片付け
+            proj.segments[i].start = proj.segments[i].orig_start
+            proj.segments[i].end = proj.segments[i].orig_end
+            proj.segments[i].time_edited = False
+            proj.segments[i].time_reviewed = False
+
         # --- 分割・結合・時刻修正を保存して読み直す ------------------------
         win.goto(20)
         win._apply_time("start", proj.segments[20].start + 3.0, explicit=True)
