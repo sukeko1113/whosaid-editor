@@ -7,6 +7,7 @@ GUI・Gemini API・ffmpeg には依存しない。
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -22,10 +23,13 @@ for _s in (sys.stdout, sys.stderr):
 
 
 from src.segments import (  # noqa: E402
+    SCHEMA_VERSION,
     Project,
     SPECIAL_UNKNOWN,
     Segment,
     fmt_hms,
+    fmt_hms_frac,
+    parse_hms,
     parse_roster,
     roster_to_text,
 )
@@ -637,6 +641,25 @@ def test_write_docx_options():
     assert paras[2] == "【佐藤】 い"
 
 
+def test_write_docx_uses_edited_times():
+    """時刻を直した区間は、直した時刻で出力される。"""
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    proj.time_offset = 4.0          # ずれ補正は出力に効かない(再生だけのもの)
+    seg = proj.segments[3]          # 既定では 30.0〜39.0
+    seg.speaker_id = proj.speakers[0].id
+    seg.start, seg.end = 37.0, 45.0
+    seg.time_edited = True
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, merge_consecutive=False)
+        paras = [p.text for p in Document(str(out)).paragraphs if p.text.strip()]
+    assert any(p.startswith("[00:00:37]") for p in paras)
+    assert not any(p.startswith("[00:00:30]") for p in paras)
+
+
 def test_build_note_distinguishes_reviewed():
     from src.segments import build_note
 
@@ -655,6 +678,330 @@ def test_fmt_hms():
     assert fmt_hms(0) == "00:00:00"
     assert fmt_hms(59.6) == "00:01:00"
     assert fmt_hms(3725) == "01:02:05"
+
+
+# ======================================================================
+# 時刻の表示・入力(0.1 秒精度)
+# ======================================================================
+
+def test_fmt_hms_frac():
+    assert fmt_hms_frac(0) == "00:00:00.0"
+    assert fmt_hms_frac(2631.5) == "00:43:51.5"
+    assert fmt_hms_frac(3725.04) == "01:02:05.0"
+    assert fmt_hms_frac(59.96) == "00:01:00.0"      # 秒への繰り上がり
+    assert fmt_hms_frac(-3.0) == "00:00:00.0"       # 負は 0 に丸める
+
+
+def test_parse_hms_formats():
+    assert parse_hms("01:02:05.4") == 3725.4
+    assert parse_hms("43:51.5") == 2631.5
+    assert parse_hms("7.5") == 7.5
+    assert parse_hms("7") == 7.0
+    assert parse_hms("00:00:00.0") == 0.0
+    # 最上位の桁だけは 60 以上を許す(90 秒、75 分)
+    assert parse_hms("90") == 90.0
+    assert parse_hms("75:00") == 4500.0
+    # 前後の空白と、全角のまま打たれた数字・区切りも受ける
+    assert parse_hms("  01:02:05.4  ") == 3725.4
+    assert parse_hms("００:４３:５１．５") == 2631.5
+
+
+def test_parse_hms_rejects_bad_values():
+    bad = [
+        "", "   ",
+        "abc",
+        "01:02:03:04",       # 桁が多い
+        "01::05",            # 空フィールド
+        ":30",
+        "-5",                # 負
+        "1.5:30",            # 小数は最下位だけ
+        "01:75:00",          # 分が 60 以上
+        "43:75.0",           # 秒が 60 以上
+        "12:34:5x",
+    ]
+    for s in bad:
+        try:
+            parse_hms(s)
+        except ValueError:
+            continue
+        raise AssertionError(f"拒否されるべき入力が通った: {s!r}")
+
+
+def test_hms_round_trip():
+    for sec in (0.0, 0.1, 7.5, 59.9, 2631.5, 3725.4, 36000.0):
+        assert parse_hms(fmt_hms_frac(sec)) == sec
+
+
+# ======================================================================
+# 時刻編集のスキーマ(schema 3)
+# ======================================================================
+
+def test_orig_times_default_to_start_end():
+    seg = Segment(index=0, start=10.0, end=20.0, text="あ", cluster="0:A")
+    assert seg.orig_start == 10.0
+    assert seg.orig_end == 20.0
+    assert seg.time_edited is False
+    # 明示指定したときはそちらが勝つ(分割で親の値を共有させるため)
+    child = Segment(index=1, start=15.0, end=20.0, text="い", cluster="0:A",
+                    orig_start=10.0, orig_end=20.0)
+    assert (child.orig_start, child.orig_end) == (10.0, 20.0)
+
+
+def test_load_schema2_file_fills_orig_times():
+    """orig_* を持たない旧ファイルは既定値だけで読め、保存は v3 になる。"""
+    old = {
+        "schema": 2,
+        "audio_path": "a.m4a",
+        "duration": 100.0,
+        "speakers": [{"id": "sp01", "name": "佐藤", "note": "", "order": 0}],
+        "segments": [
+            {"index": 0, "start": 10.0, "end": 20.0, "text": "あ", "cluster": "0:A",
+             "chunk": 0, "speaker_id": "sp01", "reviewed": True, "note": "",
+             "text_edited": False},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+
+        proj = Project.load(p)
+        seg = proj.segments[0]
+        assert (seg.orig_start, seg.orig_end) == (10.0, 20.0)
+        assert seg.time_edited is False
+
+        # 時刻を直して保存 → schema 3 で書かれ、orig は元の時刻のまま残る
+        seg.start, seg.end = 16.0, 26.0
+        seg.time_edited = True
+        proj.save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert data["schema"] == SCHEMA_VERSION == 3
+
+        again = Project.load(p)
+        s2 = again.segments[0]
+        assert (s2.start, s2.end) == (16.0, 26.0)
+        assert (s2.orig_start, s2.orig_end) == (10.0, 20.0)
+        assert s2.time_edited is True
+        assert s2.reviewed is True and s2.speaker_id == "sp01"
+
+
+# ======================================================================
+# 区間の分割・結合
+# ======================================================================
+
+def _splittable() -> Project:
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("佐藤\n田中")
+    proj.segments = [
+        Segment(index=0, start=90.0, end=100.0, text="前の発言", cluster="0:A"),
+        Segment(index=1, start=100.0, end=110.0, text="そうですねいいと思います",
+                cluster="0:B", chunk=0, speaker_id="sp01", reviewed=True, note="めも"),
+        Segment(index=2, start=110.0, end=120.0, text="次の発言", cluster="0:C"),
+    ]
+    return proj
+
+
+def test_split_segment_basics():
+    proj = _splittable()
+    head, tail = proj.split_segment(1, 105.0, len("そうですね"))
+    assert len(proj.segments) == 4
+    assert [s.index for s in proj.segments] == [0, 1, 2, 3]     # 振り直される
+    assert (head.start, head.end) == (100.0, 105.0)
+    assert (tail.start, tail.end) == (105.0, 110.0)
+    assert (head.text, tail.text) == ("そうですね", "いいと思います")
+    # 前半は元の声のまとまりと話者を維持、後半は擬似不明で未確定
+    assert head.cluster == "0:B" and head.speaker_id == "sp01"
+    assert tail.cluster == "0:?" and tail.speaker_id is None
+    assert tail.is_pseudo_cluster is True
+    # 範囲が変わったので、どちらも聴き直し対象
+    assert head.reviewed is False and tail.reviewed is False
+    assert head.time_edited is True and tail.time_edited is True
+    # 再実行時の系譜キーは親の値を両方が共有する
+    assert (head.orig_start, head.orig_end) == (100.0, 110.0)
+    assert (tail.orig_start, tail.orig_end) == (100.0, 110.0)
+    # 隣の区間には触らない
+    assert (proj.segments[0].start, proj.segments[3].start) == (90.0, 110.0)
+
+
+def test_split_segment_clamps_boundary_and_cut():
+    proj = _splittable()
+    # 区間の外を指されても内側に収める(前後に最短の長さを残す)
+    head, tail = proj.split_segment(1, 999.0, 999)
+    assert head.end == 109.9 and tail.start == 109.9
+    assert tail.text == ""                     # cut は本文の長さで頭打ち
+
+    proj = _splittable()
+    head, tail = proj.split_segment(1, 0.0, -5)
+    assert head.end == 100.1 and head.text == ""
+
+
+def test_split_segment_rejects_too_short():
+    proj = _splittable()
+    proj.segments[1].end = proj.segments[1].start + 0.15    # 2 つに割れない
+    try:
+        proj.split_segment(1, 100.05, 3)
+    except ValueError:
+        return
+    raise AssertionError("短すぎる区間が分割できてしまった")
+
+
+def test_merge_segments_basics():
+    proj = _splittable()
+    proj.segments[1].speaker_id = "sp01"
+    proj.segments[2].speaker_id = "sp01"
+    proj.segments[2].note = "あとのメモ"
+    merged = proj.merge_segments(1)
+    assert len(proj.segments) == 2
+    assert [s.index for s in proj.segments] == [0, 1]
+    assert (merged.start, merged.end) == (100.0, 120.0)
+    assert merged.text == "そうですねいいと思います次の発言"   # 空白を挟まない
+    assert merged.cluster == "0:B"                            # 前側を採用
+    assert merged.speaker_id == "sp01"                        # 同じ話者なら維持
+    assert merged.reviewed is False
+    assert merged.time_edited is True
+    assert merged.note == "めも / あとのメモ"
+    # 系譜は前側の始まりと後側の終わり(再実行時の吸収に要る)
+    assert (merged.orig_start, merged.orig_end) == (100.0, 120.0)
+
+
+def test_merge_segments_drops_conflicting_speaker():
+    proj = _splittable()
+    proj.segments[1].speaker_id = "sp01"
+    proj.segments[2].speaker_id = "sp02"
+    merged = proj.merge_segments(1)
+    assert merged.speaker_id is None      # どちらが正しいかは機械には決められない
+
+
+def test_merge_segments_rejects_last():
+    proj = _splittable()
+    try:
+        proj.merge_segments(len(proj.segments) - 1)
+    except ValueError:
+        return
+    raise AssertionError("次の区間が無いのに結合できてしまった")
+
+
+def test_split_then_merge_restores_shape():
+    """分割の取り消しは結合で行う(Ctrl+Z の対象外)。"""
+    proj = _splittable()
+    before = proj.segments[1]
+    span, text = (before.start, before.end), before.text
+    proj.split_segment(1, 105.0, 5)
+    proj.merge_segments(1)
+    after = proj.segments[1]
+    assert len(proj.segments) == 3
+    assert (after.start, after.end) == span
+    assert after.text == text
+    assert (after.orig_start, after.orig_end) == span
+
+
+# ======================================================================
+# 再実行時の引き継ぎ(carry-over)
+# ======================================================================
+
+def _carry(old_segments, new_segments):
+    """_carry_over_assignments を単体で回す。戻り値は (新しい区間リスト, ログ)"""
+    from src.pipeline import _carry_over_assignments      # google-genai を引くので局所 import
+
+    old = Project(audio_path="a.m4a")
+    old.segments = old_segments
+    logs: list[str] = []
+    return _carry_over_assignments(old, new_segments, logs.append), logs
+
+
+def test_carry_over_keeps_edited_times():
+    """時刻を直した区間は orig_start で照合され、直した時刻のまま残る。"""
+    old = [
+        Segment(index=0, start=106.0, end=116.0, text="あ", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="あ", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="い", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 2
+    assert (result[0].start, result[0].end) == (106.0, 116.0)
+    assert result[0].time_edited is True
+    assert result[0].speaker_id == "sp01" and result[0].reviewed is True
+    assert result[1].start == 110.0        # 隣は再生成側のまま
+    assert [s.index for s in result] == [0, 1]
+
+
+def test_carry_over_replaces_with_split_family():
+    """分割で 2 つになった区間が、再生成の 1 区間を丸ごと置き換える。"""
+    old = [
+        Segment(index=0, start=100.0, end=105.0, text="そうですね", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+        Segment(index=1, start=105.0, end=110.0, text="いいと思います", cluster="0:?",
+                time_edited=True, orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="そうですねいいと思います", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次の議題です", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["そうですね", "いいと思います", "次の議題です"]
+    assert result[1].cluster == "0:?"      # 擬似クラスタが保たれる
+    assert [s.index for s in result] == [0, 1, 2]
+
+
+def test_carry_over_absorbs_merged_range():
+    """結合した区間は、再生成で分かれて出てきたぶんを取り込む(区間が戻らない)。"""
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="そうですねいいと思います",
+                cluster="0:A", speaker_id="sp01", time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=105.0, text="そうですね", cluster="0:A"),
+        Segment(index=1, start=105.0, end=110.0, text="いいと思います", cluster="0:A"),
+        Segment(index=2, start=110.0, end=120.0, text="次の議題です", cluster="0:B"),
+    ]
+    result, logs = _carry(old, new)
+    assert [s.text for s in result] == ["そうですねいいと思います", "次の議題です"]
+    assert [s.index for s in result] == [0, 1]
+    # 消したことをユーザーが気づけるようログに出す
+    assert any("取り込みました" in m for m in logs)
+
+
+def test_carry_over_legacy_behaviour_unchanged():
+    """orig_* を持たない旧ファイル(= orig が start と同値)は従来どおり動く。"""
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="あ(手直し)", cluster="0:A",
+                speaker_id="sp01", reviewed=True, note="めも", text_edited=True),
+        Segment(index=1, start=110.0, end=120.0, text="い", cluster="0:B",
+                speaker_id="sp02"),
+    ]
+    # 再実行で時刻がわずかに動いた(照合の許容 ±2 秒の内側)
+    new = [
+        Segment(index=0, start=101.0, end=111.0, text="あ", cluster="0:A"),
+        Segment(index=1, start=111.0, end=121.0, text="い", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 2
+    # 時刻には手が入っていないので、再生成側の時刻をそのまま使う
+    assert (result[0].start, result[0].end) == (101.0, 111.0)
+    # 人が入れた情報だけが移る
+    assert result[0].speaker_id == "sp01" and result[0].reviewed is True
+    assert result[0].text == "あ(手直し)" and result[0].text_edited is True
+    assert result[0].note == "めも"
+    assert result[1].speaker_id == "sp02"
+
+
+def test_carry_over_absorbs_only_matched_families():
+    """照合できなかった旧区間の範囲では吸収しない(穴が開くのを防ぐ)。"""
+    old = [
+        # 再生成側に対応する区間が無い(±2 秒に何も無い)結合済み区間
+        Segment(index=0, start=300.0, end=330.0, text="消えた区間", cluster="0:A",
+                speaker_id="sp01", time_edited=True, orig_start=300.0, orig_end=330.0),
+    ]
+    new = [
+        Segment(index=0, start=310.0, end=320.0, text="残すべき区間", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["残すべき区間"]
 
 
 # ======================================================================

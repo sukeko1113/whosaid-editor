@@ -14,7 +14,7 @@ from google import genai
 from google.genai import types as genai_types
 
 from .audio import audio_fingerprint, probe_duration, split_audio
-from .segments import Project, Segment, Speaker, parse_roster
+from .segments import Project, Segment, Speaker, fmt_hms, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
     ROSTER_NOTE,
@@ -291,48 +291,113 @@ def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
     return result
 
 
-def _carry_over_assignments(old: Project, new_segments: list[Segment], on_log: LogFn) -> int:
-    """再実行時に、以前の割当結果とユーザーの本文修正を新しいセグメントへ引き継ぐ。
+def _carry_over_assignments(
+    old: Project, new_segments: list[Segment], on_log: LogFn
+) -> list[Segment]:
+    """再実行時に、以前の割当・本文修正・時刻修正を新しいセグメントへ引き継ぐ。
 
-    突き合わせは開始秒で行う(本文は編集されている可能性があるので鍵に使わない)。
-    キャッシュが効いていれば開始秒は完全一致するので、実際にはほぼ全件が一致する。
+    突き合わせの鍵は orig_start(パイプラインが出した元の時刻)を使う。
+    ユーザーが直したあとの start で照合すると、時刻のずれを数秒ぶん直した区間が
+    再実行のたびに迷子になる。orig_start はユーザーが何をしても動かないので、
+    キャッシュが効いていれば再生成側と完全に一致する。
+    本文は編集されている可能性があるので鍵に使わない。
     話者 ID は _merge_speakers が ID を保存するので、そのまま移してよい。
-    """
-    pool = sorted(
-        (s for s in old.segments if s.speaker_id or s.text_edited),
-        key=lambda s: s.start,
-    )
-    used: set[int] = set()
 
-    carried = 0
-    carried_text = 0
-    for seg in new_segments:
-        best: Segment | None = None
+    戻り値は新しい区間リスト。分割・結合を復元するために区間が増減するので、
+    呼び出し側はこの戻り値で置き換えること。
+    """
+    kept = [s for s in old.segments if s.speaker_id or s.text_edited or s.time_edited]
+    if not kept:
+        return new_segments
+
+    # 同じ orig_start を共有する旧区間は、1 つの区間を分割した兄弟(ファミリー)。
+    # まとめて 1 つの再生成区間に対応付ける。
+    families: dict[float, list[Segment]] = {}
+    for s in kept:
+        families.setdefault(round(float(s.orig_start), 3), []).append(s)
+    pool = [
+        sorted(fam, key=lambda s: (s.start, s.index))
+        for _, fam in sorted(families.items())
+    ]
+    used: set[int] = set()
+    matched: dict[int, list[Segment]] = {}      # new_segments の位置 → ファミリー
+
+    for pos, seg in enumerate(new_segments):
+        best_i = -1
         best_gap = MATCH_TOLERANCE_SECONDS + 1e-9
-        for i, src in enumerate(pool):
+        for i, fam in enumerate(pool):
             if i in used:
                 continue
-            gap = abs(src.start - seg.start)
+            gap = abs(float(fam[0].orig_start) - seg.start)
             if gap < best_gap:
-                best, best_gap, best_i = src, gap, i
-        if best is None:
+                best_i, best_gap = i, gap
+        if best_i >= 0:
+            used.add(best_i)
+            matched[pos] = pool[best_i]
+
+    # 結合して 1 つにした区間が、再実行で再び 2 つに戻るのを防ぐ。
+    # 判定は再生成区間を差し替える「前」に済ませる。差し替えて入る旧区間の
+    # start はユーザーが直した実時刻なので、パイプライン時刻と混ざると誤判定する。
+    # 範囲は照合できたファミリーのぶんだけ使う(照合できなかった旧区間の範囲まで
+    # 使うと、旧区間は入らないのに再生成区間だけ消えて穴が開く)。
+    absorb = [
+        (float(s.orig_start), float(s.orig_end))
+        for fam in matched.values()
+        for s in fam
+        if s.time_edited
+    ]
+
+    result: list[Segment] = []
+    carried = carried_text = replaced = 0
+    absorbed: list[float] = []
+
+    for pos, seg in enumerate(new_segments):
+        fam = matched.get(pos)
+        if fam is None:
+            if any(lo < seg.start < hi for lo, hi in absorb):
+                absorbed.append(seg.start)
+                continue
+            result.append(seg)
             continue
-        used.add(best_i)
-        if best.speaker_id:
-            seg.speaker_id = best.speaker_id
-            seg.reviewed = best.reviewed
-            carried += 1
-        seg.note = best.note
-        if best.text_edited:
-            seg.text = best.text          # ユーザーの手直しを潰さない
-            seg.text_edited = True
-            carried_text += 1
+
+        if len(fam) == 1 and not fam[0].time_edited:
+            # 時刻に手が入っていない区間。再生成側の時刻改善を活かし、
+            # 人が入れた情報だけを移す(従来どおりの動作)。
+            src = fam[0]
+            if src.speaker_id:
+                seg.speaker_id = src.speaker_id
+                seg.reviewed = src.reviewed
+                carried += 1
+            seg.note = src.note
+            if src.text_edited:
+                seg.text = src.text          # ユーザーの手直しを潰さない
+                seg.text_edited = True
+                carried_text += 1
+            result.append(seg)
+        else:
+            # 時刻を直した、または分割した区間。時刻も本文も構造も旧側が正しい。
+            result.extend(fam)
+            replaced += len(fam)
+            carried += sum(1 for s in fam if s.speaker_id)
+            carried_text += sum(1 for s in fam if s.text_edited)
+
+    for n, seg in enumerate(result):
+        seg.index = n
 
     if carried:
         on_log(f"以前の割当 {carried} 区間を引き継ぎました。")
     if carried_text:
         on_log(f"手直しした本文 {carried_text} 区間を復元しました。")
-    return carried
+    if replaced:
+        on_log(f"時刻を直した・分割した {replaced} 区間はそのまま残しました。")
+    if absorbed:
+        heads = "、".join(fmt_hms(t) for t in absorbed[:5])
+        more = " ほか" if len(absorbed) > 5 else ""
+        on_log(
+            f"結合済みの区間に重なる再生成区間 {len(absorbed)} 個を取り込みました"
+            f"({heads}{more})。"
+        )
+    return result
 
 
 def run_segment_pipeline(
@@ -512,7 +577,8 @@ def run_segment_pipeline(
             else:
                 # 話者リストを先に統合してから割当を移す(ID を保存するのが要点)
                 speakers = _merge_speakers(old.speakers, roster)
-                _carry_over_assignments(old, all_segments, on_log)
+                # 分割・結合を復元するぶん区間が増減するので、戻り値で置き換える
+                all_segments = _carry_over_assignments(old, all_segments, on_log)
         except Exception as e:  # 壊れた JSON は無視して作り直す
             on_log(f"既存の作業ファイルを読めませんでした({e})。新規作成します。")
             speakers = parse_roster(roster)

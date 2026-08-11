@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -37,6 +37,10 @@ SPECIAL_SPEAKERS: dict[str, str] = {
 PSEUDO_UNKNOWN = "?"
 PSEUDO_MULTI = "*"
 
+# 人が時刻を直したり区間を分けたりするときに許す最短の長さ。
+# 0 にすると start == end の区間ができて、再生も出力も意味を失う。
+MIN_SEGMENT_SECONDS = 0.1
+
 
 def fmt_hms(seconds: float) -> str:
     """秒 → [HH:MM:SS] 用の 'HH:MM:SS' 文字列"""
@@ -50,6 +54,48 @@ def fmt_ms(seconds: float) -> str:
     if total >= 3600:
         return fmt_hms(total)
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def fmt_hms_frac(seconds: float) -> str:
+    """秒 → 'HH:MM:SS.s'(0.1 秒精度)。時刻を人が直接編集するときの表示形式。
+
+    一覧の表示に使う fmt_hms() は 1 秒に丸めるが、区間の境目を耳で合わせる
+    作業では 0.1 秒が要る。負の秒は 0 として扱う(時刻に負は無い)。
+    """
+    tenths = max(0, int(round(seconds * 10)))
+    total, frac = divmod(tenths, 10)
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}.{frac}"
+
+
+# 全角のまま打たれても受ける(日本語入力の途中で切り替え忘れが起きやすい)
+_ZEN_TO_HAN = str.maketrans("０１２３４５６７８９：．", "0123456789:.")
+_INT_FIELD = re.compile(r"^\d+$", re.ASCII)
+_SEC_FIELD = re.compile(r"^\d+(?:\.\d*)?$", re.ASCII)
+
+
+def parse_hms(text: str) -> float:
+    """'HH:MM:SS.s' / 'MM:SS.s' / 'SS.s' のいずれかを秒に直す(0.1 秒精度)。
+
+    時刻入力欄から受ける。読めない文字列は ValueError にして、
+    呼び出し側が「編集前の値に戻す」判断をできるようにする。
+    最上位の桁だけは 60 以上を許す('90' = 1分30秒、'75:00' = 75分)。
+    """
+    s = str(text).strip().translate(_ZEN_TO_HAN).replace(" ", "").replace("　", "")
+    if not s:
+        raise ValueError("時刻が空です。")
+    parts = s.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"時刻の形式が読めません: {text!r}")
+    if not all(_INT_FIELD.match(p) for p in parts[:-1]) or not _SEC_FIELD.match(parts[-1]):
+        raise ValueError(f"時刻の形式が読めません: {text!r}")
+    values = [float(p) for p in parts]
+    for v in values[1:]:
+        if v >= 60.0:
+            raise ValueError(f"分・秒は 60 未満で指定してください: {text!r}")
+    total = 0.0
+    for v in values:
+        total = total * 60.0 + v
+    return round(total, 1)
 
 
 # ----------------------------------------------------------------------
@@ -142,6 +188,18 @@ class Segment:
     reviewed: bool = False              # この区間の音声を実際に聴いて確定したか
     note: str = ""
     text_edited: bool = False           # ユーザーが本文を手直ししたか(再実行時に保護)
+    time_edited: bool = False           # ユーザーが時刻を直したか
+    # パイプライン(AI)が出した元の時刻。start/end をユーザーが直しても動かさない。
+    # 再実行したときに新旧の区間を突き合わせる鍵と、「元に戻す」の戻り先に使う。
+    # None を渡すと start/end で埋める(新規生成時と、これを持たない旧ファイル)。
+    orig_start: Optional[float] = None
+    orig_end: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.orig_start is None:
+            self.orig_start = self.start
+        if self.orig_end is None:
+            self.orig_end = self.end
 
     @property
     def duration(self) -> float:
@@ -179,6 +237,10 @@ class Segment:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Segment":
+        # orig_start / orig_end は schema 3 から。旧ファイルには無いので None を
+        # 渡し、__post_init__ に start / end を入れさせる(移行処理は不要)。
+        orig_start = d.get("orig_start")
+        orig_end = d.get("orig_end")
         return cls(
             index=int(d["index"]),
             start=float(d.get("start", 0.0)),
@@ -190,6 +252,9 @@ class Segment:
             reviewed=bool(d.get("reviewed", False)),
             note=str(d.get("note", "")),
             text_edited=bool(d.get("text_edited", False)),
+            time_edited=bool(d.get("time_edited", False)),
+            orig_start=float(orig_start) if orig_start is not None else None,
+            orig_end=float(orig_end) if orig_end is not None else None,
         )
 
 
@@ -246,6 +311,100 @@ class Project:
                 seg.reviewed = False
         for i, sp in enumerate(self.speakers):
             sp.order = i
+
+    # -------------------------------------------------- 区間の分割・結合
+    def renumber(self) -> None:
+        """index を 0..n-1 に振り直す。区間を増減させたら必ず呼ぶ。"""
+        for i, seg in enumerate(self.segments):
+            seg.index = i
+
+    def split_segment(self, index: int, boundary: float, cut: int) -> tuple[Segment, Segment]:
+        """1 つの区間を、境界時刻と本文の位置で 2 つに分ける。
+
+        1 区間に 2 人の発言が(重なりなしで)順に混ざっているときに使う。
+        転写から丸ごと落ちた発言も、隣の区間を分割して空いた側に本文を
+        書き足せば復元できる。
+
+        boundary: 境界の秒(実音声の時刻)。区間の内側に収める。
+        cut:      本文を切る位置(文字数。ダイアログのカーソル位置)。
+
+        後半のクラスタを擬似不明にするのは、元の声質ラベルが区間全体に付いた
+        もので、後半の声には保証がないため。擬似クラスタは候補学習からも一括
+        適用からも自動的に外れる(Segment.is_pseudo_cluster)ので、分割で
+        生まれた不確かな区間が学習を汚したり誤って伝播したりするのを防げる。
+        """
+        seg = self.segments[index]
+        if seg.duration < MIN_SEGMENT_SECONDS * 2:
+            raise ValueError("この区間は短すぎて分割できません。")
+        lo = seg.start + MIN_SEGMENT_SECONDS
+        hi = seg.end - MIN_SEGMENT_SECONDS
+        boundary = min(max(round(float(boundary), 1), lo), hi)
+        cut = max(0, min(int(cut), len(seg.text)))
+
+        head = Segment(
+            index=index,
+            start=seg.start,
+            end=boundary,
+            text=seg.text[:cut],
+            cluster=seg.cluster,            # 前半は元の声のまとまりのまま
+            chunk=seg.chunk,
+            speaker_id=seg.speaker_id,
+            reviewed=False,                 # 範囲が変わったので聴き直し対象
+            note=seg.note,
+            text_edited=seg.text_edited,
+            time_edited=True,
+            # 再実行時に「元は 1 つだった」と分かるよう、親の値を両方が共有する
+            orig_start=seg.orig_start,
+            orig_end=seg.orig_end,
+        )
+        tail = Segment(
+            index=index + 1,
+            start=boundary,
+            end=seg.end,
+            text=seg.text[cut:],
+            cluster=f"{seg.chunk}:{PSEUDO_UNKNOWN}",
+            chunk=seg.chunk,
+            speaker_id=None,                # 後半の声は別人かもしれない
+            reviewed=False,
+            note="",
+            text_edited=seg.text_edited,
+            time_edited=True,
+            orig_start=seg.orig_start,
+            orig_end=seg.orig_end,
+        )
+        self.segments[index:index + 1] = [head, tail]
+        self.renumber()
+        return head, tail
+
+    def merge_segments(self, index: int) -> Segment:
+        """index の区間と、その次の区間を 1 つにまとめる。
+
+        分割のやり直し(逆操作)と、同じ発言が 2 行に割れているときの整理に使う。
+        話者が食い違うときは、どちらが正しいか機械には決められないので未確定に
+        落とす。呼び出し側はその旨をユーザーに確認してから呼ぶこと。
+        """
+        if index < 0 or index + 1 >= len(self.segments):
+            raise ValueError("次の区間がないので結合できません。")
+        a, b = self.segments[index], self.segments[index + 1]
+        notes = [n for n in (a.note, b.note) if n]
+        merged = Segment(
+            index=index,
+            start=min(a.start, b.start),
+            end=max(a.end, b.end),
+            text=a.text + b.text,           # 日本語なので空白を挟まない
+            cluster=a.cluster,              # 前側の声のまとまりを採用する
+            chunk=a.chunk,
+            speaker_id=a.speaker_id if a.speaker_id == b.speaker_id else None,
+            reviewed=False,                 # 範囲が変わったので聴き直し対象
+            note=" / ".join(notes),
+            text_edited=a.text_edited or b.text_edited,
+            time_edited=True,
+            orig_start=a.orig_start,        # 系譜の始まりは前側
+            orig_end=b.orig_end,            # 終わりは後側(再実行時の吸収に要る)
+        )
+        self.segments[index:index + 2] = [merged]
+        self.renumber()
+        return merged
 
     # -------------------------------------------------- 統計
     @property

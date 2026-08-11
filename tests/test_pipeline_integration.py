@@ -1,4 +1,4 @@
-"""run_segment_pipeline の結合テスト。
+"""run_segment_pipeline の結合テスト(と、ffmpeg を実際に叩く audio の検証)。
 
 Gemini API は呼ばず、transcribe_audio を差し替えて偽の応答を返す。
 ffmpeg による分割・長さ取得・セグメント化・キャッシュ・割当の引き継ぎまでを通す。
@@ -26,6 +26,7 @@ for _s in (sys.stdout, sys.stderr):
 
 
 from src import pipeline  # noqa: E402
+from src.audio import extract_peaks  # noqa: E402
 from src.segments import Project  # noqa: E402
 
 
@@ -40,6 +41,16 @@ def make_tone(path: Path, seconds: int) -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
          "-c:a", "aac", "-b:a", "64k", str(path), "-loglevel", "error"],
+        check=True,
+    )
+
+
+def make_tone_with_gap(path: Path) -> None:
+    """1秒 音 → 1秒 無音 → 1秒 音 の WAV。波形の谷が見えるかの検証用。"""
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-af", "volume=0:enable='between(t,1,2)'",
+         "-c:a", "pcm_s16le", str(path), "-loglevel", "error"],
         check=True,
     )
 
@@ -88,6 +99,31 @@ def run() -> int:
             tmp = Path(d)
             audio = tmp / "meeting.m4a"
             make_tone(audio, 150)          # 2分30秒 → 1分チャンクで 3 個
+
+            # --- 波形の抽出(分割ダイアログ用) --------------------------
+            wav = tmp / "tone.wav"
+            make_tone_with_gap(wav)
+            peaks = extract_peaks(wav, 0.0, 3.0, 30)
+            check("要求した数のバケツが返る", len(peaks) == 30)
+            check("各バケツは (最小, 最大)",
+                  all(len(p) == 2 and p[0] <= p[1] for p in peaks))
+            loud = max(abs(p[0]) for p in peaks[:8])        # 0.0〜0.8 秒(音あり)
+            quiet = max(abs(p[0]) for p in peaks[12:18])    # 1.2〜1.8 秒(無音)
+            check("音のある所は振幅が出る", loud > 1000)
+            check("無音の谷が波形に出る", quiet * 4 < loud)
+            # 範囲指定が効いていることを、無音側と音のある側の両方で見る
+            # (無音の始まりはフィルタのフレーム境界ぶんずれるので内側を取る)
+            part = extract_peaks(wav, 1.2, 1.8, 10)
+            check("範囲を指定して切り出せる", len(part) == 10)
+            check("無音の範囲を切り出すと静か", max(abs(p[1]) for p in part) * 4 < loud)
+            tail = extract_peaks(wav, 2.2, 2.8, 10)
+            check("音のある範囲を切り出すと振幅が出る", min(abs(p[1]) for p in tail) > 1000)
+            check("範囲が逆なら空リスト", extract_peaks(wav, 2.0, 1.0, 10) == [])
+            check("バケツ 0 なら空リスト", extract_peaks(wav, 0.0, 3.0, 0) == [])
+            check("読めないファイルなら空リスト",
+                  extract_peaks(tmp / "nope.wav", 0.0, 1.0, 10) == [])
+            check("サンプルより多くのバケツを求めても落ちない",
+                  len(extract_peaks(wav, 0.0, 0.01, 500)) == 500)
 
             logs: list[str] = []
             proj = pipeline.run_segment_pipeline(
@@ -312,6 +348,82 @@ def run() -> int:
             check("強制やり直しは全チャンクを転写し直す",
                   calls["n"] == len({sg.chunk for sg in proj_d.segments}))
             check("強制やり直しでも割当は残る", proj_d.assigned_count == 3)
+
+        # ==============================================================
+        # 時刻の修正・分割・結合が、再実行しても保たれる
+        #
+        # 設計上いちばん壊れやすい所。照合の鍵を「ユーザーが直したあとの
+        # start」にすると、直した区間ほど再実行のたびに迷子になる。
+        # ==============================================================
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 120)
+            proj_x = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+            )
+            assert proj_x is not None
+            sid = proj_x.speakers[0].id
+            before_total = proj_x.total_count
+
+            # (1) 時刻を 6 秒ずらす(実測で見たドリフトと同じ幅)
+            moved_seg = proj_x.segments[1]
+            moved_orig = (moved_seg.orig_start, moved_seg.orig_end)
+            moved_seg.start += 6.0
+            moved_seg.end += 6.0
+            moved_seg.time_edited = True
+            moved_seg.speaker_id = sid
+            moved_seg.reviewed = True
+
+            # (2) 分割して、空いた後半に落ちていた発言を書き足す
+            s3 = proj_x.segments[3]
+            head, tail = proj_x.split_segment(3, s3.start + s3.duration / 2, 3)
+            split_orig = (head.orig_start, head.orig_end)
+            tail.text = "落ちていた発言を書き足した"
+            tail.text_edited = True
+
+            # (3) 分割で 1 つ増えた後ろのほうで、2 区間を結合する
+            merged = proj_x.merge_segments(6)
+            merged_orig = (merged.orig_start, merged.orig_end)
+            proj_x.save()
+
+            logs_x: list[str] = []
+            proj_y = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, api_key="dummy",
+                model="gemini-2.5-flash", chunk_minutes=1,
+                on_log=logs_x.append, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n田中",
+            )
+            assert proj_y is not None
+            check("再実行しても区間の数が変わらない",
+                  proj_y.total_count == before_total)     # +1 分割 −1 結合
+            check("index が 0..n-1 に振り直される",
+                  [s.index for s in proj_y.segments] == list(range(proj_y.total_count)))
+
+            moved_back = [s for s in proj_y.segments if s.orig_start == moved_orig[0]]
+            check("直した時刻が再実行後も残る",
+                  len(moved_back) == 1
+                  and abs(moved_back[0].start - (moved_orig[0] + 6.0)) < 1e-6
+                  and moved_back[0].time_edited is True)
+            check("元の時刻(照合の鍵)は動いていない",
+                  moved_back[0].orig_end == moved_orig[1])
+            check("直した区間の割当も残る", moved_back[0].speaker_id == sid)
+
+            family = [s for s in proj_y.segments
+                      if (s.orig_start, s.orig_end) == split_orig]
+            check("分割した 2 区間がそのまま戻る", len(family) == 2)
+            check("書き足した本文が残る",
+                  any(s.text == "落ちていた発言を書き足した" for s in family))
+            check("分割の後半は擬似クラスタのまま", any(s.is_pseudo_cluster for s in family))
+
+            merged_back = [s for s in proj_y.segments
+                           if (s.orig_start, s.orig_end) == merged_orig]
+            check("結合した区間が 2 つに戻らない", len(merged_back) == 1)
+            check("取り込んだことがログに出る",
+                  any("取り込みました" in m for m in logs_x))
 
         # ==============================================================
         # 指紋の無い古い作業ファイルは、継続時間で差し替えを判定する
