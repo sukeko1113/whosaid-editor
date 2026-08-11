@@ -113,25 +113,30 @@ def clamp_times(
 
 
 def move_edge(
-    base_start: float, base_end: float, which: str, value: float, duration: float
+    base_start: float, base_end: float, which: str, value: float, duration: float,
+    shift_if_past: bool = False,
 ) -> tuple[float, float]:
     """時刻の片側を動かした結果の (開始, 終了) を返す。
 
-    動かすのは片側だけで、区間の長さは変わる(境界の微調整)。
-    ただし、もう一方を追い越すところまで指定されたときは、その値を尊重して
-    長さを保ったまま区間ごとずらす。入力欄に打った時刻を「読めないので
-    手前で止めました」と黙って書き換えるより、そのまま置くほうが分かりやすい。
+    動かすのは片側だけで、区間の長さは変わる(境界の微調整)。もう一方に
+    突き当たったらそこで止まる。
 
-    区間ごとずらしたいだけなら shift_span を使う(画面の「区間ごと」ボタン)。
+    shift_if_past は入力欄に時刻を直接打たれたときだけ True にする。
+    もう一方を追い越す時刻を打たれたら、長さを保ったままそこへずらす。
+    打った時刻を黙って手前に書き換えるより、そのまま置くほうが分かりやすい。
+    ナッジボタンでは False。短い区間はボタン 1 回で追い越してしまうので、
+    True にすると押すたびに区間ごとスライドして幅を調整できなくなる。
+
+    区間ごとずらしたいときは shift_span を使う(画面の「区間ごと」ボタン)。
     """
     span = max(MIN_SEGMENT_SECONDS, base_end - base_start)
     if which == "start":
         start, end = value, base_end
-        if start > end - MIN_SEGMENT_SECONDS:
+        if shift_if_past and start > end - MIN_SEGMENT_SECONDS:
             end = start + span
     else:
         start, end = base_start, value
-        if end < start + MIN_SEGMENT_SECONDS:
+        if shift_if_past and end < start + MIN_SEGMENT_SECONDS:
             start = end - span
     return clamp_times(start, end, duration, moved=which)
 
@@ -892,7 +897,8 @@ class AssignWindow(tk.Toplevel):
             self._show_times()
             self._set_action("時刻の形式が読めませんでした(例 00:43:51.5)。元に戻します。")
             return
-        self._apply_time(which, value, explicit=explicit)
+        # 打たれた時刻はそのまま置く(反対側を追い越すなら区間ごとそこへ移す)
+        self._apply_time(which, value, explicit=explicit, shift_if_past=True)
 
     def _nudge_time(self, which: str, delta: float) -> None:
         """(−1)(−0.1)(+0.1)(+1) ボタン。入力欄に打ちかけの値があればそこから動かす。"""
@@ -916,10 +922,12 @@ class AssignWindow(tk.Toplevel):
         start, end = shift_span(base_start, base_end, delta, self.proj.duration)
         self._commit_times(start, end, base_start, base_end, explicit=True)
 
-    def _apply_time(self, which: str, value: float, explicit: bool = False) -> None:
+    def _apply_time(self, which: str, value: float, explicit: bool = False,
+                    shift_if_past: bool = False) -> None:
         seg = self.proj.segments[self.current]
         base_start, base_end = time_edit_base(seg, self.proj.time_offset)
-        start, end = move_edge(base_start, base_end, which, value, self.proj.duration)
+        start, end = move_edge(base_start, base_end, which, value,
+                               self.proj.duration, shift_if_past=shift_if_past)
         self._commit_times(start, end, base_start, base_end, explicit)
 
     def _commit_times(self, start: float, end: float, base_start: float,
