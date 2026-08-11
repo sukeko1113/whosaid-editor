@@ -1,4 +1,4 @@
-"""run_segment_pipeline の結合テスト。
+"""run_segment_pipeline の結合テスト(と、ffmpeg を実際に叩く audio の検証)。
 
 Gemini API は呼ばず、transcribe_audio を差し替えて偽の応答を返す。
 ffmpeg による分割・長さ取得・セグメント化・キャッシュ・割当の引き継ぎまでを通す。
@@ -26,6 +26,7 @@ for _s in (sys.stdout, sys.stderr):
 
 
 from src import pipeline  # noqa: E402
+from src.audio import extract_peaks  # noqa: E402
 from src.segments import Project  # noqa: E402
 
 
@@ -40,6 +41,16 @@ def make_tone(path: Path, seconds: int) -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
          "-c:a", "aac", "-b:a", "64k", str(path), "-loglevel", "error"],
+        check=True,
+    )
+
+
+def make_tone_with_gap(path: Path) -> None:
+    """1秒 音 → 1秒 無音 → 1秒 音 の WAV。波形の谷が見えるかの検証用。"""
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+         "-af", "volume=0:enable='between(t,1,2)'",
+         "-c:a", "pcm_s16le", str(path), "-loglevel", "error"],
         check=True,
     )
 
@@ -88,6 +99,31 @@ def run() -> int:
             tmp = Path(d)
             audio = tmp / "meeting.m4a"
             make_tone(audio, 150)          # 2分30秒 → 1分チャンクで 3 個
+
+            # --- 波形の抽出(分割ダイアログ用) --------------------------
+            wav = tmp / "tone.wav"
+            make_tone_with_gap(wav)
+            peaks = extract_peaks(wav, 0.0, 3.0, 30)
+            check("要求した数のバケツが返る", len(peaks) == 30)
+            check("各バケツは (最小, 最大)",
+                  all(len(p) == 2 and p[0] <= p[1] for p in peaks))
+            loud = max(abs(p[0]) for p in peaks[:8])        # 0.0〜0.8 秒(音あり)
+            quiet = max(abs(p[0]) for p in peaks[12:18])    # 1.2〜1.8 秒(無音)
+            check("音のある所は振幅が出る", loud > 1000)
+            check("無音の谷が波形に出る", quiet * 4 < loud)
+            # 範囲指定が効いていることを、無音側と音のある側の両方で見る
+            # (無音の始まりはフィルタのフレーム境界ぶんずれるので内側を取る)
+            part = extract_peaks(wav, 1.2, 1.8, 10)
+            check("範囲を指定して切り出せる", len(part) == 10)
+            check("無音の範囲を切り出すと静か", max(abs(p[1]) for p in part) * 4 < loud)
+            tail = extract_peaks(wav, 2.2, 2.8, 10)
+            check("音のある範囲を切り出すと振幅が出る", min(abs(p[1]) for p in tail) > 1000)
+            check("範囲が逆なら空リスト", extract_peaks(wav, 2.0, 1.0, 10) == [])
+            check("バケツ 0 なら空リスト", extract_peaks(wav, 0.0, 3.0, 0) == [])
+            check("読めないファイルなら空リスト",
+                  extract_peaks(tmp / "nope.wav", 0.0, 1.0, 10) == [])
+            check("サンプルより多くのバケツを求めても落ちない",
+                  len(extract_peaks(wav, 0.0, 0.01, 500)) == 500)
 
             logs: list[str] = []
             proj = pipeline.run_segment_pipeline(
