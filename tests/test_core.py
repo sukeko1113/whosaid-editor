@@ -766,6 +766,116 @@ def test_load_schema2_file_fills_orig_times():
 
 
 # ======================================================================
+# 再実行時の引き継ぎ(carry-over)
+# ======================================================================
+
+def _carry(old_segments, new_segments):
+    """_carry_over_assignments を単体で回す。戻り値は (新しい区間リスト, ログ)"""
+    from src.pipeline import _carry_over_assignments      # google-genai を引くので局所 import
+
+    old = Project(audio_path="a.m4a")
+    old.segments = old_segments
+    logs: list[str] = []
+    return _carry_over_assignments(old, new_segments, logs.append), logs
+
+
+def test_carry_over_keeps_edited_times():
+    """時刻を直した区間は orig_start で照合され、直した時刻のまま残る。"""
+    old = [
+        Segment(index=0, start=106.0, end=116.0, text="あ", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="あ", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="い", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 2
+    assert (result[0].start, result[0].end) == (106.0, 116.0)
+    assert result[0].time_edited is True
+    assert result[0].speaker_id == "sp01" and result[0].reviewed is True
+    assert result[1].start == 110.0        # 隣は再生成側のまま
+    assert [s.index for s in result] == [0, 1]
+
+
+def test_carry_over_replaces_with_split_family():
+    """分割で 2 つになった区間が、再生成の 1 区間を丸ごと置き換える。"""
+    old = [
+        Segment(index=0, start=100.0, end=105.0, text="そうですね", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+        Segment(index=1, start=105.0, end=110.0, text="いいと思います", cluster="0:?",
+                time_edited=True, orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="そうですねいいと思います", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次の議題です", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["そうですね", "いいと思います", "次の議題です"]
+    assert result[1].cluster == "0:?"      # 擬似クラスタが保たれる
+    assert [s.index for s in result] == [0, 1, 2]
+
+
+def test_carry_over_absorbs_merged_range():
+    """結合した区間は、再生成で分かれて出てきたぶんを取り込む(区間が戻らない)。"""
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="そうですねいいと思います",
+                cluster="0:A", speaker_id="sp01", time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=105.0, text="そうですね", cluster="0:A"),
+        Segment(index=1, start=105.0, end=110.0, text="いいと思います", cluster="0:A"),
+        Segment(index=2, start=110.0, end=120.0, text="次の議題です", cluster="0:B"),
+    ]
+    result, logs = _carry(old, new)
+    assert [s.text for s in result] == ["そうですねいいと思います", "次の議題です"]
+    assert [s.index for s in result] == [0, 1]
+    # 消したことをユーザーが気づけるようログに出す
+    assert any("取り込みました" in m for m in logs)
+
+
+def test_carry_over_legacy_behaviour_unchanged():
+    """orig_* を持たない旧ファイル(= orig が start と同値)は従来どおり動く。"""
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="あ(手直し)", cluster="0:A",
+                speaker_id="sp01", reviewed=True, note="めも", text_edited=True),
+        Segment(index=1, start=110.0, end=120.0, text="い", cluster="0:B",
+                speaker_id="sp02"),
+    ]
+    # 再実行で時刻がわずかに動いた(照合の許容 ±2 秒の内側)
+    new = [
+        Segment(index=0, start=101.0, end=111.0, text="あ", cluster="0:A"),
+        Segment(index=1, start=111.0, end=121.0, text="い", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 2
+    # 時刻には手が入っていないので、再生成側の時刻をそのまま使う
+    assert (result[0].start, result[0].end) == (101.0, 111.0)
+    # 人が入れた情報だけが移る
+    assert result[0].speaker_id == "sp01" and result[0].reviewed is True
+    assert result[0].text == "あ(手直し)" and result[0].text_edited is True
+    assert result[0].note == "めも"
+    assert result[1].speaker_id == "sp02"
+
+
+def test_carry_over_absorbs_only_matched_families():
+    """照合できなかった旧区間の範囲では吸収しない(穴が開くのを防ぐ)。"""
+    old = [
+        # 再生成側に対応する区間が無い(±2 秒に何も無い)結合済み区間
+        Segment(index=0, start=300.0, end=330.0, text="消えた区間", cluster="0:A",
+                speaker_id="sp01", time_edited=True, orig_start=300.0, orig_end=330.0),
+    ]
+    new = [
+        Segment(index=0, start=310.0, end=320.0, text="残すべき区間", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
 
