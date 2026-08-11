@@ -227,7 +227,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
 3. **(任意) アイコンを置く**: `resources\icon.ico`。
 
-4. **`build.bat` をダブルクリック** → `Output\GeminiTranscriberSetup-2.0.6.exe`。
+4. **`build.bat` をダブルクリック** → `Output\GeminiTranscriberSetup-2.1.0.exe`。
 
 > Inno Setup を入れずにビルドした場合は、`dist\GeminiTranscriber\` をフォルダごと
 > コピーすれば動きます(ポータブル運用)。
@@ -238,7 +238,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 テスト(`tests/`)も同じジョブで実行されます。
 
 - **PR / push**: `Actions` タブから `GeminiTranscriber-Installer` artifact をダウンロード可能
-- **タグ push** (`git tag v2.0.6 && git push --tags`): 自動で Release を作成し `.exe` を添付
+- **タグ push** (`git tag v2.1.0 && git push --tags`): 自動で Release を作成し `.exe` を添付
 
 ---
 

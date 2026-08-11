@@ -641,6 +641,25 @@ def test_write_docx_options():
     assert paras[2] == "【佐藤】 い"
 
 
+def test_write_docx_uses_edited_times():
+    """時刻を直した区間は、直した時刻で出力される。"""
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    proj.time_offset = 4.0          # ずれ補正は出力に効かない(再生だけのもの)
+    seg = proj.segments[3]          # 既定では 30.0〜39.0
+    seg.speaker_id = proj.speakers[0].id
+    seg.start, seg.end = 37.0, 45.0
+    seg.time_edited = True
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, merge_consecutive=False)
+        paras = [p.text for p in Document(str(out)).paragraphs if p.text.strip()]
+    assert any(p.startswith("[00:00:37]") for p in paras)
+    assert not any(p.startswith("[00:00:30]") for p in paras)
+
+
 def test_build_note_distinguishes_reviewed():
     from src.segments import build_note
 

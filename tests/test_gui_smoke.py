@@ -401,6 +401,19 @@ def run() -> int:
         check("空の世代が残っていない", all(win._undo))
         win.apply_split(proj.segments[14].start + 12.0, 4)   # 数を元に戻す
 
+        # --- 分割・結合・時刻修正を保存して読み直す ------------------------
+        win.goto(20)
+        win._apply_time("start", proj.segments[20].start + 3.0, explicit=True)
+        win.save()
+        again = Project.load(proj.json_path)
+        check("区間の数がそのまま保存される", again.total_count == len(proj.segments))
+        check("時刻の修正が保存される", any(s.time_edited for s in again.segments))
+        check("分割で生まれた擬似クラスタが保存される",
+              any(s.is_pseudo_cluster for s in again.segments))
+        check("元の時刻はすべての区間に残る",
+              all(s.orig_start is not None and s.orig_end is not None
+                  for s in again.segments))
+
         # --- タイムライン描画 --------------------------------------------
         win._draw_timeline()
         win.update()
