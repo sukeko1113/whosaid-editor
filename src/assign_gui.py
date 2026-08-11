@@ -24,6 +24,7 @@ from typing import Optional
 
 from .player import SegmentPlayer
 from .segments import (
+    MIN_SEGMENT_SECONDS,
     Project,
     SPECIAL_MULTI,
     SPECIAL_NOISE,
@@ -67,11 +68,6 @@ def preview_length(text: str, duration: float) -> float:
     if duration <= 0:
         return need
     return min(max(duration, PREVIEW_FLOOR_SECONDS), need)
-
-
-# 時刻を直した区間に許す最短の長さ。0 にすると start == end の区間ができて
-# 再生も出力も意味を失うので、下限を置く。
-MIN_SEGMENT_SECONDS = 0.1
 
 
 def time_edit_base(seg: Segment, time_offset: float) -> tuple[float, float]:
