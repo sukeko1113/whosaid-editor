@@ -7,6 +7,7 @@ GUI・Gemini API・ffmpeg には依存しない。
 """
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -22,10 +23,13 @@ for _s in (sys.stdout, sys.stderr):
 
 
 from src.segments import (  # noqa: E402
+    SCHEMA_VERSION,
     Project,
     SPECIAL_UNKNOWN,
     Segment,
     fmt_hms,
+    fmt_hms_frac,
+    parse_hms,
     parse_roster,
     roster_to_text,
 )
@@ -655,6 +659,110 @@ def test_fmt_hms():
     assert fmt_hms(0) == "00:00:00"
     assert fmt_hms(59.6) == "00:01:00"
     assert fmt_hms(3725) == "01:02:05"
+
+
+# ======================================================================
+# 時刻の表示・入力(0.1 秒精度)
+# ======================================================================
+
+def test_fmt_hms_frac():
+    assert fmt_hms_frac(0) == "00:00:00.0"
+    assert fmt_hms_frac(2631.5) == "00:43:51.5"
+    assert fmt_hms_frac(3725.04) == "01:02:05.0"
+    assert fmt_hms_frac(59.96) == "00:01:00.0"      # 秒への繰り上がり
+    assert fmt_hms_frac(-3.0) == "00:00:00.0"       # 負は 0 に丸める
+
+
+def test_parse_hms_formats():
+    assert parse_hms("01:02:05.4") == 3725.4
+    assert parse_hms("43:51.5") == 2631.5
+    assert parse_hms("7.5") == 7.5
+    assert parse_hms("7") == 7.0
+    assert parse_hms("00:00:00.0") == 0.0
+    # 最上位の桁だけは 60 以上を許す(90 秒、75 分)
+    assert parse_hms("90") == 90.0
+    assert parse_hms("75:00") == 4500.0
+    # 前後の空白と、全角のまま打たれた数字・区切りも受ける
+    assert parse_hms("  01:02:05.4  ") == 3725.4
+    assert parse_hms("００:４３:５１．５") == 2631.5
+
+
+def test_parse_hms_rejects_bad_values():
+    bad = [
+        "", "   ",
+        "abc",
+        "01:02:03:04",       # 桁が多い
+        "01::05",            # 空フィールド
+        ":30",
+        "-5",                # 負
+        "1.5:30",            # 小数は最下位だけ
+        "01:75:00",          # 分が 60 以上
+        "43:75.0",           # 秒が 60 以上
+        "12:34:5x",
+    ]
+    for s in bad:
+        try:
+            parse_hms(s)
+        except ValueError:
+            continue
+        raise AssertionError(f"拒否されるべき入力が通った: {s!r}")
+
+
+def test_hms_round_trip():
+    for sec in (0.0, 0.1, 7.5, 59.9, 2631.5, 3725.4, 36000.0):
+        assert parse_hms(fmt_hms_frac(sec)) == sec
+
+
+# ======================================================================
+# 時刻編集のスキーマ(schema 3)
+# ======================================================================
+
+def test_orig_times_default_to_start_end():
+    seg = Segment(index=0, start=10.0, end=20.0, text="あ", cluster="0:A")
+    assert seg.orig_start == 10.0
+    assert seg.orig_end == 20.0
+    assert seg.time_edited is False
+    # 明示指定したときはそちらが勝つ(分割で親の値を共有させるため)
+    child = Segment(index=1, start=15.0, end=20.0, text="い", cluster="0:A",
+                    orig_start=10.0, orig_end=20.0)
+    assert (child.orig_start, child.orig_end) == (10.0, 20.0)
+
+
+def test_load_schema2_file_fills_orig_times():
+    """orig_* を持たない旧ファイルは既定値だけで読め、保存は v3 になる。"""
+    old = {
+        "schema": 2,
+        "audio_path": "a.m4a",
+        "duration": 100.0,
+        "speakers": [{"id": "sp01", "name": "佐藤", "note": "", "order": 0}],
+        "segments": [
+            {"index": 0, "start": 10.0, "end": 20.0, "text": "あ", "cluster": "0:A",
+             "chunk": 0, "speaker_id": "sp01", "reviewed": True, "note": "",
+             "text_edited": False},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+
+        proj = Project.load(p)
+        seg = proj.segments[0]
+        assert (seg.orig_start, seg.orig_end) == (10.0, 20.0)
+        assert seg.time_edited is False
+
+        # 時刻を直して保存 → schema 3 で書かれ、orig は元の時刻のまま残る
+        seg.start, seg.end = 16.0, 26.0
+        seg.time_edited = True
+        proj.save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert data["schema"] == SCHEMA_VERSION == 3
+
+        again = Project.load(p)
+        s2 = again.segments[0]
+        assert (s2.start, s2.end) == (16.0, 26.0)
+        assert (s2.orig_start, s2.orig_end) == (10.0, 20.0)
+        assert s2.time_edited is True
+        assert s2.reviewed is True and s2.speaker_id == "sp01"
 
 
 # ======================================================================

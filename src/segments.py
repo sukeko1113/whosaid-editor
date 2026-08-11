@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -50,6 +50,48 @@ def fmt_ms(seconds: float) -> str:
     if total >= 3600:
         return fmt_hms(total)
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def fmt_hms_frac(seconds: float) -> str:
+    """秒 → 'HH:MM:SS.s'(0.1 秒精度)。時刻を人が直接編集するときの表示形式。
+
+    一覧の表示に使う fmt_hms() は 1 秒に丸めるが、区間の境目を耳で合わせる
+    作業では 0.1 秒が要る。負の秒は 0 として扱う(時刻に負は無い)。
+    """
+    tenths = max(0, int(round(seconds * 10)))
+    total, frac = divmod(tenths, 10)
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}.{frac}"
+
+
+# 全角のまま打たれても受ける(日本語入力の途中で切り替え忘れが起きやすい)
+_ZEN_TO_HAN = str.maketrans("０１２３４５６７８９：．", "0123456789:.")
+_INT_FIELD = re.compile(r"^\d+$", re.ASCII)
+_SEC_FIELD = re.compile(r"^\d+(?:\.\d*)?$", re.ASCII)
+
+
+def parse_hms(text: str) -> float:
+    """'HH:MM:SS.s' / 'MM:SS.s' / 'SS.s' のいずれかを秒に直す(0.1 秒精度)。
+
+    時刻入力欄から受ける。読めない文字列は ValueError にして、
+    呼び出し側が「編集前の値に戻す」判断をできるようにする。
+    最上位の桁だけは 60 以上を許す('90' = 1分30秒、'75:00' = 75分)。
+    """
+    s = str(text).strip().translate(_ZEN_TO_HAN).replace(" ", "").replace("　", "")
+    if not s:
+        raise ValueError("時刻が空です。")
+    parts = s.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"時刻の形式が読めません: {text!r}")
+    if not all(_INT_FIELD.match(p) for p in parts[:-1]) or not _SEC_FIELD.match(parts[-1]):
+        raise ValueError(f"時刻の形式が読めません: {text!r}")
+    values = [float(p) for p in parts]
+    for v in values[1:]:
+        if v >= 60.0:
+            raise ValueError(f"分・秒は 60 未満で指定してください: {text!r}")
+    total = 0.0
+    for v in values:
+        total = total * 60.0 + v
+    return round(total, 1)
 
 
 # ----------------------------------------------------------------------
@@ -142,6 +184,18 @@ class Segment:
     reviewed: bool = False              # この区間の音声を実際に聴いて確定したか
     note: str = ""
     text_edited: bool = False           # ユーザーが本文を手直ししたか(再実行時に保護)
+    time_edited: bool = False           # ユーザーが時刻を直したか
+    # パイプライン(AI)が出した元の時刻。start/end をユーザーが直しても動かさない。
+    # 再実行したときに新旧の区間を突き合わせる鍵と、「元に戻す」の戻り先に使う。
+    # None を渡すと start/end で埋める(新規生成時と、これを持たない旧ファイル)。
+    orig_start: Optional[float] = None
+    orig_end: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.orig_start is None:
+            self.orig_start = self.start
+        if self.orig_end is None:
+            self.orig_end = self.end
 
     @property
     def duration(self) -> float:
@@ -179,6 +233,10 @@ class Segment:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Segment":
+        # orig_start / orig_end は schema 3 から。旧ファイルには無いので None を
+        # 渡し、__post_init__ に start / end を入れさせる(移行処理は不要)。
+        orig_start = d.get("orig_start")
+        orig_end = d.get("orig_end")
         return cls(
             index=int(d["index"]),
             start=float(d.get("start", 0.0)),
@@ -190,6 +248,9 @@ class Segment:
             reviewed=bool(d.get("reviewed", False)),
             note=str(d.get("note", "")),
             text_edited=bool(d.get("text_edited", False)),
+            time_edited=bool(d.get("time_edited", False)),
+            orig_start=float(orig_start) if orig_start is not None else None,
+            orig_end=float(orig_end) if orig_end is not None else None,
         )
 
 
