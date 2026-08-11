@@ -28,8 +28,11 @@ from .segments import (
     SPECIAL_MULTI,
     SPECIAL_NOISE,
     SPECIAL_UNKNOWN,
+    Segment,
     Speaker,
     fmt_hms,
+    fmt_hms_frac,
+    parse_hms,
     parse_roster,
     roster_to_text,
     write_docx,
@@ -64,6 +67,68 @@ def preview_length(text: str, duration: float) -> float:
     if duration <= 0:
         return need
     return min(max(duration, PREVIEW_FLOOR_SECONDS), need)
+
+
+# 時刻を直した区間に許す最短の長さ。0 にすると start == end の区間ができて
+# 再生も出力も意味を失うので、下限を置く。
+MIN_SEGMENT_SECONDS = 0.1
+
+
+def time_edit_base(seg: Segment, time_offset: float) -> tuple[float, float]:
+    """時刻編集の入力欄に出す値(開始, 終了)。
+
+    まだ直していない区間は、いま「ずれ補正込みで聴こえている位置」を初期値に
+    する。そのまま確定すれば、聴こえたとおりの時刻がその区間に固定される。
+    一度直した区間の start/end は実音声の時刻そのものなので、補正を足さない。
+    """
+    if seg.time_edited:
+        return seg.start, seg.end
+    return max(0.0, seg.start + time_offset), max(0.0, seg.end + time_offset)
+
+
+def clamp_times(
+    start: float, end: float, duration: float, moved: str = "start"
+) -> tuple[float, float]:
+    """時刻編集の値を有効な範囲に収める(0.1 秒精度)。
+
+    moved は今動かしたほうの端。行き過ぎたときに動かさなかった側を守る。
+    隣の区間との重なりは直さない。同時発話は正当な記録なので、
+    勝手に隣を詰めたり切ったりしてはいけない。
+    """
+    start = max(0.0, round(start, 1))
+    end = max(0.0, round(end, 1))
+    top = round(duration, 1) if duration and duration > 0 else None
+    if top is not None:
+        start = min(start, top)
+        end = min(end, top)
+    if end - start < MIN_SEGMENT_SECONDS:
+        if moved == "start":
+            start = round(end - MIN_SEGMENT_SECONDS, 1)
+            if start < 0.0:
+                start, end = 0.0, MIN_SEGMENT_SECONDS
+        else:
+            end = round(start + MIN_SEGMENT_SECONDS, 1)
+            if top is not None and end > top:
+                end = top
+                start = max(0.0, round(end - MIN_SEGMENT_SECONDS, 1))
+    return start, end
+
+
+def playback_window(
+    seg: Segment, time_offset: float, back: float = 0.0, extend: float = 0.0
+) -> tuple[float, float]:
+    """この区間を音声のどこからどこまで鳴らすか(開始秒, 終了秒)。
+
+    時刻を直した区間は、人が耳で合わせた実音声の時刻そのものなので
+    ずれ補正を足さない。終わりも本文の長さから推測せず、確認した終了時刻を使う。
+    """
+    shift = 0.0 if seg.time_edited else time_offset
+    if extend > 0 or seg.time_edited:
+        preview_end = seg.end
+    else:
+        # 本文に見合う長さだけ再生する(「この先30秒▶」で続きを聴ける)
+        preview_end = seg.start + preview_length(seg.text, seg.duration)
+    return max(0.0, seg.start + shift - back), preview_end + shift + extend
 
 # 話者ごとの色(タイムライン帯・一覧の色分け用)
 PALETTE = [
@@ -182,6 +247,8 @@ class AssignWindow(tk.Toplevel):
         self.var_action = tk.StringVar(value="")
         self.var_backend = tk.StringVar(value="")
         self.var_offset = tk.DoubleVar(value=float(project.time_offset))
+        self.var_start = tk.StringVar(value="")
+        self.var_end = tk.StringVar(value="")
 
         self._build_ui()
         self._bind_keys()
@@ -258,14 +325,41 @@ class AssignWindow(tk.Toplevel):
         right = ttk.Frame(body)
         body.add(right, weight=4)
         right.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
-        right.rowconfigure(3, weight=1)
+        right.rowconfigure(2, weight=1)
+        right.rowconfigure(4, weight=1)
 
         ttk.Label(right, textvariable=self.var_seginfo, font=("", 10, "bold"))\
             .grid(row=0, column=0, sticky="w", padx=6, pady=(0, 2))
 
+        # --- 区間の時刻 --------------------------------------------------
+        # Gemini の時刻推定は局所的にずれる(1 分の間に 0→6→2 秒と変動する)。
+        # 全体一律のずれ補正では直せないので、区間ごとに耳で合わせられるようにする。
+        frm_time = ttk.Frame(right)
+        frm_time.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
+        ttk.Label(frm_time, text="時刻:").pack(side="left", padx=(0, 8))
+        for which, label in (("start", "開始"), ("end", "終了")):
+            ttk.Label(frm_time, text=label).pack(side="left", padx=(6, 2))
+            ent = ttk.Entry(
+                frm_time, width=11, justify="center",
+                textvariable=self.var_start if which == "start" else self.var_end,
+            )
+            ent.pack(side="left", padx=(0, 2))
+            # Enter は「この値でいい」という意思表示。ずれ補正込みの初期値を
+            # そのまま押しても、その時刻でこの区間を固定する。
+            ent.bind("<Return>", lambda e, w=which: self._commit_time(w, explicit=True))
+            ent.bind("<FocusOut>", lambda e, w=which: self._commit_time(w))
+            for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
+                ttk.Button(
+                    frm_time, text=text, width=5, takefocus=False,
+                    command=lambda w=which, d=delta: self._nudge_time(w, d),
+                ).pack(side="left", padx=1)
+        self.btn_revert_time = ttk.Button(
+            frm_time, text="元に戻す", takefocus=False, command=self.revert_time,
+        )
+        self.btn_revert_time.pack(side="left", padx=(12, 0))
+
         frm_text = ttk.LabelFrame(right, text="この区間の発言(編集できます)")
-        frm_text.grid(row=1, column=0, sticky="nsew", padx=4, pady=2)
+        frm_text.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
         frm_text.columnconfigure(0, weight=1)
         frm_text.rowconfigure(0, weight=1)
         self.txt_body = tk.Text(frm_text, height=6, wrap="word", font=("", 11))
@@ -277,7 +371,7 @@ class AssignWindow(tk.Toplevel):
 
         # --- 再生コントロール ------------------------------------------
         frm_play = ttk.LabelFrame(right, text="再生")
-        frm_play.grid(row=2, column=0, sticky="ew", padx=4, pady=2)
+        frm_play.grid(row=3, column=0, sticky="ew", padx=4, pady=2)
         self.btn_play = ttk.Button(frm_play, text="▶ 再生 (Space)", command=self.toggle_play, width=16)
         self.btn_play.grid(row=0, column=0, padx=(6, 4), pady=6)
         ttk.Button(frm_play, text="◀ 5秒前から",
@@ -313,7 +407,7 @@ class AssignWindow(tk.Toplevel):
 
         # --- 候補者リスト ----------------------------------------------
         frm_cand = ttk.LabelFrame(right, text="話者を選ぶ(数字キーで即確定・可能性の高い順)")
-        frm_cand.grid(row=3, column=0, sticky="nsew", padx=4, pady=2)
+        frm_cand.grid(row=4, column=0, sticky="nsew", padx=4, pady=2)
         frm_cand.columnconfigure(0, weight=1)
         frm_cand.rowconfigure(0, weight=1)
         self.cand_holder = ttk.Frame(frm_cand)
@@ -548,7 +642,9 @@ class AssignWindow(tk.Toplevel):
                 mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
             else:
                 mark = "✓"
-        values = (fmt_hms(seg.start), seg.cluster_label,
+        # 時刻を直した区間は一覧でも分かるようにする(✓/△ と同じ考え方)
+        time_cell = ("✎ " if seg.time_edited else "") + fmt_hms(seg.start)
+        values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", seg.preview(70))
         return values, tuple(tags)
 
@@ -679,23 +775,126 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
+        self._update_seginfo()
+        self._show_times()
+        self.txt_body.delete("1.0", "end")
+        self.txt_body.insert("1.0", seg.text)
+        self._rebuild_candidates()
+        self._draw_timeline()
+
+    def _update_seginfo(self) -> None:
+        """区間ヘッダ(右ペイン最上段)を書き直す。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
         pos = self.current + 1
         state = "未確定"
         if seg.speaker_id:
             state = "確認済み" if seg.reviewed else "△まとめて適用(未確認)"
+        # 時刻を直した区間は、確認した終了時刻まで丸ごと鳴らす(先頭だけにしない)
         plen = preview_length(seg.text, seg.duration)
-        long_note = (f"(再生は先頭{plen:.0f}秒)" if plen < seg.duration - 0.5 else "")
+        long_note = (
+            "" if seg.time_edited
+            else (f"(再生は先頭{plen:.0f}秒)" if plen < seg.duration - 0.5 else "")
+        )
         self.var_seginfo.set(
             f"区間 {pos}/{len(self.proj.segments)}   "
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
-            + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒" if self.proj.time_offset else "")
+            + ("   ✎時刻を修正済み" if seg.time_edited else "")
+            + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒"
+               if self.proj.time_offset and not seg.time_edited else "")
         )
-        self.txt_body.delete("1.0", "end")
-        self.txt_body.insert("1.0", seg.text)
-        self._rebuild_candidates()
+
+    # ==================================================================
+    # 区間の時刻を直す
+    # ==================================================================
+    def _show_times(self) -> None:
+        """時刻の入力欄を、いまの区間の値に合わせる。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        start, end = time_edit_base(seg, self.proj.time_offset)
+        self.var_start.set(fmt_hms_frac(start))
+        self.var_end.set(fmt_hms_frac(end))
+        self.btn_revert_time.state(["!disabled"] if seg.time_edited else ["disabled"])
+
+    def _commit_time(self, which: str, explicit: bool = False) -> None:
+        """入力欄の値を区間に反映する。読めない値は元に戻して知らせる。"""
+        if not self.proj.segments:
+            return
+        var = self.var_start if which == "start" else self.var_end
+        try:
+            value = parse_hms(var.get())
+        except ValueError:
+            self._show_times()
+            self._set_action("時刻の形式が読めませんでした(例 00:43:51.5)。元に戻します。")
+            return
+        self._apply_time(which, value, explicit=explicit)
+
+    def _nudge_time(self, which: str, delta: float) -> None:
+        """(−1)(−0.1)(+0.1)(+1) ボタン。入力欄に打ちかけの値があればそこから動かす。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        var = self.var_start if which == "start" else self.var_end
+        try:
+            current = parse_hms(var.get())
+        except ValueError:
+            base = time_edit_base(seg, self.proj.time_offset)
+            current = base[0] if which == "start" else base[1]
+        self._apply_time(which, current + delta, explicit=True)
+
+    def _apply_time(self, which: str, value: float, explicit: bool = False) -> None:
+        seg = self.proj.segments[self.current]
+        base_start, base_end = time_edit_base(seg, self.proj.time_offset)
+        start, end = (value, base_end) if which == "start" else (base_start, value)
+        start, end = clamp_times(start, end, self.proj.duration, moved=which)
+
+        changed = abs(start - base_start) > 1e-6 or abs(end - base_end) > 1e-6
+        if not changed and (seg.time_edited or not explicit):
+            # 入力欄を通り過ぎただけ。勝手に「修正済み」にはしない。
+            # (未編集の区間で Enter を押したときだけは、ずれ補正込みの値を確定する)
+            self._show_times()
+            return
+
+        seg.start, seg.end = start, end
+        seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        self._dirty = True
+        self._show_times()
+        self._update_seginfo()
+        self._update_row(seg.index)
         self._draw_timeline()
+        self._set_action(
+            f"区間 {seg.index + 1} の時刻を {fmt_hms_frac(seg.start)} → "
+            f"{fmt_hms_frac(seg.end)} にしました。"
+        )
+        if self.var_autoplay.get():
+            self.play_current()
+
+    def revert_time(self) -> None:
+        """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        if not seg.time_edited:
+            self._set_action("この区間の時刻は直されていません。")
+            return
+        seg.start = float(seg.orig_start)
+        seg.end = float(seg.orig_end)
+        seg.time_edited = False
+        self._dirty = True
+        self._show_times()
+        self._update_seginfo()
+        self._update_row(seg.index)
+        self._draw_timeline()
+        self._set_action(
+            f"区間 {seg.index + 1} の時刻を元に戻しました"
+            f"({fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)})。"
+        )
+        if self.var_autoplay.get():
+            self.play_current()
 
     def _commit_text(self) -> None:
         if not self.proj.segments:
@@ -919,17 +1118,15 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
-        # 本文に見合う長さだけ再生する(「この先30秒▶」で続きを聴ける)。
-        preview_end = seg.end
-        if extend <= 0:
-            preview_end = seg.start + preview_length(seg.text, seg.duration)
+        # 再生範囲。時刻を直した区間にはずれ補正を足さない(playback_window)。
+        play_start, play_end = playback_window(
+            seg, self.proj.time_offset, back=back, extend=extend
+        )
 
         # 短い区間で先読みを固定 0.4 秒にすると、再生窓の大半が前の発言に
         # なってしまう(1 秒の区間なら 4 割)。区間の長さに応じて縮める。
         pre_roll = min(0.4, max(0.05, seg.duration * 0.25))
 
-        # ずれ補正: Gemini の時刻推定が実音声とずれている場合の手動調整。
-        shift = self.proj.time_offset
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
@@ -948,8 +1145,8 @@ class AssignWindow(tk.Toplevel):
         try:
             self.player.play(
                 audio,
-                start=max(0.0, seg.start + shift - back),
-                end=preview_end + shift + extend,
+                start=play_start,
+                end=play_end,
                 speed=self._speed(),
                 pre_roll=pre_roll,
             )
