@@ -34,13 +34,20 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MAX_SECONDS,
     PREVIEW_MIN_SECONDS,
     AssignWindow,
+    SplitDialog,
     clamp_times,
     plan_roster_text,
     playback_window,
     preview_length,
     time_edit_base,
 )
-from src.segments import Project, SPECIAL_UNKNOWN, Segment, parse_roster  # noqa: E402
+from src.segments import (  # noqa: E402
+    Project,
+    SPECIAL_UNKNOWN,
+    Segment,
+    fmt_hms_frac,
+    parse_roster,
+)
 
 
 def make_project(tmp: Path) -> Project:
@@ -324,6 +331,75 @@ def run() -> int:
         win.save()
         check("ずれ補正が JSON に残る",
               abs(Project.load(proj.json_path).time_offset + 0.6) < 1e-6)
+
+        # --- 分割ダイアログ ----------------------------------------------
+        win.goto(10)
+        target = proj.segments[10]
+        dlg = SplitDialog(win, target)
+        dlg.update()
+        check("境界の初期値は本文の真ん中あたり",
+              abs(dlg.boundary - (target.start + target.duration / 2)) < 1.0)
+        check("音声が無くても波形の枠は描ける", len(dlg.canvas.find_all()) > 0)
+        check("カーソル位置が本文の分割点", dlg._cursor_pos() == len(target.text) // 2)
+        dlg._set_boundary(target.start + 3.0)
+        check("境界を動かせる", abs(dlg.boundary - (target.start + 3.0)) < 1e-6)
+        dlg._set_boundary(0.0)
+        check("境界は区間の内側に収まる", dlg.boundary >= target.start + 0.1)
+        dlg._set_boundary(9999.0)
+        check("境界は区間の終わりを越えない", dlg.boundary <= target.end - 0.1)
+        dlg.var_bound.set("ここは時刻を書く欄")
+        dlg._commit_bound()
+        check("読めない境界は元に戻す", dlg.var_bound.get() == fmt_hms_frac(dlg.boundary))
+        dlg._ok()
+        win.update()
+        check("OK で (境界, 本文の位置) を返す",
+              dlg.result is not None and len(dlg.result) == 2)
+
+        # --- 区間の分割・結合 --------------------------------------------
+        total = len(proj.segments)
+        win.goto(10)
+        seg10 = proj.segments[10]
+        span, text10 = (seg10.start, seg10.end), seg10.text
+        win.apply_split(seg10.start + 12.0, 4)
+        win.update()
+        check("分割で区間が 1 つ増える", len(proj.segments) == total + 1)
+        check("一覧も作り直される", len(win.tree.get_children()) == total + 1)
+        check("分割後は後半を選ぶ", win.current == 11)
+        check("後半は擬似クラスタで未確定",
+              proj.segments[11].is_pseudo_cluster
+              and proj.segments[11].speaker_id is None)
+        check("本文がカーソル位置で切れる",
+              proj.segments[10].text == text10[:4]
+              and proj.segments[11].text == text10[4:])
+
+        win.apply_merge(10)
+        win.update()
+        check("結合で元の数に戻る", len(proj.segments) == total)
+        check("結合後はその区間を選ぶ", win.current == 10)
+        check("分割前の範囲に戻る",
+              (proj.segments[10].start, proj.segments[10].end) == span)
+        check("本文もつながる", proj.segments[10].text == text10)
+
+        # --- 取り消しスタックの付け替え ------------------------------------
+        win.goto(20)
+        win.assign(sato)
+        check("取り消しが積まれる", win._undo[-1][0][0] == 20)
+        win.goto(10)
+        win.apply_split(proj.segments[10].start + 12.0, 4)
+        check("分割より後ろの取り消しは 1 つずれる", win._undo[-1][0][0] == 21)
+        win.undo()
+        win.update()
+        check("取り消しが正しい区間に効く", proj.segments[21].speaker_id is None)
+        win.apply_merge(10)             # 分割を元に戻す
+
+        depth = len(win._undo)
+        win.goto(15)
+        win.assign(sato)
+        check("取り消しが 1 世代増える", len(win._undo) == depth + 1)
+        win.apply_merge(14)             # 15 が 14 に吸収されて消える
+        check("消えた区間ぶんの取り消しは残さない", len(win._undo) == depth)
+        check("空の世代が残っていない", all(win._undo))
+        win.apply_split(proj.segments[14].start + 12.0, 4)   # 数を元に戻す
 
         # --- タイムライン描画 --------------------------------------------
         win._draw_timeline()

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import tkinter as tk
 import traceback
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
+from .audio import extract_peaks
 from .player import SegmentPlayer
 from .segments import (
     MIN_SEGMENT_SECONDS,
@@ -332,11 +334,13 @@ class AssignWindow(tk.Toplevel):
         # 全体一律のずれ補正では直せないので、区間ごとに耳で合わせられるようにする。
         frm_time = ttk.Frame(right)
         frm_time.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
-        ttk.Label(frm_time, text="時刻:").pack(side="left", padx=(0, 8))
+        row_time = ttk.Frame(frm_time)
+        row_time.pack(side="top", anchor="w")
+        ttk.Label(row_time, text="時刻:").pack(side="left", padx=(0, 8))
         for which, label in (("start", "開始"), ("end", "終了")):
-            ttk.Label(frm_time, text=label).pack(side="left", padx=(6, 2))
+            ttk.Label(row_time, text=label).pack(side="left", padx=(6, 2))
             ent = ttk.Entry(
-                frm_time, width=11, justify="center",
+                row_time, width=11, justify="center",
                 textvariable=self.var_start if which == "start" else self.var_end,
             )
             ent.pack(side="left", padx=(0, 2))
@@ -346,13 +350,24 @@ class AssignWindow(tk.Toplevel):
             ent.bind("<FocusOut>", lambda e, w=which: self._commit_time(w))
             for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
                 ttk.Button(
-                    frm_time, text=text, width=5, takefocus=False,
+                    row_time, text=text, width=5, takefocus=False,
                     command=lambda w=which, d=delta: self._nudge_time(w, d),
                 ).pack(side="left", padx=1)
         self.btn_revert_time = ttk.Button(
-            frm_time, text="元に戻す", takefocus=False, command=self.revert_time,
+            row_time, text="元に戻す", takefocus=False, command=self.revert_time,
         )
         self.btn_revert_time.pack(side="left", padx=(12, 0))
+
+        # 1 区間に 2 人の発言が順に混ざることも、同じ発言が 2 行に割れることも
+        # ある。どちらも人の目と耳でしか判断できないので、明示操作で直せるようにする。
+        row_edit = ttk.Frame(frm_time)
+        row_edit.pack(side="top", anchor="w", pady=(3, 0))
+        ttk.Button(row_edit, text="この区間を分割...", takefocus=False,
+                   command=self.split_current).pack(side="left")
+        ttk.Button(row_edit, text="前の区間と結合", takefocus=False,
+                   command=self.merge_with_prev).pack(side="left", padx=6)
+        ttk.Button(row_edit, text="次の区間と結合", takefocus=False,
+                   command=self.merge_with_next).pack(side="left")
 
         frm_text = ttk.LabelFrame(right, text="この区間の発言(編集できます)")
         frm_text.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
@@ -892,6 +907,117 @@ class AssignWindow(tk.Toplevel):
         if self.var_autoplay.get():
             self.play_current()
 
+    # ==================================================================
+    # 区間を分ける・束ねる
+    # ==================================================================
+    def _remap_undo_for_split(self, index: int) -> None:
+        """index の区間が 2 つになった。それより後ろを指す取り消しを 1 つずらす。"""
+        for snapshot in self._undo:
+            for i, (idx, sid, reviewed) in enumerate(snapshot):
+                if idx > index:
+                    snapshot[i] = (idx + 1, sid, reviewed)
+
+    def _remap_undo_for_merge(self, index: int) -> None:
+        """index と index+1 が 1 つになった。消えた側を指す取り消しは捨てる。
+
+        結合先へ付け替えると、1 つのスナップショットに同じ index が 2 つ並び、
+        どちらが復元されるかが並び順で決まってしまう。しかも取り消しで結合区間
+        全体が後側の話者になり、✓ まで付く。それより「消えた区間ぶんは戻せない」
+        ほうが安全(結合をやり直したければ分割し直せる)。
+        """
+        kept: list[list[tuple[int, Optional[str], bool]]] = []
+        for snapshot in self._undo:
+            fixed = [
+                (idx - 1 if idx > index + 1 else idx, sid, reviewed)
+                for idx, sid, reviewed in snapshot
+                if idx != index + 1
+            ]
+            if fixed:       # 空になった世代を残すと Ctrl+Z が 1 回不発になる
+                kept.append(fixed)
+        self._undo = kept
+
+    def split_current(self) -> None:
+        """分割ダイアログを開き、決まった位置で現在の区間を 2 つに分ける。"""
+        if not self.proj.segments:
+            return
+        self._commit_text()
+        seg = self.proj.segments[self.current]
+        if seg.duration < MIN_SEGMENT_SECONDS * 2:
+            messagebox.showinfo(
+                "分割できません",
+                "この区間は短すぎて 2 つに分けられません。",
+                parent=self,
+            )
+            return
+        self.player.stop()
+        dlg = SplitDialog(self, seg)
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        self.apply_split(*dlg.result)
+
+    def apply_split(self, boundary: float, cut: int) -> None:
+        """分割を反映して画面を作り直す(ダイアログ抜きでも呼べる)。"""
+        index = self.current
+        head, tail = self.proj.split_segment(index, boundary, cut)
+        self._remap_undo_for_split(index)
+        self._dirty = True
+        self.suggester.refresh()
+        # 後半は話者が未確定で聴き直しが要るので、そちらへ移す
+        self.current = index + 1
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action(
+            f"区間を {fmt_hms_frac(head.start)}〜{fmt_hms_frac(head.end)} と "
+            f"{fmt_hms_frac(tail.start)}〜{fmt_hms_frac(tail.end)} に分けました。"
+            "後半は話者を確定してください(分割の取り消しは「前の区間と結合」)。"
+        )
+
+    def merge_with_prev(self) -> None:
+        self._merge_at(self.current - 1)
+
+    def merge_with_next(self) -> None:
+        self._merge_at(self.current)
+
+    def _merge_at(self, index: int) -> None:
+        """index と index+1 を結合する。話者が食い違うときは確認する。"""
+        if not self.proj.segments:
+            return
+        if index < 0 or index + 1 >= len(self.proj.segments):
+            self.bell()
+            self._set_action("結合できる隣の区間がありません。")
+            return
+        self._commit_text()
+        a, b = self.proj.segments[index], self.proj.segments[index + 1]
+        if a.speaker_id and b.speaker_id and a.speaker_id != b.speaker_id:
+            if not messagebox.askokcancel(
+                "話者が違います",
+                f"「{self.proj.speaker_name(a.speaker_id)}」と"
+                f"「{self.proj.speaker_name(b.speaker_id)}」の区間を結合します。\n\n"
+                "どちらが正しいか決められないため、結合後は未確定に戻ります。\n"
+                "続けますか?",
+                parent=self,
+            ):
+                return
+        self.player.stop()
+        self.apply_merge(index)
+
+    def apply_merge(self, index: int) -> None:
+        """結合を反映して画面を作り直す(確認ダイアログ抜きでも呼べる)。"""
+        merged = self.proj.merge_segments(index)
+        self._remap_undo_for_merge(index)
+        self._dirty = True
+        self.suggester.refresh()
+        self.current = index
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action(
+            f"2 つの区間を {fmt_hms_frac(merged.start)}〜{fmt_hms_frac(merged.end)} に"
+            "まとめました(やり直すには「この区間を分割」)。"
+        )
+
     def _commit_text(self) -> None:
         if not self.proj.segments:
             return
@@ -1371,6 +1497,259 @@ class AssignWindow(tk.Toplevel):
             except Exception:
                 pass
         self.player.close()
+        self.destroy()
+
+
+class SplitDialog(tk.Toplevel):
+    """区間を 2 つに分ける位置を決めるダイアログ。
+
+    決めることは 2 つ:
+      - 本文のどこで切るか(Text のカーソル位置)
+      - 音声のどこで切るか(境界時刻)
+
+    境界は「波形の谷を見る」「聴いて確かめる」「0.1 秒ずつ動かす」のどれでも
+    合わせられる。発言の切れ目は無音の谷として波形に出るので、まず目で当たりを
+    付けて、耳で詰めるのが速い。ffmpeg が無い環境では波形が出ないが、
+    入力と試聴だけで作業できる。
+    """
+
+    WAVE_MARGIN = 2.0        # 波形に映す前後の余白(秒)
+    WAVE_BUCKETS = 700       # 取り込む解像度。描画時に幅へ引き伸ばす
+    WAVE_HEIGHT = 96
+    LISTEN_SECONDS = 1.5     # 境界の前後を試聴する長さ
+
+    def __init__(self, master: "AssignWindow", seg: Segment) -> None:
+        super().__init__(master)
+        self.win = master
+        self.seg = seg
+        self.result: Optional[tuple[float, int]] = None
+        self._mark_origin: Optional[float] = None    # 「再生してマーク」の起点
+        self._mark_speed = 1.0
+        self._mark_timer: Optional[str] = None
+
+        self.lo = seg.start + MIN_SEGMENT_SECONDS
+        self.hi = seg.end - MIN_SEGMENT_SECONDS
+        self.view_start = max(0.0, seg.start - self.WAVE_MARGIN)
+        self.view_end = seg.end + self.WAVE_MARGIN
+        self.boundary = round((seg.start + seg.end) / 2, 1)
+
+        self.title("区間を分割")
+        self.transient(master)
+        self.resizable(True, False)
+        self.var_bound = tk.StringVar(value="")
+        self.var_hint = tk.StringVar(value="")
+
+        self._build(seg)
+        self._load_wave()
+        # 本文のカーソル位置から境界の当たりを付ける(文字数の比で按分)
+        self._estimate_from_cursor()
+        self.grab_set()
+        self.txt.focus_set()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda e: self._cancel())
+
+    # ------------------------------------------------------------------
+    def _build(self, seg: Segment) -> None:
+        self.columnconfigure(0, weight=1)
+
+        ttk.Label(
+            self,
+            text=f"[{fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)}]  "
+                 "本文はカーソルの位置で切れます。",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(10, 4))
+
+        frm_text = ttk.LabelFrame(self, text="本文(切りたい位置をクリックしてカーソルを置く)")
+        frm_text.grid(row=1, column=0, sticky="nsew", padx=12, pady=2)
+        frm_text.columnconfigure(0, weight=1)
+        self.txt = tk.Text(frm_text, height=5, wrap="word", font=("", 11))
+        self.txt.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        self.txt.insert("1.0", seg.text)
+        # カーソルの初期位置は本文の真ん中。ここから按分して境界の初期値を出す
+        self.txt.mark_set("insert", f"1.0 + {len(seg.text) // 2} chars")
+
+        frm_wave = ttk.LabelFrame(self, text="波形(クリックで境界を移動・谷が発言の切れ目)")
+        frm_wave.grid(row=2, column=0, sticky="ew", padx=12, pady=4)
+        frm_wave.columnconfigure(0, weight=1)
+        self.canvas = tk.Canvas(frm_wave, height=self.WAVE_HEIGHT, bg="#FAFAFA",
+                                highlightthickness=1, highlightbackground="#DDD")
+        self.canvas.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        self.canvas.bind("<Button-1>", self._on_canvas_click)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_click)
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+
+        frm_b = ttk.Frame(self)
+        frm_b.grid(row=3, column=0, sticky="ew", padx=12, pady=2)
+        ttk.Label(frm_b, text="境界:").pack(side="left", padx=(0, 4))
+        ent = ttk.Entry(frm_b, textvariable=self.var_bound, width=11, justify="center")
+        ent.pack(side="left")
+        ent.bind("<Return>", lambda e: self._commit_bound())
+        ent.bind("<FocusOut>", lambda e: self._commit_bound())
+        for text, delta in (("−0.1", -0.1), ("+0.1", +0.1)):
+            ttk.Button(frm_b, text=text, width=5, takefocus=False,
+                       command=lambda d=delta: self._set_boundary(self.boundary + d))\
+                .pack(side="left", padx=1)
+        self.btn_mark = ttk.Button(frm_b, text="▶ 再生してマーク", takefocus=False,
+                                   command=self._toggle_mark)
+        self.btn_mark.pack(side="left", padx=(12, 4))
+        ttk.Button(frm_b, text="境界の前を聴く", takefocus=False,
+                   command=lambda: self._listen(before=True)).pack(side="left", padx=2)
+        ttk.Button(frm_b, text="境界の後を聴く", takefocus=False,
+                   command=lambda: self._listen(before=False)).pack(side="left", padx=2)
+
+        ttk.Label(self, textvariable=self.var_hint, foreground="#666", wraplength=760)\
+            .grid(row=4, column=0, sticky="w", padx=12, pady=(2, 0))
+
+        frm_ok = ttk.Frame(self)
+        frm_ok.grid(row=5, column=0, sticky="e", padx=12, pady=(6, 10))
+        ttk.Button(frm_ok, text="この位置で分割", command=self._ok).pack(side="left")
+        ttk.Button(frm_ok, text="キャンセル", command=self._cancel).pack(side="left", padx=6)
+
+    # ------------------------------------------------------------------
+    def _load_wave(self) -> None:
+        audio = Path(self.win.proj.audio_path)
+        self._peaks: list[tuple[int, int]] = []
+        if audio.exists():
+            self._peaks = extract_peaks(
+                audio, self.view_start, self.view_end, self.WAVE_BUCKETS
+            )
+        if not self._peaks:
+            self.var_hint.set(
+                "波形は表示できません(音声または ffmpeg が見つかりません)。"
+                "時刻の入力と試聴で合わせてください。"
+            )
+
+    def _cursor_pos(self) -> int:
+        return len(self.txt.get("1.0", "insert"))
+
+    def _estimate_from_cursor(self) -> None:
+        """本文のどこにカーソルがあるかで、境界の初期値を按分して決める。"""
+        text = self.seg.text
+        pos = self._cursor_pos()
+        ratio = (pos / len(text)) if text else 0.5
+        self._set_boundary(self.seg.start + self.seg.duration * ratio)
+
+    def _time_to_x(self, t: float) -> float:
+        w = max(1, self.canvas.winfo_width())
+        return (t - self.view_start) / max(1e-6, self.view_end - self.view_start) * w
+
+    def _x_to_time(self, x: float) -> float:
+        w = max(1, self.canvas.winfo_width())
+        return self.view_start + x / w * (self.view_end - self.view_start)
+
+    def _set_boundary(self, value: float) -> None:
+        self.boundary = min(max(round(float(value), 1), self.lo), self.hi)
+        self.var_bound.set(fmt_hms_frac(self.boundary))
+        self._redraw()
+
+    def _commit_bound(self) -> None:
+        try:
+            self._set_boundary(parse_hms(self.var_bound.get()))
+        except ValueError:
+            self.var_bound.set(fmt_hms_frac(self.boundary))
+            self.var_hint.set("時刻の形式が読めませんでした(例 00:43:51.5)。")
+
+    def _on_canvas_click(self, event) -> None:
+        self._set_boundary(self._x_to_time(event.x))
+
+    def _redraw(self) -> None:
+        c = self.canvas
+        c.delete("all")
+        w = max(1, c.winfo_width())
+        h = self.WAVE_HEIGHT
+        mid = h / 2
+
+        # 親区間の外(前後の余白)は沈めて、どこが今の区間かを分かるようにする
+        for t0, t1 in ((self.view_start, self.seg.start), (self.seg.end, self.view_end)):
+            c.create_rectangle(self._time_to_x(t0), 0, self._time_to_x(t1), h,
+                               fill="#EEEEEE", width=0)
+        if self._peaks:
+            n = len(self._peaks)
+            for i, (lo, hi) in enumerate(self._peaks):
+                x = i * w / n
+                c.create_line(x, mid - hi / 32768 * (mid - 2),
+                              x, mid - lo / 32768 * (mid - 2), fill="#5B8DB8")
+        else:
+            c.create_text(w / 2, mid, text="(波形なし)", fill="#AAA")
+
+        x = self._time_to_x(self.boundary)
+        c.create_line(x, 0, x, h, fill="#C1666B", width=2)
+
+    # ------------------------------------------------------------------
+    def _audio(self) -> Optional[Path]:
+        audio = Path(self.win.proj.audio_path)
+        if not audio.exists():
+            self.var_hint.set("音声が見つからないので試聴できません。")
+            return None
+        return audio
+
+    def _play(self, start: float, end: float) -> None:
+        audio = self._audio()
+        if audio is None:
+            return
+        try:
+            self.win.player.play(audio, start=max(0.0, start), end=end,
+                                 speed=self.win._speed(), pre_roll=0.0)
+        except Exception as e:
+            self.var_hint.set(f"再生できませんでした: {e}")
+
+    def _listen(self, before: bool) -> None:
+        self._stop_mark()
+        if before:
+            self._play(max(self.seg.start, self.boundary - self.LISTEN_SECONDS), self.boundary)
+        else:
+            self._play(self.boundary, min(self.seg.end, self.boundary + self.LISTEN_SECONDS))
+
+    def _toggle_mark(self) -> None:
+        """1 回目で区間を頭から再生し、2 回目に押した時点を境界にする。
+
+        ffplay は再生位置を教えてくれないので、経過時間から推定する。
+        起動の遅れで 0.2〜0.3 秒ずれる粗いマークなので、そのあと波形と
+        試聴で詰める前提。
+        """
+        if self._mark_origin is not None:
+            elapsed = (time.monotonic() - self._mark_origin) * self._mark_speed
+            self._set_boundary(self.seg.start + elapsed)
+            self._stop_mark()
+            self.var_hint.set(
+                "押した位置を境界にしました。0.2〜0.3 秒ほどずれるので、"
+                "波形・ナッジ・試聴で詰めてください。"
+            )
+            return
+        if self._audio() is None:
+            return
+        self._mark_speed = self.win._speed()
+        self._play(self.seg.start, self.seg.end)
+        self._mark_origin = time.monotonic()
+        self.btn_mark.configure(text="■ ここで区切る")
+        self.var_hint.set("再生中です。切れ目だと思った所で「ここで区切る」を押してください。")
+        # 再生が終わったらボタンを元に戻す(押しても意味がなくなるため)
+        wait = int((self.seg.duration / max(0.1, self._mark_speed)) * 1000) + 300
+        self._mark_timer = self.after(wait, self._stop_mark)
+
+    def _stop_mark(self) -> None:
+        if self._mark_timer is not None:
+            try:
+                self.after_cancel(self._mark_timer)
+            except tk.TclError:
+                pass
+            self._mark_timer = None
+        if self._mark_origin is not None:
+            self._mark_origin = None
+            self.btn_mark.configure(text="▶ 再生してマーク")
+
+    # ------------------------------------------------------------------
+    def _ok(self) -> None:
+        self.result = (self.boundary, self._cursor_pos())
+        self._close()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self._close()
+
+    def _close(self) -> None:
+        self._stop_mark()
+        self.win.player.stop()
+        self.grab_release()
         self.destroy()
 
 
