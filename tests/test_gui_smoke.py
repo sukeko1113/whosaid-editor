@@ -26,6 +26,7 @@ for _s in (sys.stdout, sys.stderr):
 
 import tkinter as tk  # noqa: E402
 
+import src.assign_gui as assign_gui  # noqa: E402
 from src.assign_gui import (  # noqa: E402
     FILTER_ALL,
     FILTER_UNASSIGNED,
@@ -34,6 +35,8 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MAX_SECONDS,
     PREVIEW_MIN_SECONDS,
     AssignWindow,
+    ProposalDialog,
+    ProposalRow,
     SplitDialog,
     clamp_times,
     move_edge,
@@ -42,6 +45,15 @@ from src.assign_gui import (  # noqa: E402
     playback_window,
     preview_length,
     time_edit_base,
+)
+from src.align import Word as AlignWord  # noqa: E402
+from src.inspection import (  # noqa: E402
+    Proposal,
+    inspect_times,
+    load_proposals,
+    merge_history,
+    proposals_path,
+    save_proposals,
 )
 from src.segments import (  # noqa: E402
     Project,
@@ -191,6 +203,10 @@ def run() -> int:
         check("終了をナッジできる", abs(seg3.end - (orig3[1] + 1.0)) < 1e-6)
         check("そのとき開始は動かない", abs(seg3.start - 96.5) < 1e-6)
         check("一覧に ✎ が出る", win.tree.item("s3", "values")[0].startswith("✎"))
+        check("画面で直した時刻は確認済みになる", seg3.time_reviewed is True)
+        check("確認済みは ✎ で、✎△ にはしない",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        check("区間ヘッダにも確認済みと出る", "✎時刻を修正済み" in win.var_seginfo.get())
 
         win.var_start.set("ここは時刻を書く欄")
         win._commit_time("start")
@@ -202,6 +218,90 @@ def run() -> int:
         check("印が外れる", seg3.time_edited is False)
         check("元の時刻は保持されている", (seg3.orig_start, seg3.orig_end) == orig3)
         check("一覧の ✎ も消える", not win.tree.item("s3", "values")[0].startswith("✎"))
+        check("確認済みの印も外れる", seg3.time_reviewed is False)
+
+        # --- 時刻は入れたが自分の耳では未確認(✎△) --------------------------
+        # 機械が出した時刻を当てただけの状態。いまこれを作る操作は無いので直に
+        # 組み立てる(点検の提案をまとめて適用したときにこの状態になる)。
+        seg3.start, seg3.end = orig3[0] + 6.0, orig3[1] + 6.0
+        seg3.time_edited, seg3.time_reviewed = True, False
+        win._update_row(3)
+        win.goto(3)
+        check("未確認の時刻は一覧で ✎△",
+              win.tree.item("s3", "values")[0].startswith("✎△"))
+        check("区間ヘッダにも未確認と出る",
+              "✎△時刻は推定(未確認)" in win.var_seginfo.get())
+        win._shift_time(+0.1)
+        check("画面で直せば確認済みに変わる", seg3.time_reviewed is True)
+        check("一覧の印も ✎ に変わる",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        win.revert_time()                                   # 後片付け
+        check("元に戻すと時刻も印も消える",
+              (seg3.start, seg3.end) == orig3 and seg3.time_reviewed is False)
+
+        # --- 聴いて確かめた印を上げる([この時刻で確認]) --------------------
+        seg3.start, seg3.end = orig3[0] + 6.0, orig3[1] + 6.0
+        seg3.time_edited, seg3.time_reviewed = True, False
+        win.goto(3)
+        check("未確認なら押せる", "disabled" not in win.btn_confirm_time.state())
+        before = (seg3.start, seg3.end)
+        win.confirm_time()
+        check("時刻の値は変わらない", (seg3.start, seg3.end) == before)
+        check("確認済みになる", seg3.time_reviewed is True)
+        check("一覧の印が ✎ に変わる",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        check("確認済みなら押せない", "disabled" in win.btn_confirm_time.state())
+        win.revert_time()
+
+        # まだ直していない区間でも「聴いた、この時刻でいい」と言える
+        win._set_offset(4.0)
+        win.goto(7)
+        seg7 = proj.segments[7]
+        win.confirm_time()
+        check("補正込みの時刻がそのまま確定する",
+              abs(seg7.start - (seg7.orig_start + 4.0)) < 1e-6)
+        check("確認済みとして入る", seg7.time_reviewed is True)
+        win.revert_time()
+        win._set_offset(0.0)
+
+        # --- 点検の提案を当てる --------------------------------------------
+        win.goto(9)
+        seg9 = proj.segments[9]
+        orig9 = (seg9.start, seg9.end)
+        prop = Proposal(id="p1", type="time",
+                        target_orig_start=float(seg9.orig_start),
+                        payload={"start": orig9[0] + 6.8, "end": orig9[1] + 6.8},
+                        evidence="一致 22/26 文字", confidence=0.85)
+        check("まとめて適用は未確認のまま入る",
+              win.apply_proposal(prop, reviewed=False) is True
+              and seg9.time_edited is True and seg9.time_reviewed is False)
+        check("提案の時刻が入る", abs(seg9.start - (orig9[0] + 6.8)) < 0.15)
+        check("一覧では ✎△", win.tree.item("s9", "values")[0].startswith("✎△"))
+        # 聴いて承認したぶんは ✎ になる
+        check("聴いて承認は確認済みで入る",
+              win.apply_proposal(prop, reviewed=True) is True
+              and seg9.time_reviewed is True)
+        check("一覧の印も ✎", win.tree.item("s9", "values")[0].startswith("✎ "))
+
+        # 隣と重なる提案は接点で切り詰める(同時に当てても重ならない)
+        seg10_start = proj.segments[10].start
+        over = Proposal(id="p2", type="time",
+                        target_orig_start=float(seg9.orig_start),
+                        payload={"start": orig9[0], "end": seg10_start + 30.0},
+                        evidence="", confidence=0.9)
+        win.apply_proposal(over, reviewed=False)
+        check("隣を侵さない", seg9.end <= seg10_start + 1e-6)
+
+        # 指し先が見つからない提案は当てない
+        gone = Proposal(id="p3", type="time", target_orig_start=99999.0,
+                        payload={"start": 1.0, "end": 2.0}, evidence="",
+                        confidence=1.0)
+        check("対象が無ければ当てない", win.apply_proposal(gone, reviewed=True) is False)
+        for i in (9,):                                      # 後片付け
+            s = proj.segments[i]
+            s.start, s.end = s.orig_start, s.orig_end
+            s.time_edited = s.time_reviewed = False
+        win.reload_tree()
 
         # 実データで詰まった 1.1 秒の相づちを 6.8 秒ずらす、と同じ形。
         # 「区間ごと」ボタンなら、長さより大きく動かしても潰れない
@@ -382,6 +482,101 @@ def run() -> int:
         win.update()
         check("次の未確定へ移動", not proj.segments[win.current].speaker_id)
 
+        # --- 時刻の点検(画面から) ------------------------------------------
+        # 実測は偽の単語列を注入する(whisper もモデルも要らない)。
+        check("作業ディレクトリの置き方",
+              win._work_dir().name == ".work_meeting")
+
+        def fake_words(indexes, shift=0.0):
+            """その区間を実際に喋った、という単語列を作る。
+
+            発話速度は実測に寄せて約 6.7 字/秒にする。区間の長さで按分すると
+            0.9 字/秒という不自然な遅さになり、密度フィルタに正しく弾かれて
+            しまう(それはそれで正しい挙動)。
+            """
+            out = []
+            for i in indexes:
+                seg = proj.segments[i]
+                text = seg.text.replace("。", "")
+                for n, ch in enumerate(text):
+                    at = seg.start + shift + n * 0.15
+                    out.append(AlignWord(text=ch, start=at, end=at + 0.15))
+            return out
+
+        # この見本は全区間が「これは N 番目の発言です。」でほぼ同じ本文なので、
+        # どの区間の単語列にも当たってしまう(実際の会議録では起きない形)。
+        # 点検を試す区間だけ、それらしく別々の本文にする。
+        spoken = [
+            "本日はお忙しい中お集まりいただきありがとうございます",
+            "それでは第一号議案について事務局から説明をお願いします",
+            "お手元の資料の三ページをご覧ください",
+            "前回の会議で出された意見を踏まえて修正しております",
+            "この点について何かご質問はございますでしょうか",
+            "特にないようですので次の議題に進みます",
+        ]
+        kept_text = [proj.segments[i].text for i in range(10, 16)]
+        for i, text in zip(range(10, 16), spoken):
+            proj.segments[i].text = text
+
+        # 実測はすべて正しい位置にある。ずれているのは本文側の時刻のほう
+        # (区間 12 の時刻だけが 5 秒早い)。実測をずらすと隣の発言と音声が
+        # 重なってしまい、実際には起こらない形になる。
+        words = fake_words(range(10, 16))
+        seg12 = proj.segments[12]
+        seg12.start, seg12.end = seg12.start - 5.0, seg12.end - 5.0
+        result = inspect_times(proj, words)
+        moved = [p for p in result.proposals
+                 if abs(p.target_orig_start - proj.segments[12].orig_start) < 1e-6]
+        check("ずれている区間だけ提案が出る", len(moved) == 1)
+        check("合っている区間には出ない", len(result.proposals) == 1)
+
+        rows = win._proposal_rows(result.proposals)
+        check("一覧の行ができる", len(rows) == 1)
+        check("対象は区間 13(1 始まり)", rows[0].target == "区間 13")
+        check("ずれの向きが出る", rows[0].delta.startswith("+"))
+        check("根拠が入る", "被覆" in rows[0].evidence)
+        check("信頼度が語で出る", rows[0].confidence in ("高", "中", "低"))
+
+        # まとめて適用 → ✎△、聴いて承認 → ✎
+        win.decide_proposal(moved[0], "bulk")
+        # 提案には頭出しの余白 0.3 秒が付くので、その分だけ手前に入る
+        check("まとめて適用で実測の時刻が入る",
+              abs(seg12.start - seg12.orig_start) < 0.5)
+        check("まとめて適用は未確認", seg12.time_reviewed is False)
+        check("承認済みとして記録される", moved[0].status == "accepted")
+        win.decide_proposal(moved[0], "accept")
+        check("聴いて承認は確認済み", seg12.time_reviewed is True)
+
+        reject_me = Proposal(id="r1", type="time",
+                             target_orig_start=float(proj.segments[14].orig_start),
+                             payload={"start": 1.0, "end": 2.0},
+                             evidence="", confidence=0.5)
+        win.decide_proposal(reject_me, "reject")
+        check("却下は区間を変えない",
+              proj.segments[14].time_edited is False
+              and reject_me.status == "rejected")
+
+        lost = Proposal(id="r2", type="time", target_orig_start=88888.0,
+                        payload={"start": 1.0, "end": 2.0}, evidence="",
+                        confidence=0.5)
+        win.decide_proposal(lost, "accept")
+        check("当てられない提案は却下として残す", lost.status == "rejected")
+
+        # 却下した提案は次の点検で出し直さない(sidecar に判断が残る)
+        path = proposals_path(win._work_dir(), "ff00")
+        save_proposals(path, [reject_me])
+        again = inspect_times(proj, words)
+        check("判断済みは再提示しない",
+              merge_history(again.proposals, load_proposals(path)) == again.proposals
+              or reject_me.id not in [p.id for p in
+                                      merge_history(again.proposals,
+                                                    load_proposals(path))])
+        seg12.start, seg12.end = seg12.orig_start, seg12.orig_end   # 後片付け
+        seg12.time_edited = seg12.time_reviewed = False
+        for i, text in zip(range(10, 16), kept_text):
+            proj.segments[i].text = text
+        win.reload_tree()
+
         # --- 保存・再読込 ------------------------------------------------
         win.save()
         reloaded = Project.load(proj.json_path)
@@ -414,6 +609,62 @@ def run() -> int:
         win.update()
         check("OK で (境界, 本文の位置) を返す",
               dlg.result is not None and len(dlg.result) == 2)
+
+        # --- 点検の提案一覧(骨格) ----------------------------------------
+        # 提案を作る側(inspect.py)はまだ無いので、表示用の行を直に組み立てる
+        rows = [
+            ProposalRow(key=f"p{i}", kind="時刻", target=f"区間 {i}",
+                        now="00:43:51.0", measured="00:43:57.8", delta="+6.8秒",
+                        evidence="一致 42/48 文字", confidence="高",
+                        text=f"提案 {i} の発言")
+            for i in range(3)
+        ]
+        played: list[str] = []
+        accepted: list[str] = []
+        bulked: list[tuple[str, ...]] = []
+        rejected: list[str] = []
+        played_now: list[str] = []
+        pdlg = ProposalDialog(win, rows, on_play=played.append,
+                              on_play_now=played_now.append,
+                              on_accept=accepted.append, on_bulk=bulked.append,
+                              on_reject=rejected.append)
+        pdlg.update()
+        check("提案がすべて並ぶ", len(pdlg.tree.get_children()) == 3)
+        check("根拠の列がある", pdlg.tree.heading("evidence")["text"] == "根拠")
+        check("残り件数を出す", pdlg.var_status.get() == "残り 3 件")
+
+        pdlg.tree.selection_set("p0")
+        pdlg.update()
+        check("行を選ぶと提案の時刻で再生を頼む", played == ["p0"])
+        pdlg._play_now()
+        check("いまの時刻でも聴き比べられる", played_now == ["p0"])
+        pdlg._accept()
+        pdlg.update()
+        check("聴いて承認したことを伝える", accepted == ["p0"])
+        check("決めた行は一覧から消える", not pdlg.tree.exists("p0"))
+        check("残りが減る", pdlg.var_status.get() == "残り 2 件")
+
+        pdlg.tree.selection_set("p1")
+        pdlg._reject()
+        check("却下したことを伝える", rejected == ["p1"])
+        check("却下した行も一覧から消える", not pdlg.tree.exists("p1"))
+
+        pdlg.tree.selection_remove(*pdlg.tree.get_children())
+        pdlg._accept()
+        check("選ばずに承認はできない", accepted == ["p0"])
+
+        real_ask = assign_gui.messagebox.askyesno
+        assign_gui.messagebox.askyesno = lambda *a, **k: True    # 確認は「はい」
+        try:
+            pdlg._bulk()
+        finally:
+            assign_gui.messagebox.askyesno = real_ask
+        check("残りをまとめて適用できる", bulked == [("p2",)])
+        check("まとめて適用すると提案が残らない", pdlg.var_status.get() == "残り 0 件")
+        check("何をどう決めたか記録する",
+              [kind for kind, _ in pdlg.decisions] == ["accept", "reject", "bulk"])
+        pdlg._close()
+        win.update()
 
         # --- 区間の分割・結合 --------------------------------------------
         total = len(proj.segments)

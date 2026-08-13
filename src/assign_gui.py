@@ -13,17 +13,31 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Iterable, Optional
 
+from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
 from .audio import extract_peaks
+from .config import load_config
+from .inspection import (
+    Proposal,
+    clip_to_neighbours,
+    inspect_times,
+    load_proposals,
+    merge_history,
+    proposals_path,
+    save_proposals,
+    target_segment,
+)
 from .player import SegmentPlayer
 from .segments import (
     MIN_SEGMENT_SECONDS,
@@ -33,6 +47,7 @@ from .segments import (
     SPECIAL_UNKNOWN,
     Segment,
     Speaker,
+    audio_span,
     fmt_hms,
     fmt_hms_frac,
     parse_hms,
@@ -77,11 +92,9 @@ def time_edit_base(seg: Segment, time_offset: float) -> tuple[float, float]:
 
     まだ直していない区間は、いま「ずれ補正込みで聴こえている位置」を初期値に
     する。そのまま確定すれば、聴こえたとおりの時刻がその区間に固定される。
-    一度直した区間の start/end は実音声の時刻そのものなので、補正を足さない。
+    規約そのものは segments.audio_span に置いてある(再生・点検と同じ値を使う)。
     """
-    if seg.time_edited:
-        return seg.start, seg.end
-    return max(0.0, seg.start + time_offset), max(0.0, seg.end + time_offset)
+    return audio_span(seg, time_offset)
 
 
 def clamp_times(
@@ -272,6 +285,11 @@ class AssignWindow(tk.Toplevel):
         self._undo: list[list[tuple[int, Optional[str], bool]]] = []
         self._dirty = False
         self._audio_declined = False
+        # 点検(実測用の転写)は重いので別スレッドで回す。知らせは queue 経由で
+        # 受ける(tkinter は本体スレッドからしか触れない)。
+        self._inspect_thread: Optional[threading.Thread] = None
+        self._inspect_cancel = threading.Event()
+        self._inspect_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -400,10 +418,17 @@ class AssignWindow(tk.Toplevel):
                     row_time, text=text, width=5, takefocus=False,
                     command=lambda w=which, d=delta: self._nudge_time(w, d),
                 ).pack(side="left", padx=1)
+        # 機械が当てただけの時刻(✎△)を、聴いて確かめたら ✎ に上げる。
+        # 「再生 → 合っていればこれを押す」で流せるようにボタンにしてある。
+        self.btn_confirm_time = ttk.Button(
+            row_time, text="この時刻で確認", takefocus=False,
+            command=self.confirm_time,
+        )
+        self.btn_confirm_time.pack(side="left", padx=(12, 0))
         self.btn_revert_time = ttk.Button(
             row_time, text="元に戻す", takefocus=False, command=self.revert_time,
         )
-        self.btn_revert_time.pack(side="left", padx=(12, 0))
+        self.btn_revert_time.pack(side="left", padx=(6, 0))
 
         row_edit = ttk.Frame(frm_time)
         row_edit.pack(side="top", anchor="w", pady=(3, 0))
@@ -503,6 +528,9 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
             .pack(side="left")
+        self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
+                                      command=self.run_inspection)
+        self.btn_inspect.pack(side="left", padx=6)
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
@@ -708,8 +736,11 @@ class AssignWindow(tk.Toplevel):
                 mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
             else:
                 mark = "✓"
-        # 時刻を直した区間は一覧でも分かるようにする(✓/△ と同じ考え方)
-        time_cell = ("✎ " if seg.time_edited else "") + fmt_hms(seg.start)
+        # 時刻をどこまで人が確かめたかも見えるようにする(話者の ✓/△ と同じ)
+        time_mark = ""
+        if seg.time_edited:
+            time_mark = "✎ " if seg.time_reviewed else "✎△"
+        time_cell = time_mark + fmt_hms(seg.start)
         values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", seg.preview(70))
         return values, tuple(tags)
@@ -868,7 +899,9 @@ class AssignWindow(tk.Toplevel):
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
-            + ("   ✎時刻を修正済み" if seg.time_edited else "")
+            + ("" if not seg.time_edited
+               else "   ✎時刻を修正済み" if seg.time_reviewed
+               else "   ✎△時刻は推定(未確認)")
             + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒"
                if self.proj.time_offset and not seg.time_edited else "")
         )
@@ -885,6 +918,10 @@ class AssignWindow(tk.Toplevel):
         self.var_start.set(fmt_hms_frac(start))
         self.var_end.set(fmt_hms_frac(end))
         self.btn_revert_time.state(["!disabled"] if seg.time_edited else ["disabled"])
+        # 確認済みの区間で押しても意味がない(それ以外は押せる。まだ直して
+        # いない区間でも「聴いてこの時刻で合っている」と言えるため)
+        done = seg.time_edited and seg.time_reviewed
+        self.btn_confirm_time.state(["disabled"] if done else ["!disabled"])
 
     def _commit_time(self, which: str, explicit: bool = False) -> None:
         """入力欄の値を区間に反映する。読めない値は元に戻して知らせる。"""
@@ -940,19 +977,78 @@ class AssignWindow(tk.Toplevel):
             self._show_times()
             return
 
-        seg.start, seg.end = start, end
-        seg.time_edited = True          # 以後この区間にずれ補正を足さない
-        self._dirty = True
-        self._show_times()
-        self._update_seginfo()
-        self._update_row(seg.index)
-        self._draw_timeline()
+        self._write_times(seg, start, end, reviewed=True)
         self._set_action(
             f"区間 {seg.index + 1} の時刻を {fmt_hms_frac(seg.start)} → "
             f"{fmt_hms_frac(seg.end)} にしました。"
         )
         if self.var_autoplay.get():
             self.play_current()
+
+    def _write_times(self, seg: Segment, start: float, end: float, *,
+                     reviewed: bool) -> None:
+        """区間に時刻を書く、ただ 1 つの経路。
+
+        画面で直したときも、点検の提案を当てたときも必ずここを通す。
+        経路を分けると、どちらかで ✎/✎△ の意味が食い違っても気づけない。
+
+        reviewed: その時刻を人が耳で確かめたか。画面で決めた時刻は True、
+        点検の提案をまとめて当てただけなら False(✎△ のまま残す)。
+        """
+        seg.start, seg.end = start, end
+        seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = reviewed
+        self._dirty = True
+        if seg.index == self.current:
+            self._show_times()
+            self._update_seginfo()
+        self._update_row(seg.index)
+        self._draw_timeline()
+
+    def confirm_time(self) -> None:
+        """いま出ている時刻を「自分の耳で確かめた」ものとして確定する。
+
+        点検が当てただけの時刻(✎△)を ✎ に上げるための操作。時刻の値は
+        変えない(合っているから押している)。再生と組み合わせて
+        「聴く → 合っていればキー一発」で流せるようにしてある。
+        """
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        if seg.time_edited and seg.time_reviewed:
+            self._set_action("この区間の時刻はすでに確認済みです。")
+            return
+        start, end = audio_span(seg, self.proj.time_offset)
+        self._write_times(seg, start, end, reviewed=True)
+        self._set_action(
+            f"区間 {seg.index + 1} の時刻を確認済みにしました"
+            f"(✎ {fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)})。"
+        )
+
+    def apply_proposal(self, proposal: Proposal, *, reviewed: bool) -> bool:
+        """点検の提案を 1 件当てる。当てられなければ False を返す。
+
+        書き込みは画面の時刻編集と同じ _write_times を通す。隣の区間と
+        重なる提案は接点で切り詰める(1 件ずつ承認しても、まとめて適用しても
+        重ならないようにするため)。
+        """
+        seg = target_segment(self.proj, proposal)
+        if seg is None:
+            return False
+        start = float(proposal.payload.get("start", seg.start))
+        end = float(proposal.payload.get("end", seg.end))
+
+        i = seg.index
+        prev_end = (audio_span(self.proj.segments[i - 1], self.proj.time_offset)[1]
+                    if i > 0 else None)
+        next_start = (audio_span(self.proj.segments[i + 1], self.proj.time_offset)[0]
+                      if i + 1 < len(self.proj.segments) else None)
+        clipped = clip_to_neighbours(start, end, prev_end, next_start)
+        if clipped is None:
+            return False            # 切り詰めると潰れる。当てないほうがいい
+        start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+        self._write_times(seg, start, end, reviewed=reviewed)
+        return True
 
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
@@ -965,6 +1061,7 @@ class AssignWindow(tk.Toplevel):
         seg.start = float(seg.orig_start)
         seg.end = float(seg.orig_end)
         seg.time_edited = False
+        seg.time_reviewed = False
         self._dirty = True
         self._show_times()
         self._update_seginfo()
@@ -1318,7 +1415,15 @@ class AssignWindow(tk.Toplevel):
         # 短い区間で先読みを固定 0.4 秒にすると、再生窓の大半が前の発言に
         # なってしまう(1 秒の区間なら 4 割)。区間の長さに応じて縮める。
         pre_roll = min(0.4, max(0.05, seg.duration * 0.25))
+        self.play_span(play_start, play_end, pre_roll=pre_roll, explicit=explicit)
 
+    def play_span(self, start: float, end: float, *, pre_roll: float = 0.4,
+                  explicit: bool = False) -> None:
+        """音声の任意の範囲を鳴らす。
+
+        区間の再生も、点検の提案を「その時刻で聴いてみる」のもここを通る。
+        音声が見つからないときの扱いを 1 か所にまとめておく。
+        """
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
@@ -1337,8 +1442,8 @@ class AssignWindow(tk.Toplevel):
         try:
             self.player.play(
                 audio,
-                start=play_start,
-                end=play_end,
+                start=max(0.0, start),
+                end=end,
                 speed=self._speed(),
                 pre_roll=pre_roll,
             )
@@ -1559,7 +1664,213 @@ class AssignWindow(tk.Toplevel):
         if messagebox.askyesno("出力完了", f"{out}\n\nファイルを開きますか?", parent=self):
             _open_path(out)
 
+    # ==================================================================
+    # 時刻の点検(実測と突き合わせて提案を出す)
+    # ==================================================================
+    def run_inspection(self) -> None:
+        """点検を始める。実測用の転写は重いので別スレッドで回す。
+
+        音声を外へ送らない。ここは最初から最後までこの PC の中で終わる。
+        """
+        if self._inspect_thread and self._inspect_thread.is_alive():
+            self._cancel_inspection()
+            return
+        if not self.proj.segments:
+            return
+        self._commit_text()
+
+        audio = Path(self.proj.audio_path)
+        if not audio.exists() and not self._relocate_audio():
+            return
+        audio = Path(self.proj.audio_path)
+
+        cfg = load_config()
+        self._inspect_cancel.clear()
+        self.btn_inspect.configure(text="点検を中止")
+        self._set_action("実測用の転写を始めます(この PC の中だけで処理します)...")
+        self._inspect_thread = threading.Thread(
+            target=self._inspect_worker,
+            args=(audio, self._work_dir(),
+                  str(cfg.get("align_model") or DEFAULT_MODEL),
+                  cfg.get("align_model_dir") or None),
+            daemon=True,
+        )
+        self._inspect_thread.start()
+        self.after(200, self._drain_inspect)
+
+    def _work_dir(self) -> Path:
+        """作業ディレクトリ(.work_<音声名>)。パイプラインと同じ置き方にする。"""
+        base = Path(self.proj.json_path or self.proj.audio_path).parent
+        return base / f".work_{Path(self.proj.audio_path).stem}"
+
+    def _cancel_inspection(self) -> None:
+        self._inspect_cancel.set()
+        self._set_action("点検の中止を伝えました。区切りのいい所で止まります。")
+
+    def _inspect_worker(self, audio: Path, work_dir: Path,
+                        model: str, model_dir) -> None:
+        """別スレッド。重い転写だけをここで済ませ、結果を本体へ渡す。
+
+        照合と提案づくりは本体側でやる(0.2 秒ほどで終わるうえ、区間を
+        読むので、作業中のデータを別スレッドから触らずに済む)。
+        """
+        def post(kind: str, data) -> None:
+            self._inspect_queue.put((kind, data))
+
+        try:
+            words = transcribe_words(
+                audio, work_dir=work_dir, model=model, model_dir=model_dir,
+                on_log=lambda m: post("log", m),
+                on_progress=lambda a, b: post("progress", (a, b)),
+                is_cancelled=self._inspect_cancel.is_set,
+            )
+        except AlignUnavailable as e:
+            post("unavailable", str(e))
+            return
+        except Exception:
+            post("fatal", traceback.format_exc())
+            return
+        post("cancelled" if words is None else "words", words)
+
+    def _drain_inspect(self) -> None:
+        """別スレッドからの知らせを本体で受ける(tkinter は本体からしか触れない)。"""
+        running = True
+        try:
+            while True:
+                kind, data = self._inspect_queue.get_nowait()
+                if kind == "log":
+                    self._set_action(str(data))
+                elif kind == "progress":
+                    done, total = data
+                    if total:
+                        self._set_action(
+                            f"実測用の転写 {done / total:.0%} "
+                            f"({fmt_hms(done)} / {fmt_hms(total)})...")
+                elif kind == "words":
+                    running = False
+                    self._finish_inspection(data)
+                elif kind == "cancelled":
+                    running = False
+                    self._end_inspection("点検を中止しました。")
+                elif kind == "unavailable":
+                    running = False
+                    self._end_inspection("点検を始められませんでした。")
+                    messagebox.showinfo("点検を始められません", str(data), parent=self)
+                elif kind == "fatal":
+                    running = False
+                    self._end_inspection("点検が失敗しました。")
+                    messagebox.showerror("点検エラー", str(data), parent=self)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return              # 画面が閉じられた
+        if running:
+            self.after(200, self._drain_inspect)
+
+    def _end_inspection(self, message: str) -> None:
+        self.btn_inspect.configure(text="時刻を点検...")
+        self._set_action(message)
+
+    def _finish_inspection(self, words) -> None:
+        """実測が揃った。照合して提案を作り、一覧を出す。"""
+        result = inspect_times(self.proj, words)
+        path = proposals_path(self._work_dir(), self.proj.audio_fingerprint)
+        fresh = merge_history(result.proposals, load_proposals(path))
+
+        summary = (f"{result.checked} 区間を点検: 提案 {len(fresh)} 件"
+                   f"(確認済み {result.reviewed} / 照合できず {result.unmatched} / "
+                   f"根拠が弱い {result.weak} / ずれ小 {result.close_enough})")
+        self._end_inspection(summary)
+        if not fresh:
+            messagebox.showinfo(
+                "点検が終わりました",
+                summary + "\n\n直したほうがよさそうな区間は見つかりませんでした。",
+                parent=self,
+            )
+            return
+        self._open_proposals(fresh, path)
+
+    def _proposal_rows(self, proposals) -> list[ProposalRow]:
+        """提案を一覧の行にする。ここでしか画面用の言い回しを作らない。"""
+        rows: list[ProposalRow] = []
+        for p in proposals:
+            seg = target_segment(self.proj, p)
+            if seg is None:
+                continue
+            now_start, _ = audio_span(seg, self.proj.time_offset)
+            new_start = float(p.payload.get("start", now_start))
+            rows.append(ProposalRow(
+                key=p.id,
+                kind="時刻",
+                target=f"区間 {seg.index + 1}",
+                now=fmt_hms_frac(now_start),
+                measured=fmt_hms_frac(new_start),
+                delta=f"{new_start - now_start:+.1f}秒",
+                evidence=p.evidence,
+                confidence=("高" if p.confidence >= 0.9
+                            else "中" if p.confidence >= 0.75 else "低"),
+                text=seg.preview(60),
+            ))
+        return rows
+
+    def decide_proposal(self, proposal: Proposal, decision: str) -> None:
+        """提案 1 件の始末をつける。
+
+        decision: "accept"(聴いて承認 → ✎) / "bulk"(まとめて適用 → ✎△)
+                  / "reject"(却下)
+        当てられなかった提案は却下として残す。次の点検で同じものを
+        出し直しても、また当てられないため。
+        """
+        if decision == "reject":
+            proposal.status = "rejected"
+            return
+        applied = self.apply_proposal(proposal, reviewed=(decision == "accept"))
+        proposal.status = "accepted" if applied else "rejected"
+
+    def _open_proposals(self, proposals, path: Optional[Path]) -> None:
+        by_id = {p.id: p for p in proposals}
+
+        def play(key: str, *, proposed: bool = True) -> None:
+            """その行の箇所を鳴らす。
+
+            既定は「提案した時刻」のほう。確かめたいのは提案が合っているか
+            なので、いまのずれた時刻で鳴らしても判断できない。
+            """
+            p = by_id[key]
+            seg = target_segment(self.proj, p)
+            if seg is None:
+                return
+            self.goto(seg.index)            # 本文と話者を画面に出す
+            if not proposed:
+                self.play_current(explicit=True)
+                return
+            start = float(p.payload.get("start", seg.start))
+            end = float(p.payload.get("end", seg.end))
+            self.play_span(start, end, explicit=True,
+                           pre_roll=min(0.4, max(0.05, (end - start) * 0.25)))
+
+        def bulk(keys) -> None:
+            for key in keys:
+                self.decide_proposal(by_id[key], "bulk")
+            self._set_action(
+                f"{len(keys)} 件をまとめて当てました(✎△)。"
+                "聴いて確かめると ✎ になります。")
+
+        dlg = ProposalDialog(
+            self, self._proposal_rows(proposals),
+            on_play=play,
+            on_play_now=lambda k: play(k, proposed=False),
+            on_accept=lambda k: self.decide_proposal(by_id[k], "accept"),
+            on_bulk=bulk,
+            on_reject=lambda k: self.decide_proposal(by_id[k], "reject"),
+        )
+        self.wait_window(dlg)
+        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)
+        save_proposals(path, proposals)
+        self.update_status()
+
     def _on_close(self) -> None:
+        self._inspect_cancel.set()
         self._commit_text()
         if self._dirty and self.proj.json_path:
             try:
@@ -1818,6 +2129,210 @@ class SplitDialog(tk.Toplevel):
 
     def _close(self) -> None:
         self._stop_mark()
+        self.win.player.stop()
+        self.grab_release()
+        self.destroy()
+
+
+@dataclass
+class ProposalRow:
+    """点検の提案を一覧に 1 行出すための、表示用の値。
+
+    点検側(inspect.py)が持つ提案そのものではなく、そこから作った文字列だけを
+    持つ。画面が提案の作り方を知らずに済むので、照合の実装を差し替えても
+    ここは変えなくてよい(align.py を薄いアダプタに隔離するのと同じ理由)。
+    """
+
+    key: str            # 呼び出し側が提案を特定するための鍵
+    kind: str           # 種別。"時刻" / "分割"
+    target: str         # 対象区間の見出し(例 "区間 12")
+    now: str            # いまの時刻
+    measured: str       # 実測した時刻
+    delta: str          # ずれ
+    evidence: str       # なぜそう言えるのか(照合の根拠)
+    confidence: str     # どれくらい確からしいか
+    text: str           # 発言のプレビュー
+
+
+class ProposalDialog(tk.Toplevel):
+    """点検が出した提案の一覧。承認するか却下するかを決めてもらう。
+
+    ここは見せて選ばせるだけで、本体データには触らない。決まったぶんだけ
+    呼び出し側の関数を呼び、適用は既存の時刻編集の経路にやらせる
+    (点検専用の書き込み経路は作らない)。
+
+    決め方は話者の ✓/△ と同じ形にしてある:
+      - [聴いて承認]   選んだ行を再生して確かめたうえで採る → ✎
+      - [まとめて適用] 残りを聴かずに当てる → ✎△(あとで聴いて ✎ に上げる)
+      - [却下]         その行は採らない
+
+    行は 1 つずつ選ぶ(選ぶと再生する)。まとめて承認できるようにすると、
+    聴かずに ✎ を付けられてしまい、✎ の意味が壊れる。
+
+    ※ 提案を作る側(align.py / anchor.py / inspect.py)と、この画面を開く
+      ボタンは Step 1-3a で入れる。いまは表示と決定の受け口だけ。
+    """
+
+    COLUMNS = (
+        ("kind", "種別", 60),
+        ("target", "対象", 80),
+        ("now", "いまの時刻", 100),
+        ("measured", "実測の時刻", 100),
+        ("delta", "ずれ", 70),
+        ("evidence", "根拠", 190),
+        ("confidence", "信頼度", 70),
+        ("text", "発言", 300),
+    )
+
+    def __init__(
+        self,
+        master: "AssignWindow",
+        rows: Iterable[ProposalRow],
+        *,
+        on_play=None,       # (key) 行を選んだとき。提案した時刻で再生する
+        on_play_now=None,   # (key) 比べるために、いまの時刻でも再生する
+        on_accept=None,     # (key) 聴いて承認した
+        on_bulk=None,       # (keys) 残りをまとめて適用した
+        on_reject=None,     # (key) 却下した
+    ) -> None:
+        super().__init__(master)
+        self.win = master
+        self.on_play = on_play
+        self.on_play_now = on_play_now
+        self.on_accept = on_accept
+        self.on_bulk = on_bulk
+        self.on_reject = on_reject
+        self.rows: dict[str, ProposalRow] = {r.key: r for r in rows}
+        # 何をどう決めたかの記録。呼び出し側が後から見返せるようにする
+        self.decisions: list[tuple[str, tuple[str, ...]]] = []
+
+        self.title("点検の提案")
+        self.transient(master)
+        self.var_status = tk.StringVar(value="")
+        self._build()
+        self._update_status()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            self,
+            text="行を選ぶとその箇所を再生します。聴いて合っていれば[聴いて承認]。"
+                 "[まとめて適用]した区間は ✎△(未確認)のままなので、あとから"
+                 "聴いて確かめられます。",
+            wraplength=760,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        keys = tuple(key for key, _, _ in self.COLUMNS)
+        self.tree = ttk.Treeview(self, columns=keys, show="headings",
+                                 height=14, selectmode="browse")
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width,
+                             anchor="w" if key in ("evidence", "text") else "center")
+        for row in self.rows.values():
+            self._insert(row)
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(row=1, column=1, sticky="ns", padx=(0, 12))
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        ttk.Label(self, textvariable=self.var_status, foreground="#666")\
+            .grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        # 行を選ぶと提案した時刻で鳴る。合っているかは、いまの時刻と
+        # 聴き比べると分かりやすい
+        ttk.Button(btns, text="▶ 提案の時刻", command=self._play_again)\
+            .pack(side="left")
+        ttk.Button(btns, text="▶ いまの時刻", command=self._play_now)\
+            .pack(side="left", padx=(4, 18))
+        ttk.Button(btns, text="聴いて承認", command=self._accept).pack(side="left")
+        ttk.Button(btns, text="却下", command=self._reject).pack(side="left", padx=6)
+        ttk.Button(btns, text="残りをまとめて適用", command=self._bulk)\
+            .pack(side="left", padx=(18, 6))
+        ttk.Button(btns, text="閉じる", command=self._close).pack(side="left")
+
+    def _insert(self, row: ProposalRow) -> None:
+        self.tree.insert("", "end", iid=row.key, values=(
+            row.kind, row.target, row.now, row.measured,
+            row.delta, row.evidence, row.confidence, row.text,
+        ))
+
+    def _selected_key(self) -> Optional[str]:
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def _update_status(self) -> None:
+        self.var_status.set(f"残り {len(self.rows)} 件")
+
+    def _on_select(self, _event=None) -> None:
+        self._play_again()
+
+    def _play_again(self) -> None:
+        key = self._selected_key()
+        if key and self.on_play:
+            self.on_play(key)
+
+    def _play_now(self) -> None:
+        """比べるために、いまの(直す前の)時刻でも鳴らせるようにする。"""
+        key = self._selected_key()
+        if key and self.on_play_now:
+            self.on_play_now(key)
+
+    # ------------------------------------------------------------------
+    def _accept(self) -> None:
+        key = self._selected_key()
+        if key is None:
+            self.var_status.set("承認する行を選んでください。")
+            return
+        if self.on_accept:
+            self.on_accept(key)
+        self._done("accept", (key,))
+
+    def _reject(self) -> None:
+        key = self._selected_key()
+        if key is None:
+            self.var_status.set("却下する行を選んでください。")
+            return
+        if self.on_reject:
+            self.on_reject(key)
+        self._done("reject", (key,))
+
+    def _bulk(self) -> None:
+        keys = tuple(self.rows)
+        if not keys:
+            return
+        ok = messagebox.askyesno(
+            "残りをまとめて適用",
+            f"残り {len(keys)} 件を聴かずに適用します。\n"
+            "適用した区間は ✎△(未確認)になります。あとから聴いて"
+            "確かめると ✎ に変わります。\n\nよろしいですか?",
+            parent=self,
+        )
+        if not ok:
+            return
+        if self.on_bulk:
+            self.on_bulk(keys)
+        self._done("bulk", keys)
+
+    def _done(self, kind: str, keys: tuple[str, ...]) -> None:
+        """決まった行を一覧から外す(同じ提案を二度決めさせない)。"""
+        self.decisions.append((kind, keys))
+        for key in keys:
+            self.rows.pop(key, None)
+            if self.tree.exists(key):
+                self.tree.delete(key)
+        self._update_status()
+
+    def _close(self) -> None:
         self.win.player.stop()
         self.grab_release()
         self.destroy()

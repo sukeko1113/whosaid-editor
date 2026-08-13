@@ -748,7 +748,7 @@ def test_orig_times_default_to_start_end():
 
 
 def test_load_schema2_file_fills_orig_times():
-    """orig_* を持たない旧ファイルは既定値だけで読め、保存は v3 になる。"""
+    """orig_* を持たない旧ファイルは既定値だけで読め、保存は今の版になる。"""
     old = {
         "schema": 2,
         "audio_path": "a.m4a",
@@ -769,12 +769,12 @@ def test_load_schema2_file_fills_orig_times():
         assert (seg.orig_start, seg.orig_end) == (10.0, 20.0)
         assert seg.time_edited is False
 
-        # 時刻を直して保存 → schema 3 で書かれ、orig は元の時刻のまま残る
+        # 時刻を直して保存 → 今の schema で書かれ、orig は元の時刻のまま残る
         seg.start, seg.end = 16.0, 26.0
         seg.time_edited = True
         proj.save(p)
         data = json.loads(p.read_text(encoding="utf-8"))
-        assert data["schema"] == SCHEMA_VERSION == 3
+        assert data["schema"] == SCHEMA_VERSION
 
         again = Project.load(p)
         s2 = again.segments[0]
@@ -892,6 +892,77 @@ def test_split_then_merge_restores_shape():
     assert (after.start, after.end) == span
     assert after.text == text
     assert (after.orig_start, after.orig_end) == span
+
+
+# ======================================================================
+# 時刻を耳で確かめたか(time_reviewed。schema 4)
+# ======================================================================
+
+def test_schema3_file_treats_edited_as_reviewed():
+    """v3 までは『時刻を直した = 耳で合わせた』しかなかった。"""
+    old = {
+        "schema": 3,
+        "audio_path": "a.m4a",
+        "segments": [
+            {"index": 0, "start": 16.0, "end": 26.0, "text": "あ", "cluster": "0:A",
+             "orig_start": 10.0, "orig_end": 20.0, "time_edited": True},
+            {"index": 1, "start": 30.0, "end": 40.0, "text": "い", "cluster": "0:A",
+             "orig_start": 30.0, "orig_end": 40.0},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        proj = Project.load(p)
+    assert proj.segments[0].time_reviewed is True      # 機械の推定ではなく手動だった
+    assert proj.segments[1].time_reviewed is False
+
+
+def test_unreviewed_time_survives_save_and_load():
+    """『時刻は入れたが未確認』(✎△)の状態が保存で消えない。"""
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [
+        Segment(index=0, start=16.0, end=26.0, text="あ", cluster="0:A",
+                time_edited=True, time_reviewed=False,
+                orig_start=10.0, orig_end=20.0),
+        Segment(index=1, start=36.0, end=46.0, text="い", cluster="0:A",
+                time_edited=True, time_reviewed=True,
+                orig_start=30.0, orig_end=40.0),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.speakers.json"
+        proj.save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        assert data["schema"] == SCHEMA_VERSION == 4
+        again = Project.load(p)
+    assert again.segments[0].time_edited is True
+    assert again.segments[0].time_reviewed is False    # 既定値で上書きされない
+    assert again.segments[1].time_reviewed is True
+
+
+def test_split_inherits_time_reviewed():
+    """境界は人が決めるが、外側の端は親のまま。分割で確認済みには昇格させない。"""
+    proj = _splittable()
+    proj.segments[1].time_edited = True
+    proj.segments[1].time_reviewed = True
+    head, tail = proj.split_segment(1, 105.0, 5)
+    assert head.time_reviewed is True and tail.time_reviewed is True
+
+    proj = _splittable()                        # 親が未確認(✎△ や AI の時刻のまま)
+    head, tail = proj.split_segment(1, 105.0, 5)
+    assert head.time_edited is True and tail.time_edited is True
+    assert head.time_reviewed is False and tail.time_reviewed is False
+
+
+def test_merge_needs_both_sides_reviewed():
+    """片側でも未確認なら、結合した区間も未確認。"""
+    for a_ok, b_ok, want in ((True, True, True), (True, False, False),
+                             (False, True, False), (False, False, False)):
+        proj = _splittable()
+        for seg, ok in ((proj.segments[1], a_ok), (proj.segments[2], b_ok)):
+            seg.time_edited = True
+            seg.time_reviewed = ok
+        assert proj.merge_segments(1).time_reviewed is want
 
 
 # ======================================================================

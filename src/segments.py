@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -40,6 +40,19 @@ PSEUDO_MULTI = "*"
 # 人が時刻を直したり区間を分けたりするときに許す最短の長さ。
 # 0 にすると start == end の区間ができて、再生も出力も意味を失う。
 MIN_SEGMENT_SECONDS = 0.1
+
+
+def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
+    """その区間が実音声のどこで鳴っているか(開始, 終了)。
+
+    再生の規約: 実音声の位置 = 保存時刻 + ずれ補正。ただし一度直した区間の
+    start/end は実音声の時刻そのものなので、補正を足さない。
+    画面の再生・時刻編集の初期値・自動点検の照合窓が、すべてこの 1 つの
+    規約を見るようにしてある(散らばると必ず食い違う)。
+    """
+    if seg.time_edited:
+        return seg.start, seg.end
+    return max(0.0, seg.start + time_offset), max(0.0, seg.end + time_offset)
 
 
 def fmt_hms(seconds: float) -> str:
@@ -189,6 +202,9 @@ class Segment:
     note: str = ""
     text_edited: bool = False           # ユーザーが本文を手直ししたか(再実行時に保護)
     time_edited: bool = False           # ユーザーが時刻を直したか
+    # 時刻を「自分の耳で確かめた」か。機械が出した時刻を当てただけの区間と区別する。
+    # 話者の reviewed と同じ考え方で、あとから未確認だけを拾い直せるようにする。
+    time_reviewed: bool = False
     # パイプライン(AI)が出した元の時刻。start/end をユーザーが直しても動かさない。
     # 再実行したときに新旧の区間を突き合わせる鍵と、「元に戻す」の戻り先に使う。
     # None を渡すと start/end で埋める(新規生成時と、これを持たない旧ファイル)。
@@ -241,6 +257,10 @@ class Segment:
         # 渡し、__post_init__ に start / end を入れさせる(移行処理は不要)。
         orig_start = d.get("orig_start")
         orig_end = d.get("orig_end")
+        # schema 3 までは「時刻を直した = 自分の耳で合わせた」しかなかった。
+        # 機械が出した時刻を当てただけの区間と区別する印は 4 で足したので、
+        # 古いファイルの time_edited は確認済みとして読む。
+        time_edited = bool(d.get("time_edited", False))
         return cls(
             index=int(d["index"]),
             start=float(d.get("start", 0.0)),
@@ -252,7 +272,8 @@ class Segment:
             reviewed=bool(d.get("reviewed", False)),
             note=str(d.get("note", "")),
             text_edited=bool(d.get("text_edited", False)),
-            time_edited=bool(d.get("time_edited", False)),
+            time_edited=time_edited,
+            time_reviewed=bool(d.get("time_reviewed", time_edited)),
             orig_start=float(orig_start) if orig_start is not None else None,
             orig_end=float(orig_end) if orig_end is not None else None,
         )
@@ -353,6 +374,9 @@ class Project:
             note=seg.note,
             text_edited=seg.text_edited,
             time_edited=True,
+            # 境界は人が決めるが、外側の端は元の区間のまま。親が未確認なら
+            # 子も未確認にする(分割したというだけで確認済みには昇格させない)。
+            time_reviewed=seg.time_reviewed,
             # 再実行時に「元は 1 つだった」と分かるよう、親の値を両方が共有する
             orig_start=seg.orig_start,
             orig_end=seg.orig_end,
@@ -369,6 +393,7 @@ class Project:
             note="",
             text_edited=seg.text_edited,
             time_edited=True,
+            time_reviewed=seg.time_reviewed,
             orig_start=seg.orig_start,
             orig_end=seg.orig_end,
         )
@@ -399,6 +424,8 @@ class Project:
             note=" / ".join(notes),
             text_edited=a.text_edited or b.text_edited,
             time_edited=True,
+            # 両端とも耳で確かめてあったときだけ確認済みのまま(片方が未確認なら未確認)
+            time_reviewed=a.time_reviewed and b.time_reviewed,
             orig_start=a.orig_start,        # 系譜の始まりは前側
             orig_end=b.orig_end,            # 終わりは後側(再実行時の吸収に要る)
         )
