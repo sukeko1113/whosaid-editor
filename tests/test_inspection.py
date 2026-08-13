@@ -24,6 +24,7 @@ from src.inspection import (                              # noqa: E402
     PROPOSAL_TIME,
     Proposal,
     clip_to_neighbours,
+    decided_history,
     drop_conflicts,
     inspect_times,
     load_proposals,
@@ -396,7 +397,8 @@ def test_clip_refuses_to_make_a_crushed_segment():
     assert ok is not None
 
 
-def test_target_segment_prefers_the_front_of_a_split_family():
+def test_target_segment_prefers_the_front_without_target_now():
+    """target_now を持たない古い提案は、後方互換で前側に倒す。"""
     proj = project()
     proj.split_segment(1, proj.segments[1].start + 2.0, 3)
     p = Proposal(id="x", type=PROPOSAL_TIME,
@@ -404,6 +406,59 @@ def test_target_segment_prefers_the_front_of_a_split_family():
                  payload={}, evidence="", confidence=1.0)
     found = target_segment(proj, p)
     assert found is not None and found.index == 1       # 分割した前側
+
+
+def test_target_segment_resolves_split_siblings_by_position():
+    """分割兄弟は orig_start を共有する。位置で正しい側に当てる。
+
+    前側優先のままだと、後側(tail)への提案が前側(head)に適用され、
+    head が自分の実測で直った後に tail の実測で上書きされる。
+    """
+    proj = project()
+    head_start = proj.segments[1].start                 # 6.0
+    proj.split_segment(1, head_start + 2.0, 3)          # head 6-8 / tail 8-10.5
+    orig = float(proj.segments[1].orig_start)
+
+    for_tail = Proposal(id="t", type=PROPOSAL_TIME, target_orig_start=orig,
+                        payload={}, evidence="", confidence=1.0,
+                        target_now=8.0)
+    found = target_segment(proj, for_tail)
+    assert found is not None and found.index == 2       # 後側に当たる
+
+    for_head = Proposal(id="h", type=PROPOSAL_TIME, target_orig_start=orig,
+                        payload={}, evidence="", confidence=1.0,
+                        target_now=6.0)
+    found = target_segment(proj, for_head)
+    assert found is not None and found.index == 1       # 前側に当たる
+
+
+def test_target_segment_expires_when_structure_changed():
+    """兄弟のどれからも遠い提案(分割し直しなどで構造が変わった)は失効。"""
+    proj = project()
+    proj.split_segment(1, proj.segments[1].start + 2.0, 3)
+    stale = Proposal(id="s", type=PROPOSAL_TIME,
+                     target_orig_start=float(proj.segments[1].orig_start),
+                     payload={}, evidence="", confidence=1.0,
+                     target_now=200.0)                  # どの兄弟からも遠い
+    assert target_segment(proj, stale) is None
+
+
+def test_proposals_carry_their_generation_position():
+    """inspect_times の提案は、作った時点の位置(target_now)を持つ。"""
+    proj = project(drift=6.8)
+    got = inspect_times(proj, measured_words())
+    for p, seg in zip(got.proposals, proj.segments):
+        assert p.target_now is not None
+        assert abs(p.target_now - seg.start) < 0.05
+
+
+def test_target_now_survives_the_sidecar():
+    got = inspect_times(project(drift=6.8), measured_words())
+    with tempfile.TemporaryDirectory() as d:
+        path = proposals_path(d, "ff00")
+        save_proposals(path, got.proposals)
+        again = load_proposals(path)
+    assert [p.target_now for p in again] == [p.target_now for p in got.proposals]
 
 
 def test_target_segment_missing_returns_none():
@@ -467,6 +522,43 @@ def test_accepted_proposals_are_not_shown_again():
 def test_undecided_history_does_not_hide_anything():
     fresh = inspect_times(project(drift=6.8), measured_words()).proposals
     assert len(merge_history(fresh, list(fresh))) == len(fresh)      # pending
+
+
+def test_reject_history_survives_repeated_inspections():
+    """却下の記録は、点検を何回挟んでも消えない(§6.1)。
+
+    保存を「今回の提案だけ」で上書きすると、2 回目の保存で前回の却下が
+    落ち、3 回目の点検で同じ提案が出てくる。「今回の提案 + 判断済みの
+    履歴」を書き戻すのが正しい。
+    """
+    def fresh_proposals():
+        return inspect_times(project(drift=6.8), measured_words()).proposals
+
+    with tempfile.TemporaryDirectory() as d:
+        path = proposals_path(d, "ff00")
+        # 1 回目: 1 件目を却下して保存
+        r1 = fresh_proposals()
+        rejected_id = r1[0].id
+        r1[0].status = "rejected"
+        save_proposals(path, [*r1, *decided_history(load_proposals(path))])
+        # 2 回目: 却下済みは出ない。保存し直しても記録は残る
+        h2 = load_proposals(path)
+        fresh2 = merge_history(fresh_proposals(), h2)
+        assert rejected_id not in [p.id for p in fresh2]
+        save_proposals(path, [*fresh2, *decided_history(h2)])
+        # 3 回目: まだ出ない(今回の提案だけで上書きすると、ここで再登場していた)
+        h3 = load_proposals(path)
+        fresh3 = merge_history(fresh_proposals(), h3)
+        assert rejected_id not in [p.id for p in fresh3]
+
+
+def test_decided_history_drops_stale_pending():
+    """pending は引き継がない(次の点検で作り直されるため)。"""
+    got = inspect_times(project(drift=6.8), measured_words()).proposals
+    got[0].status = "accepted"
+    got[1].status = "rejected"
+    kept = decided_history(got)
+    assert [p.status for p in kept] == ["accepted", "rejected"]
 
 
 def test_new_evidence_comes_back_even_after_rejection():

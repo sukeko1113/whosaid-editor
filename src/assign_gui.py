@@ -31,6 +31,7 @@ from .config import load_config
 from .inspection import (
     Proposal,
     clip_to_neighbours,
+    decided_history,
     inspect_times,
     load_proposals,
     merge_history,
@@ -310,6 +311,9 @@ class AssignWindow(tk.Toplevel):
         self._inspect_thread: Optional[threading.Thread] = None
         self._inspect_cancel = threading.Event()
         self._inspect_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        # 直前の「まとめて適用」を丸ごと戻すための控え(時刻専用。話者の
+        # _undo とは別系統 — あちらは時刻を持たない)
+        self._time_undo: Optional[dict] = None
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -551,6 +555,12 @@ class AssignWindow(tk.Toplevel):
         self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
                                       command=self.run_inspection)
         self.btn_inspect.pack(side="left", padx=6)
+        # 一括適用は百件級になりうる。Ctrl+Z は話者専用、[元に戻す]は
+        # 区間 1 つずつなので、まとめて戻す手段を別に置く
+        self.btn_undo_bulk = ttk.Button(bottom, text="一括適用を取り消す",
+                                        command=self.undo_bulk_times,
+                                        state="disabled")
+        self.btn_undo_bulk.pack(side="left")
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
@@ -1030,7 +1040,7 @@ class AssignWindow(tk.Toplevel):
         self.play_span(start, end, pre_roll=0.0)
 
     def _write_times(self, seg: Segment, start: float, end: float, *,
-                     reviewed: bool) -> None:
+                     reviewed: bool, refresh: bool = True) -> None:
         """区間に時刻を書く、ただ 1 つの経路。
 
         画面で直したときも、点検の提案を当てたときも必ずここを通す。
@@ -1038,11 +1048,15 @@ class AssignWindow(tk.Toplevel):
 
         reviewed: その時刻を人が耳で確かめたか。画面で決めた時刻は True、
         点検の提案をまとめて当てただけなら False(✎△ のまま残す)。
+        refresh: 画面を描き直すか。まとめて適用では 1 件ごとに描き直すと
+        百件級で待たされるので、呼び出し側が最後に 1 回だけ描き直す。
         """
         seg.start, seg.end = start, end
         seg.time_edited = True          # 以後この区間にずれ補正を足さない
         seg.time_reviewed = reviewed
         self._dirty = True
+        if not refresh:
+            return
         if seg.index == self.current:
             self._show_times()
             self._update_seginfo()
@@ -1069,30 +1083,140 @@ class AssignWindow(tk.Toplevel):
             f"(✎ {fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)})。"
         )
 
+    def plan_proposals(
+        self, proposals: Iterable[Proposal],
+    ) -> tuple[list[tuple[Segment, float, float, Proposal]], list[Proposal]]:
+        """提案の行き先を先に全部解く(適用順序で結果が変わらないようにする)。
+
+        1 件ずつ隣に合わせて切り詰めながら書くと、まとめて適用の結果が
+        適用順序に依存する。ドリフト帯を前から順に当てると、まだ動いて
+        いない隣の古い位置に切り詰められて、後の提案ほど潰れる
+        (+7 秒帯の再現実験では昇順で 4 件中 3 件が適用不可になった)。
+
+        そこで隣の位置は「同じバッチに提案があればその提案値、なければ
+        いまの位置」として先に全件を解き、書き込みはそのあと一括で行う。
+
+        戻り値: (書き込む計画, 当てられなかった提案)。
+        """
+        resolved: dict[int, tuple[Segment, Proposal]] = {}
+        failed: list[Proposal] = []
+        for p in proposals:
+            seg = target_segment(self.proj, p)
+            # 人が耳で確定した時刻は上書きしない(§3.4)。提案の生成後に
+            # ユーザーが確定した場合もここで止まる。
+            if seg is None or seg.time_reviewed or seg.index in resolved:
+                failed.append(p)
+                continue
+            resolved[seg.index] = (seg, p)
+
+        def dest_end(i: int) -> Optional[float]:
+            """区間 i の「行き先の終了」。バッチ内なら提案値、外ならいまの値。"""
+            if i < 0:
+                return None
+            if i in resolved:
+                seg, p = resolved[i]
+                return float(p.payload.get("end", seg.end))
+            return audio_span(self.proj.segments[i], self.proj.time_offset)[1]
+
+        def dest_start(i: int) -> Optional[float]:
+            if i >= len(self.proj.segments):
+                return None
+            if i in resolved:
+                seg, p = resolved[i]
+                return float(p.payload.get("start", seg.start))
+            return audio_span(self.proj.segments[i], self.proj.time_offset)[0]
+
+        planned: list[tuple[Segment, float, float, Proposal]] = []
+        for i in sorted(resolved):
+            seg, p = resolved[i]
+            start = float(p.payload.get("start", seg.start))
+            end = float(p.payload.get("end", seg.end))
+            clipped = clip_to_neighbours(start, end,
+                                         dest_end(i - 1), dest_start(i + 1))
+            if clipped is None:
+                failed.append(p)    # 切り詰めると潰れる。当てないほうがいい
+                continue
+            start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+            planned.append((seg, start, end, p))
+        return planned, failed
+
     def apply_proposal(self, proposal: Proposal, *, reviewed: bool) -> bool:
         """点検の提案を 1 件当てる。当てられなければ False を返す。
 
-        書き込みは画面の時刻編集と同じ _write_times を通す。隣の区間と
-        重なる提案は接点で切り詰める(1 件ずつ承認しても、まとめて適用しても
-        重ならないようにするため)。
+        書き込みは画面の時刻編集と同じ _write_times を通す。
         """
-        seg = target_segment(self.proj, proposal)
-        if seg is None:
+        planned, _ = self.plan_proposals([proposal])
+        if not planned:
             return False
-        start = float(proposal.payload.get("start", seg.start))
-        end = float(proposal.payload.get("end", seg.end))
-
-        i = seg.index
-        prev_end = (audio_span(self.proj.segments[i - 1], self.proj.time_offset)[1]
-                    if i > 0 else None)
-        next_start = (audio_span(self.proj.segments[i + 1], self.proj.time_offset)[0]
-                      if i + 1 < len(self.proj.segments) else None)
-        clipped = clip_to_neighbours(start, end, prev_end, next_start)
-        if clipped is None:
-            return False            # 切り詰めると潰れる。当てないほうがいい
-        start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+        seg, start, end, _p = planned[0]
         self._write_times(seg, start, end, reviewed=reviewed)
         return True
+
+    def apply_proposals_bulk(
+        self, proposals: Iterable[Proposal],
+    ) -> tuple[list[Proposal], list[Proposal]]:
+        """提案をまとめて当てる(すべて ✎△。人の耳の確認は後から)。
+
+        戻り値: (当てられた提案, 当てられなかった提案)。status もここで更新する。
+        当てる前の時刻を控えておき、まとめて元に戻せるようにする。
+        """
+        planned, failed = self.plan_proposals(proposals)
+        if planned:
+            # 当てる前の状態を控える。百件を 1 件ずつ戻すのは現実的でない
+            self._time_undo = {
+                "total": len(self.proj.segments),
+                "items": [(seg.index, seg.start, seg.end,
+                           seg.time_edited, seg.time_reviewed)
+                          for seg, _s, _e, _p in planned],
+            }
+        for seg, start, end, p in planned:
+            self._write_times(seg, start, end, reviewed=False, refresh=False)
+            p.status = "accepted"
+        if planned:
+            self.reload_tree()
+            self._show_times()
+            self._update_seginfo()
+            self._sync_time_undo_button()
+        return [p for _, _, _, p in planned], failed
+
+    def undo_bulk_times(self) -> None:
+        """直前の「まとめて適用」を丸ごと元に戻す。
+
+        Ctrl+Z は話者専用(スナップショットに時刻を持たない)、[元に戻す]は
+        区間 1 つずつなので、百件級の一括適用を戻す手段が別に要る。
+        """
+        snap = self._time_undo
+        if not snap:
+            self._set_action("取り消せる一括適用がありません。")
+            return
+        if snap["total"] != len(self.proj.segments):
+            # 分割・結合で区間の並びが変わっている。index で戻すと別の区間を
+            # 壊すので、戻さずに知らせる
+            self._time_undo = None
+            self._sync_time_undo_button()
+            messagebox.showinfo(
+                "取り消せません",
+                "一括適用のあとで区間を分割または結合したため、"
+                "まとめて元に戻すことはできません。\n"
+                "区間ごとの[元に戻す]をお使いください。",
+                parent=self,
+            )
+            return
+        for index, start, end, edited, reviewed in snap["items"]:
+            seg = self.proj.segments[index]
+            seg.start, seg.end = start, end
+            seg.time_edited, seg.time_reviewed = edited, reviewed
+        self._dirty = True
+        self._time_undo = None
+        self.reload_tree()
+        self._show_times()
+        self._update_seginfo()
+        self._sync_time_undo_button()
+        self._set_action(f"{len(snap['items'])} 区間の一括適用を元に戻しました。")
+
+    def _sync_time_undo_button(self) -> None:
+        state = ["!disabled"] if self._time_undo else ["disabled"]
+        self.btn_undo_bulk.state(state)
 
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
@@ -1819,7 +1943,8 @@ class AssignWindow(tk.Toplevel):
         """実測が揃った。照合して提案を作り、一覧を出す。"""
         result = inspect_times(self.proj, words)
         path = proposals_path(self._work_dir(), self.proj.audio_fingerprint)
-        fresh = merge_history(result.proposals, load_proposals(path))
+        history = load_proposals(path)
+        fresh = merge_history(result.proposals, history)
 
         summary = (f"{result.checked} 区間を点検: 提案 {len(fresh)} 件"
                    f"(確認済み {result.reviewed} / 照合できず {result.unmatched} / "
@@ -1832,7 +1957,7 @@ class AssignWindow(tk.Toplevel):
                 parent=self,
             )
             return
-        self._open_proposals(fresh, path)
+        self._open_proposals(fresh, path, decided_history(history))
 
     def _proposal_rows(self, proposals) -> list[ProposalRow]:
         """提案を一覧の行にする。ここでしか画面用の言い回しを作らない。"""
@@ -1862,16 +1987,19 @@ class AssignWindow(tk.Toplevel):
 
         decision: "accept"(聴いて承認 → ✎) / "bulk"(まとめて適用 → ✎△)
                   / "reject"(却下)
-        当てられなかった提案は却下として残す。次の点検で同じものを
-        出し直しても、また当てられないため。
+        当てられなかった提案は pending のまま残す。隣が動いた後なら
+        当てられたかもしれず、再点検で出直せるようにするため。却下として
+        記録すると、同じ根拠の正当な提案が二度と出なくなる。
+        再提示を抑止するのは、人が明示的に却下したものだけ。
         """
         if decision == "reject":
             proposal.status = "rejected"
             return
-        applied = self.apply_proposal(proposal, reviewed=(decision == "accept"))
-        proposal.status = "accepted" if applied else "rejected"
+        if self.apply_proposal(proposal, reviewed=(decision == "accept")):
+            proposal.status = "accepted"
 
-    def _open_proposals(self, proposals, path: Optional[Path]) -> None:
+    def _open_proposals(self, proposals, path: Optional[Path],
+                        history: Iterable[Proposal] = ()) -> None:
         by_id = {p.id: p for p in proposals}
 
         def play(key: str, *, proposed: bool = True) -> None:
@@ -1894,11 +2022,13 @@ class AssignWindow(tk.Toplevel):
                            pre_roll=min(0.4, max(0.05, (end - start) * 0.25)))
 
         def bulk(keys) -> None:
-            for key in keys:
-                self.decide_proposal(by_id[key], "bulk")
-            self._set_action(
-                f"{len(keys)} 件をまとめて当てました(✎△)。"
-                "聴いて確かめると ✎ になります。")
+            ok, failed = self.apply_proposals_bulk([by_id[k] for k in keys])
+            # 当てられなかった分は pending のまま(隣が動けば次は当たるかもしれない)
+            msg = (f"{len(ok)} 件をまとめて当てました(✎△)。"
+                   "聴いて確かめると ✎ になります。")
+            if failed:
+                msg += f" {len(failed)} 件は当てられませんでした。"
+            self._set_action(msg)
 
         dlg = ProposalDialog(
             self, self._proposal_rows(proposals),
@@ -1909,8 +2039,10 @@ class AssignWindow(tk.Toplevel):
             on_reject=lambda k: self.decide_proposal(by_id[k], "reject"),
         )
         self.wait_window(dlg)
-        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)
-        save_proposals(path, proposals)
+        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)。
+        # 過去の判断済み(history)も一緒に書き戻す。今回の提案だけで
+        # 上書きすると、点検を 2 回挟んだだけで却下の記録が消える。
+        save_proposals(path, [*proposals, *history])
         self.update_status()
 
     def _on_close(self) -> None:

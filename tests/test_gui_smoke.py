@@ -309,6 +309,87 @@ def run() -> int:
                         payload={"start": 1.0, "end": 2.0}, evidence="",
                         confidence=1.0)
         check("対象が無ければ当てない", win.apply_proposal(gone, reviewed=True) is False)
+
+        # --- まとめて適用は順序に依存しない ---------------------------------
+        # ドリフト帯: 隣り合う 4 区間が全部 +7 秒ずれている。1 件ずつ前から
+        # 当てると、まだ動いていない隣の古い位置に切り詰められて潰れる。
+        # 行き先を先に全部解いてから書くので、何件でも同時に動かせる。
+        band = []
+        for i in (16, 17, 18, 19):
+            s = proj.segments[i]
+            band.append(Proposal(
+                id=f"b{i}", type="time", target_orig_start=float(s.orig_start),
+                payload={"start": float(s.orig_start) + 7.0,
+                         "end": float(s.orig_end) + 7.0},
+                evidence="", confidence=0.9))
+        ok, failed = win.apply_proposals_bulk(band)
+        check("ドリフト帯を全件まとめて当てられる",
+              len(ok) == 4 and not failed)
+        check("全件が提案どおりの位置に入る",
+              all(abs(proj.segments[i].start - (proj.segments[i].orig_start + 7.0))
+                  < 1e-6 for i in (16, 17, 18, 19)))
+        check("まとめて適用は全件 ✎△",
+              all(proj.segments[i].time_edited and not proj.segments[i].time_reviewed
+                  for i in (16, 17, 18, 19)))
+        check("承認済みとして記録される",
+              all(p.status == "accepted" for p in band))
+        # 隣どうしは重ならない(接点で切り詰め済み)
+        check("適用後も隣と重ならない",
+              all(proj.segments[i].end <= proj.segments[i + 1].start + 1e-6
+                  for i in (16, 17, 18)))
+
+        # --- 一括適用をまとめて元に戻す -------------------------------------
+        check("一括適用の直後は取り消せる",
+              "disabled" not in win.btn_undo_bulk.state())
+        win.undo_bulk_times()
+        check("全件が適用前の時刻に戻る",
+              all(abs(proj.segments[i].start - proj.segments[i].orig_start) < 1e-6
+                  for i in (16, 17, 18, 19)))
+        check("印も適用前に戻る",
+              all(not proj.segments[i].time_edited
+                  and not proj.segments[i].time_reviewed
+                  for i in (16, 17, 18, 19)))
+        check("二度は取り消せない",
+              "disabled" in win.btn_undo_bulk.state())
+        # 分割・結合で並びが変わったら、index で戻すのは危ないので拒む
+        win.apply_proposals_bulk(band)
+        total_before = len(proj.segments)
+        proj.split_segment(30, proj.segments[30].start + 2.0, 3)
+        real_ask2 = assign_gui.messagebox.showinfo
+        told: list = []
+        assign_gui.messagebox.showinfo = lambda *a, **k: told.append(a)
+        try:
+            win.undo_bulk_times()
+        finally:
+            assign_gui.messagebox.showinfo = real_ask2
+        check("並びが変わったら取り消さずに知らせる",
+              bool(told) and abs(proj.segments[16].start
+                                 - (proj.segments[16].orig_start + 7.0)) < 1e-6)
+        proj.merge_segments(30)                             # 後片付け
+        check("区間の数が戻る", len(proj.segments) == total_before)
+        s30 = proj.segments[30]                 # 結合は time_edited を立てる
+        s30.start, s30.end = float(s30.orig_start), float(s30.orig_end)
+        s30.time_edited = s30.time_reviewed = False
+        win.reload_tree()
+        # band(区間 16〜19)は +7 秒のまま次の検査へ渡す
+
+        # 人が耳で確定した区間には、まとめて適用でも触れない
+        seg16 = proj.segments[16]
+        seg16.time_reviewed = True
+        again = Proposal(id="b16x", type="time",
+                         target_orig_start=float(seg16.orig_start),
+                         payload={"start": float(seg16.orig_start) + 9.0,
+                                  "end": float(seg16.orig_end) + 9.0},
+                         evidence="", confidence=0.9)
+        ok, failed = win.apply_proposals_bulk([again])
+        check("確定済み(✎)はまとめて適用でも動かない",
+              not ok and len(failed) == 1
+              and abs(seg16.start - (seg16.orig_start + 7.0)) < 1e-6)
+        for i in (16, 17, 18, 19):                          # 後片付け
+            s = proj.segments[i]
+            s.start, s.end = float(s.orig_start), float(s.orig_end)
+            s.time_edited = s.time_reviewed = False
+        win.reload_tree()
         for i in (9,):                                      # 後片付け
             s = proj.segments[i]
             s.start, s.end = s.orig_start, s.orig_end
@@ -572,7 +653,9 @@ def run() -> int:
                         payload={"start": 1.0, "end": 2.0}, evidence="",
                         confidence=0.5)
         win.decide_proposal(lost, "accept")
-        check("当てられない提案は却下として残す", lost.status == "rejected")
+        # 却下ではなく pending のまま残す。隣が動いた後なら当てられたかも
+        # しれず、却下として記録すると正当な提案が二度と出なくなる
+        check("当てられない提案は pending のまま", lost.status == "pending")
 
         # 却下した提案は次の点検で出し直さない(sidecar に判断が残る)
         path = proposals_path(win._work_dir(), "ff00")
