@@ -46,6 +46,7 @@ from src.assign_gui import (  # noqa: E402
     preview_length,
     time_edit_base,
 )
+from src.inspection import Proposal  # noqa: E402
 from src.segments import (  # noqa: E402
     Project,
     SPECIAL_UNKNOWN,
@@ -229,6 +230,70 @@ def run() -> int:
         win.revert_time()                                   # 後片付け
         check("元に戻すと時刻も印も消える",
               (seg3.start, seg3.end) == orig3 and seg3.time_reviewed is False)
+
+        # --- 聴いて確かめた印を上げる([この時刻で確認]) --------------------
+        seg3.start, seg3.end = orig3[0] + 6.0, orig3[1] + 6.0
+        seg3.time_edited, seg3.time_reviewed = True, False
+        win.goto(3)
+        check("未確認なら押せる", "disabled" not in win.btn_confirm_time.state())
+        before = (seg3.start, seg3.end)
+        win.confirm_time()
+        check("時刻の値は変わらない", (seg3.start, seg3.end) == before)
+        check("確認済みになる", seg3.time_reviewed is True)
+        check("一覧の印が ✎ に変わる",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        check("確認済みなら押せない", "disabled" in win.btn_confirm_time.state())
+        win.revert_time()
+
+        # まだ直していない区間でも「聴いた、この時刻でいい」と言える
+        win._set_offset(4.0)
+        win.goto(7)
+        seg7 = proj.segments[7]
+        win.confirm_time()
+        check("補正込みの時刻がそのまま確定する",
+              abs(seg7.start - (seg7.orig_start + 4.0)) < 1e-6)
+        check("確認済みとして入る", seg7.time_reviewed is True)
+        win.revert_time()
+        win._set_offset(0.0)
+
+        # --- 点検の提案を当てる --------------------------------------------
+        win.goto(9)
+        seg9 = proj.segments[9]
+        orig9 = (seg9.start, seg9.end)
+        prop = Proposal(id="p1", type="time",
+                        target_orig_start=float(seg9.orig_start),
+                        payload={"start": orig9[0] + 6.8, "end": orig9[1] + 6.8},
+                        evidence="一致 22/26 文字", confidence=0.85)
+        check("まとめて適用は未確認のまま入る",
+              win.apply_proposal(prop, reviewed=False) is True
+              and seg9.time_edited is True and seg9.time_reviewed is False)
+        check("提案の時刻が入る", abs(seg9.start - (orig9[0] + 6.8)) < 0.15)
+        check("一覧では ✎△", win.tree.item("s9", "values")[0].startswith("✎△"))
+        # 聴いて承認したぶんは ✎ になる
+        check("聴いて承認は確認済みで入る",
+              win.apply_proposal(prop, reviewed=True) is True
+              and seg9.time_reviewed is True)
+        check("一覧の印も ✎", win.tree.item("s9", "values")[0].startswith("✎ "))
+
+        # 隣と重なる提案は接点で切り詰める(同時に当てても重ならない)
+        seg10_start = proj.segments[10].start
+        over = Proposal(id="p2", type="time",
+                        target_orig_start=float(seg9.orig_start),
+                        payload={"start": orig9[0], "end": seg10_start + 30.0},
+                        evidence="", confidence=0.9)
+        win.apply_proposal(over, reviewed=False)
+        check("隣を侵さない", seg9.end <= seg10_start + 1e-6)
+
+        # 指し先が見つからない提案は当てない
+        gone = Proposal(id="p3", type="time", target_orig_start=99999.0,
+                        payload={"start": 1.0, "end": 2.0}, evidence="",
+                        confidence=1.0)
+        check("対象が無ければ当てない", win.apply_proposal(gone, reviewed=True) is False)
+        for i in (9,):                                      # 後片付け
+            s = proj.segments[i]
+            s.start, s.end = s.orig_start, s.orig_end
+            s.time_edited = s.time_reviewed = False
+        win.reload_tree()
 
         # 実データで詰まった 1.1 秒の相づちを 6.8 秒ずらす、と同じ形。
         # 「区間ごと」ボタンなら、長さより大きく動かしても潰れない

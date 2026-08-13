@@ -24,6 +24,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 from .audio import extract_peaks
+from .inspection import Proposal, clip_to_neighbours, target_segment
 from .player import SegmentPlayer
 from .segments import (
     MIN_SEGMENT_SECONDS,
@@ -399,10 +400,17 @@ class AssignWindow(tk.Toplevel):
                     row_time, text=text, width=5, takefocus=False,
                     command=lambda w=which, d=delta: self._nudge_time(w, d),
                 ).pack(side="left", padx=1)
+        # 機械が当てただけの時刻(✎△)を、聴いて確かめたら ✎ に上げる。
+        # 「再生 → 合っていればこれを押す」で流せるようにボタンにしてある。
+        self.btn_confirm_time = ttk.Button(
+            row_time, text="この時刻で確認", takefocus=False,
+            command=self.confirm_time,
+        )
+        self.btn_confirm_time.pack(side="left", padx=(12, 0))
         self.btn_revert_time = ttk.Button(
             row_time, text="元に戻す", takefocus=False, command=self.revert_time,
         )
-        self.btn_revert_time.pack(side="left", padx=(12, 0))
+        self.btn_revert_time.pack(side="left", padx=(6, 0))
 
         row_edit = ttk.Frame(frm_time)
         row_edit.pack(side="top", anchor="w", pady=(3, 0))
@@ -889,6 +897,10 @@ class AssignWindow(tk.Toplevel):
         self.var_start.set(fmt_hms_frac(start))
         self.var_end.set(fmt_hms_frac(end))
         self.btn_revert_time.state(["!disabled"] if seg.time_edited else ["disabled"])
+        # 確認済みの区間で押しても意味がない(それ以外は押せる。まだ直して
+        # いない区間でも「聴いてこの時刻で合っている」と言えるため)
+        done = seg.time_edited and seg.time_reviewed
+        self.btn_confirm_time.state(["disabled"] if done else ["!disabled"])
 
     def _commit_time(self, which: str, explicit: bool = False) -> None:
         """入力欄の値を区間に反映する。読めない値は元に戻して知らせる。"""
@@ -944,20 +956,78 @@ class AssignWindow(tk.Toplevel):
             self._show_times()
             return
 
-        seg.start, seg.end = start, end
-        seg.time_edited = True          # 以後この区間にずれ補正を足さない
-        seg.time_reviewed = True        # 人が画面で決めた時刻(機械の推定と区別する)
-        self._dirty = True
-        self._show_times()
-        self._update_seginfo()
-        self._update_row(seg.index)
-        self._draw_timeline()
+        self._write_times(seg, start, end, reviewed=True)
         self._set_action(
             f"区間 {seg.index + 1} の時刻を {fmt_hms_frac(seg.start)} → "
             f"{fmt_hms_frac(seg.end)} にしました。"
         )
         if self.var_autoplay.get():
             self.play_current()
+
+    def _write_times(self, seg: Segment, start: float, end: float, *,
+                     reviewed: bool) -> None:
+        """区間に時刻を書く、ただ 1 つの経路。
+
+        画面で直したときも、点検の提案を当てたときも必ずここを通す。
+        経路を分けると、どちらかで ✎/✎△ の意味が食い違っても気づけない。
+
+        reviewed: その時刻を人が耳で確かめたか。画面で決めた時刻は True、
+        点検の提案をまとめて当てただけなら False(✎△ のまま残す)。
+        """
+        seg.start, seg.end = start, end
+        seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = reviewed
+        self._dirty = True
+        if seg.index == self.current:
+            self._show_times()
+            self._update_seginfo()
+        self._update_row(seg.index)
+        self._draw_timeline()
+
+    def confirm_time(self) -> None:
+        """いま出ている時刻を「自分の耳で確かめた」ものとして確定する。
+
+        点検が当てただけの時刻(✎△)を ✎ に上げるための操作。時刻の値は
+        変えない(合っているから押している)。再生と組み合わせて
+        「聴く → 合っていればキー一発」で流せるようにしてある。
+        """
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        if seg.time_edited and seg.time_reviewed:
+            self._set_action("この区間の時刻はすでに確認済みです。")
+            return
+        start, end = audio_span(seg, self.proj.time_offset)
+        self._write_times(seg, start, end, reviewed=True)
+        self._set_action(
+            f"区間 {seg.index + 1} の時刻を確認済みにしました"
+            f"(✎ {fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)})。"
+        )
+
+    def apply_proposal(self, proposal: Proposal, *, reviewed: bool) -> bool:
+        """点検の提案を 1 件当てる。当てられなければ False を返す。
+
+        書き込みは画面の時刻編集と同じ _write_times を通す。隣の区間と
+        重なる提案は接点で切り詰める(1 件ずつ承認しても、まとめて適用しても
+        重ならないようにするため)。
+        """
+        seg = target_segment(self.proj, proposal)
+        if seg is None:
+            return False
+        start = float(proposal.payload.get("start", seg.start))
+        end = float(proposal.payload.get("end", seg.end))
+
+        i = seg.index
+        prev_end = (audio_span(self.proj.segments[i - 1], self.proj.time_offset)[1]
+                    if i > 0 else None)
+        next_start = (audio_span(self.proj.segments[i + 1], self.proj.time_offset)[0]
+                      if i + 1 < len(self.proj.segments) else None)
+        clipped = clip_to_neighbours(start, end, prev_end, next_start)
+        if clipped is None:
+            return False            # 切り詰めると潰れる。当てないほうがいい
+        start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+        self._write_times(seg, start, end, reviewed=reviewed)
+        return True
 
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
