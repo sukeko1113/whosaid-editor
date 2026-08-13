@@ -13,8 +13,10 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 import traceback
@@ -23,8 +25,19 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
+from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
 from .audio import extract_peaks
-from .inspection import Proposal, clip_to_neighbours, target_segment
+from .config import load_config
+from .inspection import (
+    Proposal,
+    clip_to_neighbours,
+    inspect_times,
+    load_proposals,
+    merge_history,
+    proposals_path,
+    save_proposals,
+    target_segment,
+)
 from .player import SegmentPlayer
 from .segments import (
     MIN_SEGMENT_SECONDS,
@@ -272,6 +285,11 @@ class AssignWindow(tk.Toplevel):
         self._undo: list[list[tuple[int, Optional[str], bool]]] = []
         self._dirty = False
         self._audio_declined = False
+        # 点検(実測用の転写)は重いので別スレッドで回す。知らせは queue 経由で
+        # 受ける(tkinter は本体スレッドからしか触れない)。
+        self._inspect_thread: Optional[threading.Thread] = None
+        self._inspect_cancel = threading.Event()
+        self._inspect_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -510,6 +528,9 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
             .pack(side="left")
+        self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
+                                      command=self.run_inspection)
+        self.btn_inspect.pack(side="left", padx=6)
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
@@ -1635,7 +1656,199 @@ class AssignWindow(tk.Toplevel):
         if messagebox.askyesno("出力完了", f"{out}\n\nファイルを開きますか?", parent=self):
             _open_path(out)
 
+    # ==================================================================
+    # 時刻の点検(実測と突き合わせて提案を出す)
+    # ==================================================================
+    def run_inspection(self) -> None:
+        """点検を始める。実測用の転写は重いので別スレッドで回す。
+
+        音声を外へ送らない。ここは最初から最後までこの PC の中で終わる。
+        """
+        if self._inspect_thread and self._inspect_thread.is_alive():
+            self._cancel_inspection()
+            return
+        if not self.proj.segments:
+            return
+        self._commit_text()
+
+        audio = Path(self.proj.audio_path)
+        if not audio.exists() and not self._relocate_audio():
+            return
+        audio = Path(self.proj.audio_path)
+
+        cfg = load_config()
+        self._inspect_cancel.clear()
+        self.btn_inspect.configure(text="点検を中止")
+        self._set_action("実測用の転写を始めます(この PC の中だけで処理します)...")
+        self._inspect_thread = threading.Thread(
+            target=self._inspect_worker,
+            args=(audio, self._work_dir(),
+                  str(cfg.get("align_model") or DEFAULT_MODEL),
+                  cfg.get("align_model_dir") or None),
+            daemon=True,
+        )
+        self._inspect_thread.start()
+        self.after(200, self._drain_inspect)
+
+    def _work_dir(self) -> Path:
+        """作業ディレクトリ(.work_<音声名>)。パイプラインと同じ置き方にする。"""
+        base = Path(self.proj.json_path or self.proj.audio_path).parent
+        return base / f".work_{Path(self.proj.audio_path).stem}"
+
+    def _cancel_inspection(self) -> None:
+        self._inspect_cancel.set()
+        self._set_action("点検の中止を伝えました。区切りのいい所で止まります。")
+
+    def _inspect_worker(self, audio: Path, work_dir: Path,
+                        model: str, model_dir) -> None:
+        """別スレッド。重い転写だけをここで済ませ、結果を本体へ渡す。
+
+        照合と提案づくりは本体側でやる(0.2 秒ほどで終わるうえ、区間を
+        読むので、作業中のデータを別スレッドから触らずに済む)。
+        """
+        def post(kind: str, data) -> None:
+            self._inspect_queue.put((kind, data))
+
+        try:
+            words = transcribe_words(
+                audio, work_dir=work_dir, model=model, model_dir=model_dir,
+                on_log=lambda m: post("log", m),
+                on_progress=lambda a, b: post("progress", (a, b)),
+                is_cancelled=self._inspect_cancel.is_set,
+            )
+        except AlignUnavailable as e:
+            post("unavailable", str(e))
+            return
+        except Exception:
+            post("fatal", traceback.format_exc())
+            return
+        post("cancelled" if words is None else "words", words)
+
+    def _drain_inspect(self) -> None:
+        """別スレッドからの知らせを本体で受ける(tkinter は本体からしか触れない)。"""
+        running = True
+        try:
+            while True:
+                kind, data = self._inspect_queue.get_nowait()
+                if kind == "log":
+                    self._set_action(str(data))
+                elif kind == "progress":
+                    done, total = data
+                    if total:
+                        self._set_action(
+                            f"実測用の転写 {done / total:.0%} "
+                            f"({fmt_hms(done)} / {fmt_hms(total)})...")
+                elif kind == "words":
+                    running = False
+                    self._finish_inspection(data)
+                elif kind == "cancelled":
+                    running = False
+                    self._end_inspection("点検を中止しました。")
+                elif kind == "unavailable":
+                    running = False
+                    self._end_inspection("点検を始められませんでした。")
+                    messagebox.showinfo("点検を始められません", str(data), parent=self)
+                elif kind == "fatal":
+                    running = False
+                    self._end_inspection("点検が失敗しました。")
+                    messagebox.showerror("点検エラー", str(data), parent=self)
+        except queue.Empty:
+            pass
+        except tk.TclError:
+            return              # 画面が閉じられた
+        if running:
+            self.after(200, self._drain_inspect)
+
+    def _end_inspection(self, message: str) -> None:
+        self.btn_inspect.configure(text="時刻を点検...")
+        self._set_action(message)
+
+    def _finish_inspection(self, words) -> None:
+        """実測が揃った。照合して提案を作り、一覧を出す。"""
+        result = inspect_times(self.proj, words)
+        path = proposals_path(self._work_dir(), self.proj.audio_fingerprint)
+        fresh = merge_history(result.proposals, load_proposals(path))
+
+        summary = (f"{result.checked} 区間を点検: 提案 {len(fresh)} 件"
+                   f"(確認済み {result.reviewed} / 照合できず {result.unmatched} / "
+                   f"根拠が弱い {result.low_coverage} / ずれ小 {result.close_enough})")
+        self._end_inspection(summary)
+        if not fresh:
+            messagebox.showinfo(
+                "点検が終わりました",
+                summary + "\n\n直したほうがよさそうな区間は見つかりませんでした。",
+                parent=self,
+            )
+            return
+        self._open_proposals(fresh, path)
+
+    def _proposal_rows(self, proposals) -> list[ProposalRow]:
+        """提案を一覧の行にする。ここでしか画面用の言い回しを作らない。"""
+        rows: list[ProposalRow] = []
+        for p in proposals:
+            seg = target_segment(self.proj, p)
+            if seg is None:
+                continue
+            now_start, _ = audio_span(seg, self.proj.time_offset)
+            new_start = float(p.payload.get("start", now_start))
+            rows.append(ProposalRow(
+                key=p.id,
+                kind="時刻",
+                target=f"区間 {seg.index + 1}",
+                now=fmt_hms_frac(now_start),
+                measured=fmt_hms_frac(new_start),
+                delta=f"{new_start - now_start:+.1f}秒",
+                evidence=p.evidence,
+                confidence=("高" if p.confidence >= 0.9
+                            else "中" if p.confidence >= 0.75 else "低"),
+                text=seg.preview(60),
+            ))
+        return rows
+
+    def decide_proposal(self, proposal: Proposal, decision: str) -> None:
+        """提案 1 件の始末をつける。
+
+        decision: "accept"(聴いて承認 → ✎) / "bulk"(まとめて適用 → ✎△)
+                  / "reject"(却下)
+        当てられなかった提案は却下として残す。次の点検で同じものを
+        出し直しても、また当てられないため。
+        """
+        if decision == "reject":
+            proposal.status = "rejected"
+            return
+        applied = self.apply_proposal(proposal, reviewed=(decision == "accept"))
+        proposal.status = "accepted" if applied else "rejected"
+
+    def _open_proposals(self, proposals, path: Optional[Path]) -> None:
+        by_id = {p.id: p for p in proposals}
+
+        def play(key: str) -> None:
+            seg = target_segment(self.proj, by_id[key])
+            if seg is not None:
+                self.goto(seg.index)
+                self.play_current(explicit=True)
+
+        def bulk(keys) -> None:
+            for key in keys:
+                self.decide_proposal(by_id[key], "bulk")
+            self._set_action(
+                f"{len(keys)} 件をまとめて当てました(✎△)。"
+                "聴いて確かめると ✎ になります。")
+
+        dlg = ProposalDialog(
+            self, self._proposal_rows(proposals),
+            on_play=play,
+            on_accept=lambda k: self.decide_proposal(by_id[k], "accept"),
+            on_bulk=bulk,
+            on_reject=lambda k: self.decide_proposal(by_id[k], "reject"),
+        )
+        self.wait_window(dlg)
+        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)
+        save_proposals(path, proposals)
+        self.update_status()
+
     def _on_close(self) -> None:
+        self._inspect_cancel.set()
         self._commit_text()
         if self._dirty and self.proj.json_path:
             try:

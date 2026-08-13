@@ -219,6 +219,31 @@ def test_measure_segments_does_not_go_backwards():
     assert abs(got[2].start - (20.0 - PAD)) < 1e-9     # 後ろの方に当たる
 
 
+def test_measure_segments_prefers_the_near_occurrence():
+    """同じ言い回しが窓の中に 2 つあるとき、近いほうを採る。
+
+    会議では「そうですね」「はい、わかりました」が何度も出る。difflib は
+    窓の中で最も手前の一致を選ぶので、近くを先に見ないと 20 秒前の同じ
+    言葉に当たり、ずれていない区間にずれた提案が出る。
+    """
+    phrase = "そうですねたしかに"
+    ws = evenly(phrase, 0.0, 0.5) + evenly("あいだのはつげんです", 8.0, 0.5) \
+        + evenly(phrase, 20.0, 0.5)
+    # 20 秒側の発言。窓を広く取ると 0 秒側にも届く
+    got = measure_segments([(phrase, 20.0, 24.5)], ws)
+    assert got[0] is not None
+    assert abs(got[0].start - (20.0 - PAD)) < 1e-9
+
+
+def test_measure_segments_still_finds_far_matches():
+    """近くに無ければ、ちゃんと広げて探す(近さを優先しすぎない)。"""
+    phrase = "ここにしかないはつげん"
+    ws = evenly(phrase, 40.0, 0.5)
+    got = measure_segments([(phrase, 20.0, 24.5)], ws)      # 20 秒ずれている
+    assert got[0] is not None
+    assert abs(got[0].start - (40.0 - PAD)) < 1e-9
+
+
 def test_measure_segments_without_words():
     spans, _ = _three_segments()
     assert measure_segments(spans, []) == [None, None, None]

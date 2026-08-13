@@ -42,6 +42,15 @@ PAD = 0.05
 # だったので、4 倍以上の余裕を取ってある(§12 のキャリブレーション対象)。
 WINDOW = 30.0
 
+# まず狭く探し、十分に当たらなければ WINDOW まで広げる。
+# 会議では同じ言い回しが何度も出る(「そうですね」「はい、わかりました」)。
+# difflib は窓の中で最も手前の一致を選ぶので、いきなり広く探すと
+# 30 秒前の同じ言葉に当たり、ずれていない区間にずれた提案を出してしまう。
+NEAR_WINDOW = 5.0
+
+# 狭い窓でこれだけ乗ったら、広げずにそれを採る。
+GOOD_ENOUGH = 0.8
+
 # 上の窓で見つからなかった区間だけ、もう一度広く探すときの幅。
 # 数が少ないので広げても安い。
 WIDE_WINDOW = 120.0
@@ -207,7 +216,9 @@ def measure_segments(
     words: Sequence[Word],
     *,
     window: float = WINDOW,
+    near_window: float = NEAR_WINDOW,
     wide_window: float = WIDE_WINDOW,
+    good_enough: float = GOOD_ENOUGH,
     min_block: int = MIN_BLOCK,
     pad: float = PAD,
 ) -> list[Optional[Measured]]:
@@ -215,6 +226,10 @@ def measure_segments(
 
     spans は (本文, いまの開始, いまの終了)。時刻は**実音声の時刻**で渡す
     こと(ずれ補正を足したあとの値)。
+
+    まず近く(near_window)を探し、十分に当たらなければ window まで広げる。
+    同じ言い回しが窓の中に何度も出てくるとき、difflib は最も手前の一致を
+    選ぶので、いきなり広く探すと手前の同じ言葉に当たってしまう。
 
     前から順に見て、次の区間は直前の区間が一致した位置より後ろから探す。
     同じ文言が前にもあるとき(「はい」「そうですね」)に前へ戻って当たるのを
@@ -232,14 +247,20 @@ def measure_segments(
         return results
 
     floor = 0.0            # ここより前は探さない(単調に進ませる)
+    steps = [w for w in (near_window, window) if w <= window] or [window]
     for i, (text, start, end) in enumerate(spans):
-        lo = max(floor, start - window)
-        got = measure(text, track, lo, end + window,
-                      min_block=min_block, pad=pad)
-        if got is not None:
-            results[i] = got
-            if got.coverage >= SWEEP_MIN_COVERAGE:
-                floor = max(floor, got.end - SWEEP_SLACK)
+        best: Optional[Measured] = None
+        for w in steps:
+            got = measure(text, track, max(floor, start - w), end + w,
+                          min_block=min_block, pad=pad)
+            if got is not None and (best is None or got.coverage > best.coverage):
+                best = got
+            if best is not None and best.coverage >= good_enough:
+                break       # 近くで十分に当たった。わざわざ広げない
+        if best is not None:
+            results[i] = best
+            if best.coverage >= SWEEP_MIN_COVERAGE:
+                floor = max(floor, best.end - SWEEP_SLACK)
 
     # 取りこぼしを広い窓で拾い直す。ここでは単調の制約を「前後の一致の間」
     # に限る(前後が決まっていれば、その間から出ることはない)。

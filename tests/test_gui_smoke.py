@@ -46,7 +46,15 @@ from src.assign_gui import (  # noqa: E402
     preview_length,
     time_edit_base,
 )
-from src.inspection import Proposal  # noqa: E402
+from src.align import Word as AlignWord  # noqa: E402
+from src.inspection import (  # noqa: E402
+    Proposal,
+    inspect_times,
+    load_proposals,
+    merge_history,
+    proposals_path,
+    save_proposals,
+)
 from src.segments import (  # noqa: E402
     Project,
     SPECIAL_UNKNOWN,
@@ -473,6 +481,100 @@ def run() -> int:
         win._goto_next_target()
         win.update()
         check("次の未確定へ移動", not proj.segments[win.current].speaker_id)
+
+        # --- 時刻の点検(画面から) ------------------------------------------
+        # 実測は偽の単語列を注入する(whisper もモデルも要らない)。
+        check("作業ディレクトリの置き方",
+              win._work_dir().name == ".work_meeting")
+
+        def fake_words(indexes, shift=0.0):
+            """その区間を実際に喋った、という単語列を作る。
+
+            本文が区間の長さいっぱいに広がるようにする(先頭だけに詰めると、
+            終了時刻が実測と大きく食い違い、全区間が提案対象になる)。
+            """
+            out = []
+            for i in indexes:
+                seg = proj.segments[i]
+                text = seg.text.replace("。", "")
+                per = seg.duration / len(text)
+                for n, ch in enumerate(text):
+                    at = seg.start + shift + n * per
+                    out.append(AlignWord(text=ch, start=at, end=at + per))
+            return out
+
+        # この見本は全区間が「これは N 番目の発言です。」でほぼ同じ本文なので、
+        # どの区間の単語列にも当たってしまう(実際の会議録では起きない形)。
+        # 点検を試す区間だけ、それらしく別々の本文にする。
+        spoken = [
+            "本日はお忙しい中お集まりいただきありがとうございます",
+            "それでは第一号議案について事務局から説明をお願いします",
+            "お手元の資料の三ページをご覧ください",
+            "前回の会議で出された意見を踏まえて修正しております",
+            "この点について何かご質問はございますでしょうか",
+            "特にないようですので次の議題に進みます",
+        ]
+        kept_text = [proj.segments[i].text for i in range(10, 16)]
+        for i, text in zip(range(10, 16), spoken):
+            proj.segments[i].text = text
+
+        # 実測はすべて正しい位置にある。ずれているのは本文側の時刻のほう
+        # (区間 12 の時刻だけが 5 秒早い)。実測をずらすと隣の発言と音声が
+        # 重なってしまい、実際には起こらない形になる。
+        words = fake_words(range(10, 16))
+        seg12 = proj.segments[12]
+        seg12.start, seg12.end = seg12.start - 5.0, seg12.end - 5.0
+        result = inspect_times(proj, words)
+        moved = [p for p in result.proposals
+                 if abs(p.target_orig_start - proj.segments[12].orig_start) < 1e-6]
+        check("ずれている区間だけ提案が出る", len(moved) == 1)
+        check("合っている区間には出ない", len(result.proposals) == 1)
+
+        rows = win._proposal_rows(result.proposals)
+        check("一覧の行ができる", len(rows) == 1)
+        check("対象は区間 13(1 始まり)", rows[0].target == "区間 13")
+        check("ずれの向きが出る", rows[0].delta.startswith("+"))
+        check("根拠が入る", "被覆" in rows[0].evidence)
+        check("信頼度が語で出る", rows[0].confidence in ("高", "中", "低"))
+
+        # まとめて適用 → ✎△、聴いて承認 → ✎
+        win.decide_proposal(moved[0], "bulk")
+        check("まとめて適用で実測の時刻が入る",
+              abs(seg12.start - seg12.orig_start) < 0.2)
+        check("まとめて適用は未確認", seg12.time_reviewed is False)
+        check("承認済みとして記録される", moved[0].status == "accepted")
+        win.decide_proposal(moved[0], "accept")
+        check("聴いて承認は確認済み", seg12.time_reviewed is True)
+
+        reject_me = Proposal(id="r1", type="time",
+                             target_orig_start=float(proj.segments[14].orig_start),
+                             payload={"start": 1.0, "end": 2.0},
+                             evidence="", confidence=0.5)
+        win.decide_proposal(reject_me, "reject")
+        check("却下は区間を変えない",
+              proj.segments[14].time_edited is False
+              and reject_me.status == "rejected")
+
+        lost = Proposal(id="r2", type="time", target_orig_start=88888.0,
+                        payload={"start": 1.0, "end": 2.0}, evidence="",
+                        confidence=0.5)
+        win.decide_proposal(lost, "accept")
+        check("当てられない提案は却下として残す", lost.status == "rejected")
+
+        # 却下した提案は次の点検で出し直さない(sidecar に判断が残る)
+        path = proposals_path(win._work_dir(), "ff00")
+        save_proposals(path, [reject_me])
+        again = inspect_times(proj, words)
+        check("判断済みは再提示しない",
+              merge_history(again.proposals, load_proposals(path)) == again.proposals
+              or reject_me.id not in [p.id for p in
+                                      merge_history(again.proposals,
+                                                    load_proposals(path))])
+        seg12.start, seg12.end = seg12.orig_start, seg12.orig_end   # 後片付け
+        seg12.time_edited = seg12.time_reviewed = False
+        for i, text in zip(range(10, 16), kept_text):
+            proj.segments[i].text = text
+        win.reload_tree()
 
         # --- 保存・再読込 ------------------------------------------------
         win.save()
