@@ -76,6 +76,12 @@ class Measured:
     matched: int            # 一致した文字数
     total: int              # 区間の文字数(正規化後)
     window: float           # どの幅の窓で見つけたか(根拠に出す)
+    # 本文の頭・末尾それぞれ何文字がアンカーに乗らなかったか。
+    # 開始は最初の一致から、終了は最後の一致から取るので、端が欠けている
+    # ほどその側の時刻は信用できない(実測: 末尾 3 字以上欠けた提案は
+    # 終了が外れ、2 字以下は全部当たりだった)。
+    head_gap: int = 0
+    tail_gap: int = 0
 
     @property
     def duration(self) -> float:
@@ -208,6 +214,8 @@ def measure(
         matched=matched,
         total=len(norm),
         window=t1 - t0,
+        head_gap=first.a,
+        tail_gap=len(norm) - (last.a + last.size),
     )
 
 

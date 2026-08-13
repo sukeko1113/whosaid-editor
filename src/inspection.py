@@ -37,8 +37,27 @@ from .segments import (
 # 被覆率がこれ未満なら提案しない。偶然の数文字一致から時刻を作らないための壁。
 MIN_COVERAGE = 0.60
 
-# 開始・終了のどちらかがこれ以上ずれていたら提案する。これ未満は誤差の範囲。
+# 一致した文字がこれより少ない提案は出さない。3〜4 文字の偶然一致は被覆率が
+# 100% になり得るので、被覆率では防げない。
+# 実会議の聴き取り(2026-08-13・15 件): 完全に外れた 2 件はどちらも一致 3 文字。
+MIN_MATCHED = 8
+
+# 開始がこれ以上ずれていたら提案する。これ未満は誤差の範囲。
+# 終了のずれでは提案しない。記録に出るのも頭出しに効くのも開始時刻で、
+# 終了は照合の中で最も精度が弱い(末尾の言い回しほど聞き取りが揺れる)。
 TIME_DELTA = 0.75
+
+# 本文の末尾がこれ以上アンカーに乗らなかったら、終了時刻を信用せず
+# いまの区間の長さを保つ。終了は「最後に一致した文字」から取るので、
+# 末尾が欠けると手前に出て発言の途中で切れる。
+# 実会議の聴き取り: 欠け 3 字以上の 2 件はどちらも終了が外れ、2 字以下は全部当たり。
+TAIL_GAP_LIMIT = 3
+
+# 提案どうしの実測範囲が、短いほうの半分を超えて重なっていたら「取り合い」。
+# 挨拶やお礼の応酬(「よろしくお願いします」の連発)では、複数の区間が同じ
+# 音声位置に当たる。正しいのは高々 1 つで、どれかは機械には決められない。
+# 実測(67 分会議): 3 区間が全く同じ時刻に当たった組があった。
+CONFLICT_OVERLAP = 0.5
 
 PROPOSAL_TIME = "time"
 
@@ -85,13 +104,21 @@ class InspectResult:
     reviewed: int = 0           # 人が耳で確定済み。機械は口を出さない
     unmatched: int = 0          # 照合できなかった
     low_coverage: int = 0       # 一致はしたが乗りが足りない
-    close_enough: int = 0       # ずれが小さいので出す必要がない
+    short_match: int = 0        # 一致した文字が少なすぎる(偶然かもしれない)
+    close_enough: int = 0       # 開始のずれが小さいので出す必要がない
+    conflicted: int = 0         # 他の提案と同じ音声位置を取り合った
     notes: list[str] = field(default_factory=list)
 
     @property
     def checked(self) -> int:
         return (len(self.proposals) + self.reviewed + self.unmatched
-                + self.low_coverage + self.close_enough)
+                + self.low_coverage + self.short_match + self.close_enough
+                + self.conflicted)
+
+    @property
+    def weak(self) -> int:
+        """根拠が弱くて出さなかった数(画面の内訳表示用)。"""
+        return self.low_coverage + self.short_match + self.conflicted
 
 
 def _proposal_id(kind: str, orig_start: float, start: float, end: float) -> str:
@@ -104,9 +131,12 @@ def _proposal_id(kind: str, orig_start: float, start: float, end: float) -> str:
     return hashlib.blake2b(seed.encode("utf-8"), digest_size=6).hexdigest()
 
 
-def _evidence(m: Measured, d_start: float, d_end: float) -> str:
-    return (f"一致 {m.matched}/{m.total} 文字(被覆 {m.coverage:.0%})・"
-            f"ずれ 開始 {d_start:+.1f} 秒 / 終了 {d_end:+.1f} 秒")
+def _evidence(m: Measured, d_start: float, d_end: float, keep_tail: bool) -> str:
+    base = (f"一致 {m.matched}/{m.total} 文字(被覆 {m.coverage:.0%})・"
+            f"ずれ 開始 {d_start:+.1f} 秒")
+    if keep_tail:
+        return base + "・終わりは測れず(いまの長さを保つ)"
+    return base + f" / 終了 {d_end:+.1f} 秒"
 
 
 def inspect_times(
@@ -114,7 +144,9 @@ def inspect_times(
     words: Sequence[Word],
     *,
     min_coverage: float = MIN_COVERAGE,
+    min_matched: int = MIN_MATCHED,
     time_delta: float = TIME_DELTA,
+    tail_gap_limit: int = TAIL_GAP_LIMIT,
     **anchor_kw: Any,
 ) -> InspectResult:
     """実測と突き合わせて、時刻の提案を作る(§3)。
@@ -155,23 +187,66 @@ def inspect_times(
                 )
             continue
 
+        if m.matched < min_matched:
+            result.short_match += 1
+            continue
+
         if m.coverage < min_coverage:
             result.low_coverage += 1
             continue
 
-        if abs(d_start) < time_delta and abs(d_end) < time_delta:
+        if abs(d_start) < time_delta:
             result.close_enough += 1
             continue
 
+        # 末尾が乗っていない区間の終了は信用せず、いまの長さを保って
+        # 開始だけ動かす(区間全体が同じ量ずれているのが典型的なドリフト)。
+        keep_tail = m.tail_gap >= tail_gap_limit
+        end = (m.start + (now_end - now_start)) if keep_tail else m.end
+
         result.proposals.append(Proposal(
-            id=_proposal_id(PROPOSAL_TIME, float(seg.orig_start), m.start, m.end),
+            id=_proposal_id(PROPOSAL_TIME, float(seg.orig_start), m.start, end),
             type=PROPOSAL_TIME,
             target_orig_start=float(seg.orig_start),
-            payload={"start": round(m.start, 2), "end": round(m.end, 2)},
-            evidence=_evidence(m, d_start, d_end),
+            payload={"start": round(m.start, 2), "end": round(end, 2)},
+            evidence=_evidence(m, d_start, d_end, keep_tail),
             confidence=m.coverage,
         ))
+
+    result.proposals, result.conflicted = drop_conflicts(result.proposals)
     return result
+
+
+def drop_conflicts(proposals: Sequence[Proposal],
+                   overlap_ratio: float = CONFLICT_OVERLAP,
+                   ) -> tuple[list[Proposal], int]:
+    """同じ音声位置を取り合う提案を、全部引っ込める。
+
+    実測の範囲が重なる提案どうしは、正しくても高々 1 つ。どれが正しいかを
+    機械が選ぶと、外れたときに間違った時刻が「実測」の顔をして残る。
+    全部引っ込めて、その区間は人の耳に任せる。
+
+    隣り合う発言が接しているだけ(重なりゼロか僅か)の組は正当なので残す。
+    判定は「短いほうの長さの半分を超えて重なるか」。
+    """
+    order = sorted(range(len(proposals)),
+                   key=lambda i: float(proposals[i].payload.get("start", 0.0)))
+    bad: set[int] = set()
+    for a_pos, i in enumerate(order):
+        s1 = float(proposals[i].payload["start"])
+        e1 = float(proposals[i].payload["end"])
+        for j in order[a_pos + 1:]:
+            s2 = float(proposals[j].payload["start"])
+            e2 = float(proposals[j].payload["end"])
+            if s2 >= e1:
+                break               # start 順なので、これ以降は重ならない
+            overlap = min(e1, e2) - s2
+            shorter = max(MIN_SEGMENT_SECONDS, min(e1 - s1, e2 - s2))
+            if overlap > overlap_ratio * shorter:
+                bad.add(i)
+                bad.add(j)
+    kept = [p for k, p in enumerate(proposals) if k not in bad]
+    return kept, len(bad)
 
 
 # ----------------------------------------------------------------------

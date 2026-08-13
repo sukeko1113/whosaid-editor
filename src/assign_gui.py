@@ -1779,7 +1779,7 @@ class AssignWindow(tk.Toplevel):
 
         summary = (f"{result.checked} 区間を点検: 提案 {len(fresh)} 件"
                    f"(確認済み {result.reviewed} / 照合できず {result.unmatched} / "
-                   f"根拠が弱い {result.low_coverage} / ずれ小 {result.close_enough})")
+                   f"根拠が弱い {result.weak} / ずれ小 {result.close_enough})")
         self._end_inspection(summary)
         if not fresh:
             messagebox.showinfo(

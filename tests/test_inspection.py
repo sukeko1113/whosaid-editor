@@ -24,6 +24,7 @@ from src.inspection import (                              # noqa: E402
     PROPOSAL_TIME,
     Proposal,
     clip_to_neighbours,
+    drop_conflicts,
     inspect_times,
     load_proposals,
     merge_history,
@@ -134,7 +135,109 @@ def test_low_coverage_is_not_proposed():
     proj.segments[0].text = "まったくちがうながいはつげんがここにあります"
     got = inspect_times(proj, measured_words())
     assert len(got.proposals) == 2
-    assert got.low_coverage + got.unmatched == 1
+    assert got.low_coverage + got.short_match + got.unmatched == 1
+
+
+def test_full_match_on_short_text_is_not_trusted():
+    """本文が短いと被覆率 100% でも根拠にならない。
+
+    実会議の聴き取りで完全に外れた 2 件は、どちらも一致 3 文字だった。
+    3 文字の本文が 3 文字一致すれば被覆率は 100% になる。被覆率では防げない。
+    """
+    proj = Project(audio_path="a.m4a", duration=60.0)
+    proj.segments = [Segment(index=0, start=6.8, end=9.8,
+                             text="はいそうです", cluster="0:A")]
+    got = inspect_times(proj, evenly("はいそうです", 0.0))
+    assert got.proposals == []
+    assert got.short_match == 1
+
+
+def test_end_only_drift_is_not_proposed():
+    """終了だけのずれでは提案しない。
+
+    記録に出るのも頭出しに効くのも開始時刻。終了は照合の中で最も精度が
+    弱い部分なので、終了のずれだけで人を呼び出さない。
+    """
+    proj = project()
+    for seg in proj.segments:
+        seg.end += 3.0
+    got = inspect_times(proj, measured_words())
+    assert got.proposals == []
+    assert got.close_enough == 3
+
+
+def test_unheard_tail_keeps_current_duration():
+    """末尾が聞き取れていない区間は、終了を動かさずいまの長さを保つ。
+
+    終了は「最後に一致した文字」から取るので、末尾が欠けると手前に出て
+    発言の途中で切れる(聴き取りで確認: 欠け 3 字以上は終了が外れる)。
+    """
+    heard = "あきのてんきはとてもすごしやすい"       # 16 字は実測にある
+    proj = Project(audio_path="a.m4a", duration=60.0)
+    proj.segments = [Segment(index=0, start=6.8, end=16.8,
+                             text=heard + "ですよね", cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 0.0))
+    assert len(got.proposals) == 1
+    p = got.proposals[0]
+    assert abs(p.payload["start"] - 0.0) < 0.1          # 開始は実測に直す
+    duration = p.payload["end"] - p.payload["start"]
+    assert abs(duration - 10.0) < 0.1                   # 長さは変えない
+    assert "終わりは測れず" in p.evidence
+
+
+def _prop(pid: str, start: float, end: float) -> Proposal:
+    return Proposal(id=pid, type=PROPOSAL_TIME, target_orig_start=0.0,
+                    payload={"start": start, "end": end},
+                    evidence="", confidence=1.0)
+
+
+def test_conflicting_proposals_are_all_dropped():
+    """同じ音声位置を取り合う提案は、どれも出さない。
+
+    挨拶の応酬では複数の区間が同じ実測位置に当たる(実測: 3 区間が全く同じ
+    時刻に当たった)。正しいのは高々 1 つで、どれかは機械には決められない。
+    """
+    same = [_prop("a", 10.0, 12.0), _prop("b", 10.0, 12.0), _prop("c", 10.1, 12.0)]
+    kept, dropped = drop_conflicts(same)
+    assert kept == [] and dropped == 3
+
+
+def test_adjacent_proposals_are_not_conflicts():
+    """接しているだけ(隣り合う発言)の提案は正当。引っ込めない。"""
+    row = [_prop("a", 10.0, 12.0), _prop("b", 12.0, 15.0), _prop("c", 15.1, 16.0)]
+    kept, dropped = drop_conflicts(row)
+    assert len(kept) == 3 and dropped == 0
+    # 余白ぶんの僅かな食い込み(半分未満)も正当なまま
+    graze = [_prop("a", 10.0, 12.1), _prop("b", 12.0, 15.0)]
+    kept, dropped = drop_conflicts(graze)
+    assert len(kept) == 2 and dropped == 0
+
+
+def test_conflict_drop_is_counted():
+    """取り合いは実際に起き、引っ込めた数は内訳に出る。
+
+    一致した範囲が単調掃引の戻り幅(1 秒)より短いと、次の区間の走査が
+    同じ場所まで戻れてしまい、同じ音声を 2 区間が取り合う。早口の挨拶
+    (1 秒未満)が該当する。実測でも 3 区間が全く同じ時刻に当たった。
+    """
+    heard = "よろしくおねがいいたします"
+    proj = Project(audio_path="a.m4a", duration=60.0)
+    proj.segments = [
+        Segment(index=0, start=27.0, end=28.0, text=heard, cluster="0:A"),
+        Segment(index=1, start=45.0, end=46.0, text=heard, cluster="0:B"),
+    ]
+    # 実測には 30.0 秒に 1 回だけ、0.8 秒で早口に言った挨拶がある
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.06))
+    assert got.proposals == []
+    assert got.conflicted == 2
+
+
+def test_heard_tail_uses_measured_end():
+    """末尾まで乗っていれば、終了も実測で直す(従来どおり)。"""
+    got = inspect_times(project(drift=6.8), measured_words())
+    p = got.proposals[0]
+    assert "終わりは測れず" not in p.evidence
+    assert abs(p.payload["end"] - 4.55) < 0.2       # 実測の終了(4.5 + 余白)
 
 
 def test_unmatched_segments_are_counted():

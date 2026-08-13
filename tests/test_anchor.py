@@ -149,6 +149,16 @@ def test_measure_reports_partial_coverage():
     assert 0.6 < got.coverage < 0.7
     # 始まりは「一致した最初の文字」から取る(フィラーの分は含まない)
     assert abs(got.start - (0.0 - PAD)) < 1e-9 or got.start == 0.0
+    # 頭の 6 文字(えーとあのー)が乗らなかった、と分かる
+    assert got.head_gap == 6 and got.tail_gap == 0
+
+
+def test_measure_reports_tail_gap():
+    """末尾が聞き取れていないことも分かる(終了時刻の信用判断に使う)。"""
+    track = prepare(evenly("それでは議事に入ります", 0.0, 0.5))
+    got = measure("それでは議事に入りますけれども", track, 0.0, 100.0)
+    assert got is not None
+    assert got.head_gap == 0 and got.tail_gap == 4
 
 
 def test_measure_outside_the_window_is_unmatched():
