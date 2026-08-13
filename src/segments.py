@@ -42,6 +42,19 @@ PSEUDO_MULTI = "*"
 MIN_SEGMENT_SECONDS = 0.1
 
 
+def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
+    """その区間が実音声のどこで鳴っているか(開始, 終了)。
+
+    再生の規約: 実音声の位置 = 保存時刻 + ずれ補正。ただし一度直した区間の
+    start/end は実音声の時刻そのものなので、補正を足さない。
+    画面の再生・時刻編集の初期値・自動点検の照合窓が、すべてこの 1 つの
+    規約を見るようにしてある(散らばると必ず食い違う)。
+    """
+    if seg.time_edited:
+        return seg.start, seg.end
+    return max(0.0, seg.start + time_offset), max(0.0, seg.end + time_offset)
+
+
 def fmt_hms(seconds: float) -> str:
     """秒 → [HH:MM:SS] 用の 'HH:MM:SS' 文字列"""
     total = int(round(seconds))

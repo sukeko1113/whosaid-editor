@@ -33,6 +33,7 @@ from .segments import (
     SPECIAL_UNKNOWN,
     Segment,
     Speaker,
+    audio_span,
     fmt_hms,
     fmt_hms_frac,
     parse_hms,
@@ -77,11 +78,9 @@ def time_edit_base(seg: Segment, time_offset: float) -> tuple[float, float]:
 
     まだ直していない区間は、いま「ずれ補正込みで聴こえている位置」を初期値に
     する。そのまま確定すれば、聴こえたとおりの時刻がその区間に固定される。
-    一度直した区間の start/end は実音声の時刻そのものなので、補正を足さない。
+    規約そのものは segments.audio_span に置いてある(再生・点検と同じ値を使う)。
     """
-    if seg.time_edited:
-        return seg.start, seg.end
-    return max(0.0, seg.start + time_offset), max(0.0, seg.end + time_offset)
+    return audio_span(seg, time_offset)
 
 
 def clamp_times(

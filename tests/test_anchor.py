@@ -245,6 +245,21 @@ def test_measure_segments_flags_a_lucky_short_match():
     assert got[1].coverage < 0.4        # 13 文字中 4 文字しか乗っていない
 
 
+def test_a_lucky_short_match_does_not_block_the_rest():
+    """数文字しか当たっていない区間で掃引位置を進めない。
+
+    進めてしまうと、後ろの区間が軒並み範囲外になり、1 件の誤マッチで
+    ファイル全体の照合が壊れる。
+    """
+    spans, ws = _three_segments()
+    # この区間は 3 つ目の「まったく」に当たる(実測ではずっと後ろ)
+    spans.insert(1, ("まったくちがうはつげんです", 4.6, 5.9))
+    got = measure_segments(spans, ws)
+    assert got[2] is not None and got[3] is not None, "後ろの区間が巻き添えになった"
+    assert abs(got[2].start - (6.0 - PAD)) < 1e-9
+    assert abs(got[3].start - (12.0 - PAD)) < 1e-9
+
+
 # ======================================================================
 # 実物の単語列で照合する
 # ======================================================================

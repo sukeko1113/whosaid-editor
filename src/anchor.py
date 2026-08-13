@@ -50,6 +50,12 @@ WIDE_WINDOW = 120.0
 # 直前の一致の終わりから少しだけ戻ることは許す。
 SWEEP_SLACK = 1.0
 
+# これだけ乗った一致でなければ、掃引位置を進めない。
+# 偶然 3〜4 文字だけ当たった区間で先へ進んでしまうと、その後ろの区間が
+# まとめて範囲外になり、1 件の誤マッチがファイル全体を壊す。
+# 進めないだけで、その区間の測定結果自体は返す(呼び出し側が被覆率で弾く)。
+SWEEP_MIN_COVERAGE = 0.5
+
 
 @dataclass
 class Measured:
@@ -214,6 +220,8 @@ def measure_segments(
     同じ文言が前にもあるとき(「はい」「そうですね」)に前へ戻って当たるのを
     防ぐ。ここで弾かれるのは時刻が前後する一致なので、設計書 §3.1 の
     時刻単調性フィルタと同じ役目を、窓を切る側でまとめて果たしている。
+    ただし掃引位置を進めるのは、十分に乗った一致だけ(SWEEP_MIN_COVERAGE)。
+    数文字しか当たっていない区間で先へ進むと、その後ろが軒並み範囲外になる。
 
     1 度目で見つからなかった区間だけ、広い窓でもう一度探す。数が少ないので
     広げても安く、ドリフトが大きい帯を取りこぼさずに済む。
@@ -230,7 +238,8 @@ def measure_segments(
                       min_block=min_block, pad=pad)
         if got is not None:
             results[i] = got
-            floor = max(floor, got.end - SWEEP_SLACK)
+            if got.coverage >= SWEEP_MIN_COVERAGE:
+                floor = max(floor, got.end - SWEEP_SLACK)
 
     # 取りこぼしを広い窓で拾い直す。ここでは単調の制約を「前後の一致の間」
     # に限る(前後が決まっていれば、その間から出ることはない)。
