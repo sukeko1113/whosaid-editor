@@ -338,6 +338,41 @@ def run() -> int:
               all(proj.segments[i].end <= proj.segments[i + 1].start + 1e-6
                   for i in (16, 17, 18)))
 
+        # --- 一括適用をまとめて元に戻す -------------------------------------
+        check("一括適用の直後は取り消せる",
+              "disabled" not in win.btn_undo_bulk.state())
+        win.undo_bulk_times()
+        check("全件が適用前の時刻に戻る",
+              all(abs(proj.segments[i].start - proj.segments[i].orig_start) < 1e-6
+                  for i in (16, 17, 18, 19)))
+        check("印も適用前に戻る",
+              all(not proj.segments[i].time_edited
+                  and not proj.segments[i].time_reviewed
+                  for i in (16, 17, 18, 19)))
+        check("二度は取り消せない",
+              "disabled" in win.btn_undo_bulk.state())
+        # 分割・結合で並びが変わったら、index で戻すのは危ないので拒む
+        win.apply_proposals_bulk(band)
+        total_before = len(proj.segments)
+        proj.split_segment(30, proj.segments[30].start + 2.0, 3)
+        real_ask2 = assign_gui.messagebox.showinfo
+        told: list = []
+        assign_gui.messagebox.showinfo = lambda *a, **k: told.append(a)
+        try:
+            win.undo_bulk_times()
+        finally:
+            assign_gui.messagebox.showinfo = real_ask2
+        check("並びが変わったら取り消さずに知らせる",
+              bool(told) and abs(proj.segments[16].start
+                                 - (proj.segments[16].orig_start + 7.0)) < 1e-6)
+        proj.merge_segments(30)                             # 後片付け
+        check("区間の数が戻る", len(proj.segments) == total_before)
+        s30 = proj.segments[30]                 # 結合は time_edited を立てる
+        s30.start, s30.end = float(s30.orig_start), float(s30.orig_end)
+        s30.time_edited = s30.time_reviewed = False
+        win.reload_tree()
+        # band(区間 16〜19)は +7 秒のまま次の検査へ渡す
+
         # 人が耳で確定した区間には、まとめて適用でも触れない
         seg16 = proj.segments[16]
         seg16.time_reviewed = True

@@ -311,6 +311,9 @@ class AssignWindow(tk.Toplevel):
         self._inspect_thread: Optional[threading.Thread] = None
         self._inspect_cancel = threading.Event()
         self._inspect_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
+        # 直前の「まとめて適用」を丸ごと戻すための控え(時刻専用。話者の
+        # _undo とは別系統 — あちらは時刻を持たない)
+        self._time_undo: Optional[dict] = None
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -552,6 +555,12 @@ class AssignWindow(tk.Toplevel):
         self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
                                       command=self.run_inspection)
         self.btn_inspect.pack(side="left", padx=6)
+        # 一括適用は百件級になりうる。Ctrl+Z は話者専用、[元に戻す]は
+        # 区間 1 つずつなので、まとめて戻す手段を別に置く
+        self.btn_undo_bulk = ttk.Button(bottom, text="一括適用を取り消す",
+                                        command=self.undo_bulk_times,
+                                        state="disabled")
+        self.btn_undo_bulk.pack(side="left")
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
 
@@ -1149,8 +1158,17 @@ class AssignWindow(tk.Toplevel):
         """提案をまとめて当てる(すべて ✎△。人の耳の確認は後から)。
 
         戻り値: (当てられた提案, 当てられなかった提案)。status もここで更新する。
+        当てる前の時刻を控えておき、まとめて元に戻せるようにする。
         """
         planned, failed = self.plan_proposals(proposals)
+        if planned:
+            # 当てる前の状態を控える。百件を 1 件ずつ戻すのは現実的でない
+            self._time_undo = {
+                "total": len(self.proj.segments),
+                "items": [(seg.index, seg.start, seg.end,
+                           seg.time_edited, seg.time_reviewed)
+                          for seg, _s, _e, _p in planned],
+            }
         for seg, start, end, p in planned:
             self._write_times(seg, start, end, reviewed=False, refresh=False)
             p.status = "accepted"
@@ -1158,7 +1176,47 @@ class AssignWindow(tk.Toplevel):
             self.reload_tree()
             self._show_times()
             self._update_seginfo()
+            self._sync_time_undo_button()
         return [p for _, _, _, p in planned], failed
+
+    def undo_bulk_times(self) -> None:
+        """直前の「まとめて適用」を丸ごと元に戻す。
+
+        Ctrl+Z は話者専用(スナップショットに時刻を持たない)、[元に戻す]は
+        区間 1 つずつなので、百件級の一括適用を戻す手段が別に要る。
+        """
+        snap = self._time_undo
+        if not snap:
+            self._set_action("取り消せる一括適用がありません。")
+            return
+        if snap["total"] != len(self.proj.segments):
+            # 分割・結合で区間の並びが変わっている。index で戻すと別の区間を
+            # 壊すので、戻さずに知らせる
+            self._time_undo = None
+            self._sync_time_undo_button()
+            messagebox.showinfo(
+                "取り消せません",
+                "一括適用のあとで区間を分割または結合したため、"
+                "まとめて元に戻すことはできません。\n"
+                "区間ごとの[元に戻す]をお使いください。",
+                parent=self,
+            )
+            return
+        for index, start, end, edited, reviewed in snap["items"]:
+            seg = self.proj.segments[index]
+            seg.start, seg.end = start, end
+            seg.time_edited, seg.time_reviewed = edited, reviewed
+        self._dirty = True
+        self._time_undo = None
+        self.reload_tree()
+        self._show_times()
+        self._update_seginfo()
+        self._sync_time_undo_button()
+        self._set_action(f"{len(snap['items'])} 区間の一括適用を元に戻しました。")
+
+    def _sync_time_undo_button(self) -> None:
+        state = ["!disabled"] if self._time_undo else ["disabled"]
+        self.btn_undo_bulk.state(state)
 
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
