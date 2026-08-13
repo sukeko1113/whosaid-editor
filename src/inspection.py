@@ -98,12 +98,17 @@ class Proposal:
     evidence: str               # なぜそう言えるのか(画面にそのまま出す)
     confidence: float           # 0〜1。被覆率をそのまま使う
     status: str = "pending"     # pending / accepted / rejected
+    # 提案を作った時点での、対象区間のいまの開始(実音声の時刻)。
+    # orig_start だけでは分割兄弟(親の orig を共有する)を区別できないため、
+    # 兄弟が複数いるときはこれに最も近い区間へ当てる。古い保存分には無い。
+    target_now: Optional[float] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "Proposal":
+        now = d.get("target_now")
         return cls(
             id=str(d.get("id", "")),
             type=str(d.get("type", PROPOSAL_TIME)),
@@ -112,6 +117,7 @@ class Proposal:
             evidence=str(d.get("evidence", "")),
             confidence=float(d.get("confidence", 0.0)),
             status=str(d.get("status", "pending")),
+            target_now=float(now) if now is not None else None,
         )
 
 
@@ -282,6 +288,7 @@ def inspect_times(
             payload={"start": round(pad_start, 2), "end": round(pad_end, 2)},
             evidence=_evidence(m, d_start, d_end, keep_tail, head_comp),
             confidence=m.coverage,
+            target_now=round(now_start, 2),
         ))
         raw_spans.append((start, start + (now_end - now_start) if keep_tail
                           else m.end))
@@ -350,17 +357,31 @@ def clip_to_neighbours(start: float, end: float,
     return start, end
 
 
+# 分割兄弟の中から対象を選ぶとき、提案時の位置からこれ以上離れた区間には
+# 当てない。構造(分割のし直し等)が変わった提案は失効させるほうが安全。
+TARGET_TOLERANCE = 5.0
+
+
 def target_segment(proj: Project, proposal: Proposal) -> Optional[Segment]:
     """提案が指している区間を返す。分割で index が変わっても見失わない。
 
-    同じ orig_start を持つ区間が複数あるのは、その区間を分割した兄弟。
-    そのときは先頭(前側)を対象にする。
+    同じ orig_start を持つ区間が複数あるのは、その区間を分割した兄弟か
+    重複区間。orig_start だけでは区別できないので、提案を作った時点の
+    位置(target_now)に最も近いものへ当てる。先頭(前側)へ倒すのは、
+    target_now を持たない古い提案の後方互換だけ。
     """
     same = [s for s in proj.segments
             if abs(float(s.orig_start) - proposal.target_orig_start) < 1e-6]
     if not same:
         return None
-    return min(same, key=lambda s: (s.start, s.index))
+    if proposal.target_now is None or len(same) == 1:
+        return min(same, key=lambda s: (s.start, s.index))
+
+    def dist(s: Segment) -> float:
+        return abs(audio_span(s, proj.time_offset)[0] - proposal.target_now)
+
+    best = min(same, key=dist)
+    return best if dist(best) <= TARGET_TOLERANCE else None
 
 
 # ----------------------------------------------------------------------

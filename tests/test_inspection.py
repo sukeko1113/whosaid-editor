@@ -396,7 +396,8 @@ def test_clip_refuses_to_make_a_crushed_segment():
     assert ok is not None
 
 
-def test_target_segment_prefers_the_front_of_a_split_family():
+def test_target_segment_prefers_the_front_without_target_now():
+    """target_now を持たない古い提案は、後方互換で前側に倒す。"""
     proj = project()
     proj.split_segment(1, proj.segments[1].start + 2.0, 3)
     p = Proposal(id="x", type=PROPOSAL_TIME,
@@ -404,6 +405,59 @@ def test_target_segment_prefers_the_front_of_a_split_family():
                  payload={}, evidence="", confidence=1.0)
     found = target_segment(proj, p)
     assert found is not None and found.index == 1       # 分割した前側
+
+
+def test_target_segment_resolves_split_siblings_by_position():
+    """分割兄弟は orig_start を共有する。位置で正しい側に当てる。
+
+    前側優先のままだと、後側(tail)への提案が前側(head)に適用され、
+    head が自分の実測で直った後に tail の実測で上書きされる。
+    """
+    proj = project()
+    head_start = proj.segments[1].start                 # 6.0
+    proj.split_segment(1, head_start + 2.0, 3)          # head 6-8 / tail 8-10.5
+    orig = float(proj.segments[1].orig_start)
+
+    for_tail = Proposal(id="t", type=PROPOSAL_TIME, target_orig_start=orig,
+                        payload={}, evidence="", confidence=1.0,
+                        target_now=8.0)
+    found = target_segment(proj, for_tail)
+    assert found is not None and found.index == 2       # 後側に当たる
+
+    for_head = Proposal(id="h", type=PROPOSAL_TIME, target_orig_start=orig,
+                        payload={}, evidence="", confidence=1.0,
+                        target_now=6.0)
+    found = target_segment(proj, for_head)
+    assert found is not None and found.index == 1       # 前側に当たる
+
+
+def test_target_segment_expires_when_structure_changed():
+    """兄弟のどれからも遠い提案(分割し直しなどで構造が変わった)は失効。"""
+    proj = project()
+    proj.split_segment(1, proj.segments[1].start + 2.0, 3)
+    stale = Proposal(id="s", type=PROPOSAL_TIME,
+                     target_orig_start=float(proj.segments[1].orig_start),
+                     payload={}, evidence="", confidence=1.0,
+                     target_now=200.0)                  # どの兄弟からも遠い
+    assert target_segment(proj, stale) is None
+
+
+def test_proposals_carry_their_generation_position():
+    """inspect_times の提案は、作った時点の位置(target_now)を持つ。"""
+    proj = project(drift=6.8)
+    got = inspect_times(proj, measured_words())
+    for p, seg in zip(got.proposals, proj.segments):
+        assert p.target_now is not None
+        assert abs(p.target_now - seg.start) < 0.05
+
+
+def test_target_now_survives_the_sidecar():
+    got = inspect_times(project(drift=6.8), measured_words())
+    with tempfile.TemporaryDirectory() as d:
+        path = proposals_path(d, "ff00")
+        save_proposals(path, got.proposals)
+        again = load_proposals(path)
+    assert [p.target_now for p in again] == [p.target_now for p in got.proposals]
 
 
 def test_target_segment_missing_returns_none():
