@@ -44,6 +44,7 @@ from src.assign_gui import (  # noqa: E402
     shift_span,
     playback_window,
     preview_length,
+    tail_window,
     time_edit_base,
 )
 from src.align import Word as AlignWord  # noqa: E402
@@ -207,6 +208,17 @@ def run() -> int:
         check("確認済みは ✎ で、✎△ にはしない",
               win.tree.item("s3", "values")[0].startswith("✎ "))
         check("区間ヘッダにも確認済みと出る", "✎時刻を修正済み" in win.var_seginfo.get())
+
+        # 終了を直したら、頭からではなく終わりだけを鳴らす(長い区間で待たない)
+        lo, hi = tail_window(seg3, proj.time_offset)
+        check("終わりの再生は終了時刻で終わる", abs(hi - seg3.end) < 1e-6)
+        check("終わりの再生は 3 秒", abs((hi - lo) - 3.0) < 1e-6)
+        short = Segment(index=0, start=10.0, end=11.2, text="はい。", cluster="0:A")
+        s_lo, s_hi = tail_window(short, 0.0)
+        check("短い区間は区間の長さまで", abs((s_hi - s_lo) - 1.2) < 1e-6)
+        off = Segment(index=0, start=10.0, end=30.0, text="あ", cluster="0:A")
+        o_lo, o_hi = tail_window(off, 4.0)
+        check("ずれ補正込みの終了から数える", abs(o_hi - 34.0) < 1e-6)
 
         win.var_start.set("ここは時刻を書く欄")
         win._commit_time("start")
