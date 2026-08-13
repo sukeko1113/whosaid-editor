@@ -1,0 +1,251 @@
+"""Gemini の本文と、実測の単語時刻を突き合わせる(照合)。
+
+やること:
+    1. 正規化(NFKC・記号落とし)と、元の位置へ戻る写像表づくり
+    2. 区間ごとに、その時刻の周りの単語だけを見て文字を突き合わせる
+    3. 一致した文字の時刻から、区間の始まりと終わりを引き直す
+    4. どれだけ乗ったか(被覆率)を返す。低ければ呼び出し側が提案を諦める
+
+ここは純粋関数だけで書いてある。音声もモデルも要らないので、テキストと
+単語のフィクスチャだけで全部テストできる。
+
+**区間ごとに窓を切る理由**(設計書 §3.1 からの変更・2026-08-13 に決定):
+全文どうしを difflib に掛けると 4 万文字(52 分の会議)で 66 秒かかる。
+O(n^2) なので 2 時間の録音では 5 分を超える。区間の時刻の周りだけを見れば
+n が千文字弱に落ちて 0.16 秒で済む(いずれも実測)。
+速さ以上に効くのは誤マッチが構造的に起きなくなること。全文照合では
+「はい」が 3 分先の「はい」に当たり得るが、窓を切ればそもそも届かない。
+窓から外れた区間は黙って間違えず「照合できなかった」として返る。
+
+渡す時刻は**実音声の時刻**(再生位置)であること。作業ファイルの保存値には
+ずれ補正が乗っていない区間があるので、呼び出し側で補正を足してから渡す。
+"""
+from __future__ import annotations
+
+import bisect
+import unicodedata
+from dataclasses import dataclass
+from difflib import SequenceMatcher
+from typing import Optional, Sequence
+
+from .align import Word
+
+
+# 一致とみなす最短の長さ。日本語は 1〜2 文字の一致が偶然でも頻発するので、
+# それを拾うと誤ったアンカーだらけになる。
+MIN_BLOCK = 3
+
+# 区間の境界に付ける余白(秒)。息継ぎの分だけ前後に広げる。
+PAD = 0.05
+
+# 区間の時刻の前後、何秒ぶんの単語を探すか。実測のドリフトは +6.8 秒程度
+# だったので、4 倍以上の余裕を取ってある(§12 のキャリブレーション対象)。
+WINDOW = 30.0
+
+# 上の窓で見つからなかった区間だけ、もう一度広く探すときの幅。
+# 数が少ないので広げても安い。
+WIDE_WINDOW = 120.0
+
+# 単調に進ませるときの戻り幅(秒)。区間の切れ目は両者で少しずれるので、
+# 直前の一致の終わりから少しだけ戻ることは許す。
+SWEEP_SLACK = 1.0
+
+
+@dataclass
+class Measured:
+    """1 区間ぶんの実測結果。"""
+
+    start: float            # 引き直した開始(余白込み)
+    end: float              # 引き直した終了(余白込み)
+    coverage: float         # 区間の文字のうち、一致に乗った割合(0〜1)
+    matched: int            # 一致した文字数
+    total: int              # 区間の文字数(正規化後)
+    window: float           # どの幅の窓で見つけたか(根拠に出す)
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end - self.start)
+
+
+@dataclass
+class Track:
+    """実測側を 1 本の文字列として扱えるようにしたもの。
+
+    文字ごとに時刻を持つ。単語の中は文字数で按分する(逐語の粒度なら
+    これで十分。実測では 45 語中 35 語が 1 文字だった)。
+    """
+
+    text: str
+    starts: list[float]     # 昇順であること(range() が二分探索する)
+    ends: list[float]       # 同上
+
+    def __len__(self) -> int:
+        return len(self.text)
+
+    def range(self, t0: float, t1: float) -> tuple[int, int]:
+        """[t0, t1] に掛かる文字の範囲(半開区間)を返す。"""
+        lo = bisect.bisect_left(self.ends, t0)
+        hi = bisect.bisect_right(self.starts, t1)
+        return lo, max(lo, hi)
+
+
+def _droppable(ch: str) -> bool:
+    """照合の邪魔になる文字か(空白・句読点・記号・制御文字)。
+
+    実測側は句読点が単語にくっついて返る('ありがとうございます。')。
+    Gemini 側の句読点の打ち方とは揃わないので、両方から落として比べる。
+    """
+    return unicodedata.category(ch)[0] in ("Z", "C", "P", "S")
+
+
+def normalize(text: str) -> tuple[str, list[int]]:
+    """NFKC 正規化して記号を落とす。
+
+    戻り値は (正規化後の文字列, 各文字が元の何文字目から来たか)。
+    写像表を持つのは、分割候補(§4)で音声側の切れ目を本文の位置に
+    戻す必要があるため。
+
+    1 文字ずつ正規化するので、全体を NFKC に掛けた場合と結果が違うことが
+    ある(「か」+濁点のように、分かれて書かれた濁点は合体しない)。
+    位置の対応を正確に保つほうを取っている。合体しなかった濁点は
+    1 文字ぶん一致しないだけで、被覆率に吸収される。
+    """
+    out: list[str] = []
+    origin: list[int] = []
+    for i, ch in enumerate(text):
+        for c in unicodedata.normalize("NFKC", ch):
+            if _droppable(c):
+                continue
+            out.append(c)
+            origin.append(i)
+    return "".join(out), origin
+
+
+def prepare(words: Sequence[Word]) -> Track:
+    """単語の並びを、文字ごとに時刻を持つ 1 本の文字列にする。
+
+    時刻順に並べ直してから作る。faster-whisper は前から順に返すが、
+    アライナを差し替えたときに順序が崩れていると、窓を切る二分探索が
+    静かに嘘をつく(そこだけは崩れてはいけない)。
+    終了時刻も同じ理由で、前の文字より前に戻らないようにしておく
+    (単語どうしが重なって返る場合。faster-whisper では起きない)。
+    """
+    ordered = sorted(words, key=lambda w: (w.start, w.end))
+    raw: list[str] = []
+    starts: list[float] = []
+    ends: list[float] = []
+    for w in ordered:
+        n = len(w.text)
+        if n == 0:
+            continue
+        span = max(0.0, w.end - w.start)
+        for i in range(n):
+            starts.append(w.start + span * i / n)
+            end = w.start + span * (i + 1) / n
+            ends.append(max(end, ends[-1]) if ends else end)
+        raw.append(w.text)
+
+    text, origin = normalize("".join(raw))
+    return Track(text=text,
+                 starts=[starts[i] for i in origin],
+                 ends=[ends[i] for i in origin])
+
+
+def measure(
+    text: str,
+    track: Track,
+    t0: float,
+    t1: float,
+    *,
+    min_block: int = MIN_BLOCK,
+    pad: float = PAD,
+) -> Optional[Measured]:
+    """1 区間ぶんを、[t0, t1] の範囲の実測と突き合わせる。
+
+    見つからなければ None(照合不能)。当てずっぽうの時刻を返すくらいなら、
+    照合できなかったと言うほうがいい。
+
+    始まりは「最初に一致した文字」の開始、終わりは「最後に一致した文字」の
+    終了から取る(§3.2)。区間の頭が丸ごと聞き取れていない場合、始まりは
+    その分だけ後ろに出る。被覆率を一緒に返すので、呼び出し側で弾ける。
+    """
+    norm, _ = normalize(text)
+    if not norm:
+        return None
+    lo, hi = track.range(t0, t1)
+    window = track.text[lo:hi]
+    if not window:
+        return None
+
+    sm = SequenceMatcher(None, norm, window, autojunk=False)
+    blocks = [m for m in sm.get_matching_blocks() if m.size >= min_block]
+    if not blocks:
+        return None
+
+    first, last = blocks[0], blocks[-1]
+    start = track.starts[lo + first.b] - pad
+    end = track.ends[lo + last.b + last.size - 1] + pad
+    matched = sum(m.size for m in blocks)
+    return Measured(
+        start=max(0.0, start),
+        end=max(start, end),
+        coverage=matched / len(norm),
+        matched=matched,
+        total=len(norm),
+        window=t1 - t0,
+    )
+
+
+def measure_segments(
+    spans: Sequence[tuple[str, float, float]],
+    words: Sequence[Word],
+    *,
+    window: float = WINDOW,
+    wide_window: float = WIDE_WINDOW,
+    min_block: int = MIN_BLOCK,
+    pad: float = PAD,
+) -> list[Optional[Measured]]:
+    """全区間ぶんまとめて実測と突き合わせる。
+
+    spans は (本文, いまの開始, いまの終了)。時刻は**実音声の時刻**で渡す
+    こと(ずれ補正を足したあとの値)。
+
+    前から順に見て、次の区間は直前の区間が一致した位置より後ろから探す。
+    同じ文言が前にもあるとき(「はい」「そうですね」)に前へ戻って当たるのを
+    防ぐ。ここで弾かれるのは時刻が前後する一致なので、設計書 §3.1 の
+    時刻単調性フィルタと同じ役目を、窓を切る側でまとめて果たしている。
+
+    1 度目で見つからなかった区間だけ、広い窓でもう一度探す。数が少ないので
+    広げても安く、ドリフトが大きい帯を取りこぼさずに済む。
+    """
+    track = prepare(words)
+    results: list[Optional[Measured]] = [None] * len(spans)
+    if not track.text:
+        return results
+
+    floor = 0.0            # ここより前は探さない(単調に進ませる)
+    for i, (text, start, end) in enumerate(spans):
+        lo = max(floor, start - window)
+        got = measure(text, track, lo, end + window,
+                      min_block=min_block, pad=pad)
+        if got is not None:
+            results[i] = got
+            floor = max(floor, got.end - SWEEP_SLACK)
+
+    # 取りこぼしを広い窓で拾い直す。ここでは単調の制約を「前後の一致の間」
+    # に限る(前後が決まっていれば、その間から出ることはない)。
+    for i, (text, start, end) in enumerate(spans):
+        if results[i] is not None:
+            continue
+        lo = max(0.0, start - wide_window)
+        hi = end + wide_window
+        prev = next((results[j] for j in range(i - 1, -1, -1) if results[j]), None)
+        nxt = next((results[j] for j in range(i + 1, len(spans)) if results[j]), None)
+        if prev is not None:
+            lo = max(lo, prev.end - SWEEP_SLACK)
+        if nxt is not None:
+            hi = min(hi, nxt.start + SWEEP_SLACK)
+        if hi <= lo:
+            continue
+        results[i] = measure(text, track, lo, hi, min_block=min_block, pad=pad)
+    return results
