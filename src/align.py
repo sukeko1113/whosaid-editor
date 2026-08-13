@@ -16,7 +16,9 @@ faster_whisper は関数の中で import する。トップレベルに置くと
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -93,17 +95,31 @@ def resolve_model(model: str = DEFAULT_MODEL,
     return model
 
 
-def words_cache_path(work_dir: Path | str, fingerprint: str,
-                     model: str) -> Optional[Path]:
+def words_cache_path(work_dir: Path | str, fingerprint: str, model: str,
+                     model_dir: Optional[Path | str] = None) -> Optional[Path]:
     """words キャッシュの置き場(§7)。指紋が無いときは None。
 
-    キーは「音声の指紋 + モデル名 + 実装バージョン」。どれが欠けても
+    キーは「音声の指紋 + モデルの素性 + 実装バージョン」。どれが欠けても
     別物の転写を使い回す事故になるので、指紋が取れなかった音声は
     そもそもキャッシュしない(毎回取り直すほうが安全)。
+
+    モデルの素性には model_dir も含める。手動配置のフォルダを差し替えると
+    モデル名が同じでも中身は別物で、名前だけをキーにすると差し替え前の
+    実測を使い回してしまう。フォルダはパスの短縮ハッシュで区別する
+    (パスが同じで中身だけ入れ替えた場合は拾えない。§7 に既知の限界として記載)。
+
+    モデル名の区切り文字(HF のリポ ID に含まれる「/」等)は「-」に無害化する。
+    そのままだとキャッシュのファイル名が下位フォルダに割れてしまう。
     """
     if not fingerprint:
         return None
-    return Path(work_dir) / "align" / f"words.{fingerprint}.{model}.a{ALIGN_VER}.json"
+    tag = re.sub(r"[\\/:]+", "-", model)
+    if model_dir:
+        digest = hashlib.blake2b(
+            str(Path(model_dir).resolve()).encode("utf-8"),
+            digest_size=4).hexdigest()
+        tag += f".d{digest}"
+    return Path(work_dir) / "align" / f"words.{fingerprint}.{tag}.a{ALIGN_VER}.json"
 
 
 def load_words(path: Optional[Path]) -> Optional[list[Word]]:
@@ -164,7 +180,8 @@ def transcribe_words(
 
     if fingerprint is None:
         fingerprint = audio_fingerprint(audio_path)
-    cache = words_cache_path(work_dir, fingerprint, model) if work_dir else None
+    cache = (words_cache_path(work_dir, fingerprint, model, model_dir)
+             if work_dir else None)
 
     if not force:
         cached = load_words(cache)
