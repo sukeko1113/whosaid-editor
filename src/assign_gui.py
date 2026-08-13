@@ -73,6 +73,11 @@ PREVIEW_MIN_SECONDS = 8.0      # 本文が短いときに確保する長さ
 PREVIEW_SLACK_SECONDS = 5.0    # Gemini の時刻推定がずれる分の余裕
 PREVIEW_FLOOR_SECONDS = 1.5    # 区間自体が極端に短いときの最低再生時間
 
+# 終了時刻を直したときに鳴らす、終わりの長さ(秒)。
+# 日本語で 20 字程度の一句が入り、語尾が切れていないかを判断できる。
+# 頭から鳴らすと長い区間では終わりに来るまで待たされるので、ここだけ聴かせる。
+TAIL_PREVIEW_SECONDS = 3.0
+
 
 def preview_length(text: str, duration: float) -> float:
     """この区間を何秒再生するか。
@@ -187,6 +192,21 @@ def playback_window(
         # 本文に見合う長さだけ再生する(「この先30秒▶」で続きを聴ける)
         preview_end = seg.start + preview_length(seg.text, seg.duration)
     return max(0.0, seg.start + shift - back), preview_end + shift + extend
+
+
+def tail_window(
+    seg: Segment, time_offset: float, seconds: float = TAIL_PREVIEW_SECONDS
+) -> tuple[float, float]:
+    """終わりの数秒だけを鳴らす範囲を返す。
+
+    終了時刻を直したときの確認用。頭から鳴らすと、長い区間では終わりに
+    たどり着くまで待たされる。確かめたいのは語尾が切れていないかなので、
+    終わりだけを聴けば足りる。
+    """
+    start, end = audio_span(seg, time_offset)
+    tail = min(seconds, max(MIN_SEGMENT_SECONDS, end - start))
+    return max(0.0, end - tail), end
+
 
 # 話者ごとの色(タイムライン帯・一覧の色分け用)
 PALETTE = [
@@ -965,10 +985,16 @@ class AssignWindow(tk.Toplevel):
         base_start, base_end = time_edit_base(seg, self.proj.time_offset)
         start, end = move_edge(base_start, base_end, which, value,
                                self.proj.duration, shift_if_past=shift_if_past)
-        self._commit_times(start, end, base_start, base_end, explicit)
+        # 反対側を追い越して区間ごと動いたときは、頭から聴かせる
+        moved = which
+        if shift_if_past and abs(start - base_start) > 1e-6 \
+                and abs(end - base_end) > 1e-6:
+            moved = "both"
+        self._commit_times(start, end, base_start, base_end, explicit, moved)
 
     def _commit_times(self, start: float, end: float, base_start: float,
-                      base_end: float, explicit: bool) -> None:
+                      base_end: float, explicit: bool,
+                      moved: str = "both") -> None:
         seg = self.proj.segments[self.current]
         changed = abs(start - base_start) > 1e-6 or abs(end - base_end) > 1e-6
         if not changed and (seg.time_edited or not explicit):
@@ -978,12 +1004,30 @@ class AssignWindow(tk.Toplevel):
             return
 
         self._write_times(seg, start, end, reviewed=True)
+        tail_only = moved == "end"
         self._set_action(
             f"区間 {seg.index + 1} の時刻を {fmt_hms_frac(seg.start)} → "
             f"{fmt_hms_frac(seg.end)} にしました。"
+            + (f"(終わりの{TAIL_PREVIEW_SECONDS:.0f}秒を鳴らします)"
+               if tail_only and self.var_autoplay.get() else "")
         )
         if self.var_autoplay.get():
-            self.play_current()
+            if tail_only:
+                self.play_tail()
+            else:
+                self.play_current()
+
+    def play_tail(self) -> None:
+        """いまの区間の終わりだけを鳴らす。
+
+        終了時刻を直したときの確認用。確かめたいのは語尾が切れていないかで、
+        長い区間を頭から鳴らすと、そこへ来るまで待たされる。
+        """
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        start, end = tail_window(seg, self.proj.time_offset)
+        self.play_span(start, end, pre_roll=0.0)
 
     def _write_times(self, seg: Segment, start: float, end: float, *,
                      reviewed: bool) -> None:
