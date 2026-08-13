@@ -21,7 +21,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from typing import Iterable, Optional
 
 from .audio import extract_peaks
 from .player import SegmentPlayer
@@ -1825,6 +1825,193 @@ class SplitDialog(tk.Toplevel):
 
     def _close(self) -> None:
         self._stop_mark()
+        self.win.player.stop()
+        self.grab_release()
+        self.destroy()
+
+
+@dataclass
+class ProposalRow:
+    """点検の提案を一覧に 1 行出すための、表示用の値。
+
+    点検側(inspect.py)が持つ提案そのものではなく、そこから作った文字列だけを
+    持つ。画面が提案の作り方を知らずに済むので、照合の実装を差し替えても
+    ここは変えなくてよい(align.py を薄いアダプタに隔離するのと同じ理由)。
+    """
+
+    key: str            # 呼び出し側が提案を特定するための鍵
+    kind: str           # 種別。"時刻" / "分割"
+    target: str         # 対象区間の見出し(例 "区間 12")
+    now: str            # いまの時刻
+    measured: str       # 実測した時刻
+    delta: str          # ずれ
+    evidence: str       # なぜそう言えるのか(照合の根拠)
+    confidence: str     # どれくらい確からしいか
+    text: str           # 発言のプレビュー
+
+
+class ProposalDialog(tk.Toplevel):
+    """点検が出した提案の一覧。承認するか却下するかを決めてもらう。
+
+    ここは見せて選ばせるだけで、本体データには触らない。決まったぶんだけ
+    呼び出し側の関数を呼び、適用は既存の時刻編集の経路にやらせる
+    (点検専用の書き込み経路は作らない)。
+
+    決め方は話者の ✓/△ と同じ形にしてある:
+      - [聴いて承認]   選んだ行を再生して確かめたうえで採る → ✎
+      - [まとめて適用] 残りを聴かずに当てる → ✎△(あとで聴いて ✎ に上げる)
+      - [却下]         その行は採らない
+
+    行は 1 つずつ選ぶ(選ぶと再生する)。まとめて承認できるようにすると、
+    聴かずに ✎ を付けられてしまい、✎ の意味が壊れる。
+
+    ※ 提案を作る側(align.py / anchor.py / inspect.py)と、この画面を開く
+      ボタンは Step 1-3a で入れる。いまは表示と決定の受け口だけ。
+    """
+
+    COLUMNS = (
+        ("kind", "種別", 60),
+        ("target", "対象", 80),
+        ("now", "いまの時刻", 100),
+        ("measured", "実測の時刻", 100),
+        ("delta", "ずれ", 70),
+        ("evidence", "根拠", 190),
+        ("confidence", "信頼度", 70),
+        ("text", "発言", 300),
+    )
+
+    def __init__(
+        self,
+        master: "AssignWindow",
+        rows: Iterable[ProposalRow],
+        *,
+        on_play=None,       # (key) 行を選んだとき。該当箇所を再生する
+        on_accept=None,     # (key) 聴いて承認した
+        on_bulk=None,       # (keys) 残りをまとめて適用した
+        on_reject=None,     # (key) 却下した
+    ) -> None:
+        super().__init__(master)
+        self.win = master
+        self.on_play = on_play
+        self.on_accept = on_accept
+        self.on_bulk = on_bulk
+        self.on_reject = on_reject
+        self.rows: dict[str, ProposalRow] = {r.key: r for r in rows}
+        # 何をどう決めたかの記録。呼び出し側が後から見返せるようにする
+        self.decisions: list[tuple[str, tuple[str, ...]]] = []
+
+        self.title("点検の提案")
+        self.transient(master)
+        self.var_status = tk.StringVar(value="")
+        self._build()
+        self._update_status()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            self,
+            text="行を選ぶとその箇所を再生します。聴いて合っていれば[聴いて承認]。"
+                 "[まとめて適用]した区間は ✎△(未確認)のままなので、あとから"
+                 "聴いて確かめられます。",
+            wraplength=760,
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        keys = tuple(key for key, _, _ in self.COLUMNS)
+        self.tree = ttk.Treeview(self, columns=keys, show="headings",
+                                 height=14, selectmode="browse")
+        for key, label, width in self.COLUMNS:
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width,
+                             anchor="w" if key in ("evidence", "text") else "center")
+        for row in self.rows.values():
+            self._insert(row)
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(row=1, column=1, sticky="ns", padx=(0, 12))
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        ttk.Label(self, textvariable=self.var_status, foreground="#666")\
+            .grid(row=2, column=0, sticky="w", padx=12, pady=(4, 0))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        ttk.Button(btns, text="聴いて承認", command=self._accept).pack(side="left")
+        ttk.Button(btns, text="却下", command=self._reject).pack(side="left", padx=6)
+        ttk.Button(btns, text="残りをまとめて適用", command=self._bulk)\
+            .pack(side="left", padx=(18, 6))
+        ttk.Button(btns, text="閉じる", command=self._close).pack(side="left")
+
+    def _insert(self, row: ProposalRow) -> None:
+        self.tree.insert("", "end", iid=row.key, values=(
+            row.kind, row.target, row.now, row.measured,
+            row.delta, row.evidence, row.confidence, row.text,
+        ))
+
+    def _selected_key(self) -> Optional[str]:
+        sel = self.tree.selection()
+        return sel[0] if sel else None
+
+    def _update_status(self) -> None:
+        self.var_status.set(f"残り {len(self.rows)} 件")
+
+    def _on_select(self, _event=None) -> None:
+        key = self._selected_key()
+        if key and self.on_play:
+            self.on_play(key)
+
+    # ------------------------------------------------------------------
+    def _accept(self) -> None:
+        key = self._selected_key()
+        if key is None:
+            self.var_status.set("承認する行を選んでください。")
+            return
+        if self.on_accept:
+            self.on_accept(key)
+        self._done("accept", (key,))
+
+    def _reject(self) -> None:
+        key = self._selected_key()
+        if key is None:
+            self.var_status.set("却下する行を選んでください。")
+            return
+        if self.on_reject:
+            self.on_reject(key)
+        self._done("reject", (key,))
+
+    def _bulk(self) -> None:
+        keys = tuple(self.rows)
+        if not keys:
+            return
+        ok = messagebox.askyesno(
+            "残りをまとめて適用",
+            f"残り {len(keys)} 件を聴かずに適用します。\n"
+            "適用した区間は ✎△(未確認)になります。あとから聴いて"
+            "確かめると ✎ に変わります。\n\nよろしいですか?",
+            parent=self,
+        )
+        if not ok:
+            return
+        if self.on_bulk:
+            self.on_bulk(keys)
+        self._done("bulk", keys)
+
+    def _done(self, kind: str, keys: tuple[str, ...]) -> None:
+        """決まった行を一覧から外す(同じ提案を二度決めさせない)。"""
+        self.decisions.append((kind, keys))
+        for key in keys:
+            self.rows.pop(key, None)
+            if self.tree.exists(key):
+                self.tree.delete(key)
+        self._update_status()
+
+    def _close(self) -> None:
         self.win.player.stop()
         self.grab_release()
         self.destroy()

@@ -26,6 +26,7 @@ for _s in (sys.stdout, sys.stderr):
 
 import tkinter as tk  # noqa: E402
 
+import src.assign_gui as assign_gui  # noqa: E402
 from src.assign_gui import (  # noqa: E402
     FILTER_ALL,
     FILTER_UNASSIGNED,
@@ -34,6 +35,8 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MAX_SECONDS,
     PREVIEW_MIN_SECONDS,
     AssignWindow,
+    ProposalDialog,
+    ProposalRow,
     SplitDialog,
     clamp_times,
     move_edge,
@@ -438,6 +441,58 @@ def run() -> int:
         win.update()
         check("OK で (境界, 本文の位置) を返す",
               dlg.result is not None and len(dlg.result) == 2)
+
+        # --- 点検の提案一覧(骨格) ----------------------------------------
+        # 提案を作る側(inspect.py)はまだ無いので、表示用の行を直に組み立てる
+        rows = [
+            ProposalRow(key=f"p{i}", kind="時刻", target=f"区間 {i}",
+                        now="00:43:51.0", measured="00:43:57.8", delta="+6.8秒",
+                        evidence="一致 42/48 文字", confidence="高",
+                        text=f"提案 {i} の発言")
+            for i in range(3)
+        ]
+        played: list[str] = []
+        accepted: list[str] = []
+        bulked: list[tuple[str, ...]] = []
+        rejected: list[str] = []
+        pdlg = ProposalDialog(win, rows, on_play=played.append,
+                              on_accept=accepted.append, on_bulk=bulked.append,
+                              on_reject=rejected.append)
+        pdlg.update()
+        check("提案がすべて並ぶ", len(pdlg.tree.get_children()) == 3)
+        check("根拠の列がある", pdlg.tree.heading("evidence")["text"] == "根拠")
+        check("残り件数を出す", pdlg.var_status.get() == "残り 3 件")
+
+        pdlg.tree.selection_set("p0")
+        pdlg.update()
+        check("行を選ぶと再生を頼む", played == ["p0"])
+        pdlg._accept()
+        pdlg.update()
+        check("聴いて承認したことを伝える", accepted == ["p0"])
+        check("決めた行は一覧から消える", not pdlg.tree.exists("p0"))
+        check("残りが減る", pdlg.var_status.get() == "残り 2 件")
+
+        pdlg.tree.selection_set("p1")
+        pdlg._reject()
+        check("却下したことを伝える", rejected == ["p1"])
+        check("却下した行も一覧から消える", not pdlg.tree.exists("p1"))
+
+        pdlg.tree.selection_remove(*pdlg.tree.get_children())
+        pdlg._accept()
+        check("選ばずに承認はできない", accepted == ["p0"])
+
+        real_ask = assign_gui.messagebox.askyesno
+        assign_gui.messagebox.askyesno = lambda *a, **k: True    # 確認は「はい」
+        try:
+            pdlg._bulk()
+        finally:
+            assign_gui.messagebox.askyesno = real_ask
+        check("残りをまとめて適用できる", bulked == [("p2",)])
+        check("まとめて適用すると提案が残らない", pdlg.var_status.get() == "残り 0 件")
+        check("何をどう決めたか記録する",
+              [kind for kind, _ in pdlg.decisions] == ["accept", "reject", "bulk"])
+        pdlg._close()
+        win.update()
 
         # --- 区間の分割・結合 --------------------------------------------
         total = len(proj.segments)
