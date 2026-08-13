@@ -622,7 +622,9 @@ def run() -> int:
         accepted: list[str] = []
         bulked: list[tuple[str, ...]] = []
         rejected: list[str] = []
+        played_now: list[str] = []
         pdlg = ProposalDialog(win, rows, on_play=played.append,
+                              on_play_now=played_now.append,
                               on_accept=accepted.append, on_bulk=bulked.append,
                               on_reject=rejected.append)
         pdlg.update()
@@ -632,7 +634,9 @@ def run() -> int:
 
         pdlg.tree.selection_set("p0")
         pdlg.update()
-        check("行を選ぶと再生を頼む", played == ["p0"])
+        check("行を選ぶと提案の時刻で再生を頼む", played == ["p0"])
+        pdlg._play_now()
+        check("いまの時刻でも聴き比べられる", played_now == ["p0"])
         pdlg._accept()
         pdlg.update()
         check("聴いて承認したことを伝える", accepted == ["p0"])

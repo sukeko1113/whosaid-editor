@@ -1415,7 +1415,15 @@ class AssignWindow(tk.Toplevel):
         # 短い区間で先読みを固定 0.4 秒にすると、再生窓の大半が前の発言に
         # なってしまう(1 秒の区間なら 4 割)。区間の長さに応じて縮める。
         pre_roll = min(0.4, max(0.05, seg.duration * 0.25))
+        self.play_span(play_start, play_end, pre_roll=pre_roll, explicit=explicit)
 
+    def play_span(self, start: float, end: float, *, pre_roll: float = 0.4,
+                  explicit: bool = False) -> None:
+        """音声の任意の範囲を鳴らす。
+
+        区間の再生も、点検の提案を「その時刻で聴いてみる」のもここを通る。
+        音声が見つからないときの扱いを 1 か所にまとめておく。
+        """
         audio = Path(self.proj.audio_path)
         if not audio.exists():
             # 移動のたびに警告を出し続けないよう、断られたら自動再生を切る
@@ -1434,8 +1442,8 @@ class AssignWindow(tk.Toplevel):
         try:
             self.player.play(
                 audio,
-                start=play_start,
-                end=play_end,
+                start=max(0.0, start),
+                end=end,
                 speed=self._speed(),
                 pre_roll=pre_roll,
             )
@@ -1822,11 +1830,24 @@ class AssignWindow(tk.Toplevel):
     def _open_proposals(self, proposals, path: Optional[Path]) -> None:
         by_id = {p.id: p for p in proposals}
 
-        def play(key: str) -> None:
-            seg = target_segment(self.proj, by_id[key])
-            if seg is not None:
-                self.goto(seg.index)
+        def play(key: str, *, proposed: bool = True) -> None:
+            """その行の箇所を鳴らす。
+
+            既定は「提案した時刻」のほう。確かめたいのは提案が合っているか
+            なので、いまのずれた時刻で鳴らしても判断できない。
+            """
+            p = by_id[key]
+            seg = target_segment(self.proj, p)
+            if seg is None:
+                return
+            self.goto(seg.index)            # 本文と話者を画面に出す
+            if not proposed:
                 self.play_current(explicit=True)
+                return
+            start = float(p.payload.get("start", seg.start))
+            end = float(p.payload.get("end", seg.end))
+            self.play_span(start, end, explicit=True,
+                           pre_roll=min(0.4, max(0.05, (end - start) * 0.25)))
 
         def bulk(keys) -> None:
             for key in keys:
@@ -1838,6 +1859,7 @@ class AssignWindow(tk.Toplevel):
         dlg = ProposalDialog(
             self, self._proposal_rows(proposals),
             on_play=play,
+            on_play_now=lambda k: play(k, proposed=False),
             on_accept=lambda k: self.decide_proposal(by_id[k], "accept"),
             on_bulk=bulk,
             on_reject=lambda k: self.decide_proposal(by_id[k], "reject"),
@@ -2167,7 +2189,8 @@ class ProposalDialog(tk.Toplevel):
         master: "AssignWindow",
         rows: Iterable[ProposalRow],
         *,
-        on_play=None,       # (key) 行を選んだとき。該当箇所を再生する
+        on_play=None,       # (key) 行を選んだとき。提案した時刻で再生する
+        on_play_now=None,   # (key) 比べるために、いまの時刻でも再生する
         on_accept=None,     # (key) 聴いて承認した
         on_bulk=None,       # (keys) 残りをまとめて適用した
         on_reject=None,     # (key) 却下した
@@ -2175,6 +2198,7 @@ class ProposalDialog(tk.Toplevel):
         super().__init__(master)
         self.win = master
         self.on_play = on_play
+        self.on_play_now = on_play_now
         self.on_accept = on_accept
         self.on_bulk = on_bulk
         self.on_reject = on_reject
@@ -2224,6 +2248,12 @@ class ProposalDialog(tk.Toplevel):
 
         btns = ttk.Frame(self)
         btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=12, pady=10)
+        # 行を選ぶと提案した時刻で鳴る。合っているかは、いまの時刻と
+        # 聴き比べると分かりやすい
+        ttk.Button(btns, text="▶ 提案の時刻", command=self._play_again)\
+            .pack(side="left")
+        ttk.Button(btns, text="▶ いまの時刻", command=self._play_now)\
+            .pack(side="left", padx=(4, 18))
         ttk.Button(btns, text="聴いて承認", command=self._accept).pack(side="left")
         ttk.Button(btns, text="却下", command=self._reject).pack(side="left", padx=6)
         ttk.Button(btns, text="残りをまとめて適用", command=self._bulk)\
@@ -2244,9 +2274,18 @@ class ProposalDialog(tk.Toplevel):
         self.var_status.set(f"残り {len(self.rows)} 件")
 
     def _on_select(self, _event=None) -> None:
+        self._play_again()
+
+    def _play_again(self) -> None:
         key = self._selected_key()
         if key and self.on_play:
             self.on_play(key)
+
+    def _play_now(self) -> None:
+        """比べるために、いまの(直す前の)時刻でも鳴らせるようにする。"""
+        key = self._selected_key()
+        if key and self.on_play_now:
+            self.on_play_now(key)
 
     # ------------------------------------------------------------------
     def _accept(self) -> None:
