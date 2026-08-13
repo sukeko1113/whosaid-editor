@@ -490,17 +490,17 @@ def run() -> int:
         def fake_words(indexes, shift=0.0):
             """その区間を実際に喋った、という単語列を作る。
 
-            本文が区間の長さいっぱいに広がるようにする(先頭だけに詰めると、
-            終了時刻が実測と大きく食い違い、全区間が提案対象になる)。
+            発話速度は実測に寄せて約 6.7 字/秒にする。区間の長さで按分すると
+            0.9 字/秒という不自然な遅さになり、密度フィルタに正しく弾かれて
+            しまう(それはそれで正しい挙動)。
             """
             out = []
             for i in indexes:
                 seg = proj.segments[i]
                 text = seg.text.replace("。", "")
-                per = seg.duration / len(text)
                 for n, ch in enumerate(text):
-                    at = seg.start + shift + n * per
-                    out.append(AlignWord(text=ch, start=at, end=at + per))
+                    at = seg.start + shift + n * 0.15
+                    out.append(AlignWord(text=ch, start=at, end=at + 0.15))
             return out
 
         # この見本は全区間が「これは N 番目の発言です。」でほぼ同じ本文なので、
@@ -539,8 +539,9 @@ def run() -> int:
 
         # まとめて適用 → ✎△、聴いて承認 → ✎
         win.decide_proposal(moved[0], "bulk")
+        # 提案には頭出しの余白 0.3 秒が付くので、その分だけ手前に入る
         check("まとめて適用で実測の時刻が入る",
-              abs(seg12.start - seg12.orig_start) < 0.2)
+              abs(seg12.start - seg12.orig_start) < 0.5)
         check("まとめて適用は未確認", seg12.time_reviewed is False)
         check("承認済みとして記録される", moved[0].status == "accepted")
         win.decide_proposal(moved[0], "accept")

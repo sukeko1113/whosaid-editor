@@ -35,9 +35,6 @@ from .align import Word
 # それを拾うと誤ったアンカーだらけになる。
 MIN_BLOCK = 3
 
-# 区間の境界に付ける余白(秒)。息継ぎの分だけ前後に広げる。
-PAD = 0.05
-
 # 区間の時刻の前後、何秒ぶんの単語を探すか。実測のドリフトは +6.8 秒程度
 # だったので、4 倍以上の余裕を取ってある(§12 のキャリブレーション対象)。
 WINDOW = 30.0
@@ -179,7 +176,6 @@ def measure(
     t1: float,
     *,
     min_block: int = MIN_BLOCK,
-    pad: float = PAD,
 ) -> Optional[Measured]:
     """1 区間ぶんを、[t0, t1] の範囲の実測と突き合わせる。
 
@@ -187,8 +183,11 @@ def measure(
     照合できなかったと言うほうがいい。
 
     始まりは「最初に一致した文字」の開始、終わりは「最後に一致した文字」の
-    終了から取る(§3.2)。区間の頭が丸ごと聞き取れていない場合、始まりは
-    その分だけ後ろに出る。被覆率を一緒に返すので、呼び出し側で弾ける。
+    終了から取る(§3.2)。**測ったままの生の値**で、余白は付けない。
+    余白や頭の欠けの補正は提案を作る側(inspection.py)の方針であり、
+    実測と混ぜると較正のときに切り分けられなくなる。
+    区間の頭が丸ごと聞き取れていない場合、始まりはその分だけ後ろに出る。
+    head_gap と被覆率を一緒に返すので、呼び出し側で補正・棄却できる。
     """
     norm, _ = normalize(text)
     if not norm:
@@ -204,8 +203,8 @@ def measure(
         return None
 
     first, last = blocks[0], blocks[-1]
-    start = track.starts[lo + first.b] - pad
-    end = track.ends[lo + last.b + last.size - 1] + pad
+    start = track.starts[lo + first.b]
+    end = track.ends[lo + last.b + last.size - 1]
     matched = sum(m.size for m in blocks)
     return Measured(
         start=max(0.0, start),
@@ -228,7 +227,6 @@ def measure_segments(
     wide_window: float = WIDE_WINDOW,
     good_enough: float = GOOD_ENOUGH,
     min_block: int = MIN_BLOCK,
-    pad: float = PAD,
 ) -> list[Optional[Measured]]:
     """全区間ぶんまとめて実測と突き合わせる。
 
@@ -260,7 +258,7 @@ def measure_segments(
         best: Optional[Measured] = None
         for w in steps:
             got = measure(text, track, max(floor, start - w), end + w,
-                          min_block=min_block, pad=pad)
+                          min_block=min_block)
             if got is not None and (best is None or got.coverage > best.coverage):
                 best = got
             if best is not None and best.coverage >= good_enough:
@@ -285,5 +283,5 @@ def measure_segments(
             hi = min(hi, nxt.start + SWEEP_SLACK)
         if hi <= lo:
             continue
-        results[i] = measure(text, track, lo, hi, min_block=min_block, pad=pad)
+        results[i] = measure(text, track, lo, hi, min_block=min_block)
     return results

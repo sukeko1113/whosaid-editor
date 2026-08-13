@@ -53,6 +53,21 @@ TIME_DELTA = 0.75
 # 実会議の聴き取り: 欠け 3 字以上の 2 件はどちらも終了が外れ、2 字以下は全部当たり。
 TAIL_GAP_LIMIT = 3
 
+# 提案に付ける境界の余白(秒)。whisper の単語時刻は発話の立ち上がりを
+# 少し遅く取る癖があるため、開始側は厚めに取る。
+# 聴き取り 2 回目: 頭の欠けゼロの区間でも「わずかに遅く始まる」と判定された。
+START_PAD = 0.30
+END_PAD = 0.20
+
+# 一致した文字の密度(字/秒)。正常な発話は実測で 4〜11 字/秒。これを大きく
+# 下回る「一致」は、広い範囲に散らばった偶然の一致を拾っている。
+# 聴き取り 2 回目: 本文が発話と食い違っていた区間は 0.8 字/秒だった。
+MIN_DENSITY = 1.5
+
+# 頭の欠けの秒換算がこれを超えたら、開始そのものが測れていないとみなして
+# 提案しない(補正が実測より大きくなったら、それはもう推定であって実測ではない)。
+HEAD_COMP_MAX = 6.0
+
 # 提案どうしの実測範囲が、短いほうの半分を超えて重なっていたら「取り合い」。
 # 挨拶やお礼の応酬(「よろしくお願いします」の連発)では、複数の区間が同じ
 # 音声位置に当たる。正しいのは高々 1 つで、どれかは機械には決められない。
@@ -105,6 +120,8 @@ class InspectResult:
     unmatched: int = 0          # 照合できなかった
     low_coverage: int = 0       # 一致はしたが乗りが足りない
     short_match: int = 0        # 一致した文字が少なすぎる(偶然かもしれない)
+    scattered: int = 0          # 一致が広い範囲に散らばりすぎている
+    head_lost: int = 0          # 頭の欠けが大きすぎて開始を測れない
     close_enough: int = 0       # 開始のずれが小さいので出す必要がない
     conflicted: int = 0         # 他の提案と同じ音声位置を取り合った
     notes: list[str] = field(default_factory=list)
@@ -112,13 +129,14 @@ class InspectResult:
     @property
     def checked(self) -> int:
         return (len(self.proposals) + self.reviewed + self.unmatched
-                + self.low_coverage + self.short_match + self.close_enough
-                + self.conflicted)
+                + self.low_coverage + self.short_match + self.scattered
+                + self.head_lost + self.close_enough + self.conflicted)
 
     @property
     def weak(self) -> int:
         """根拠が弱くて出さなかった数(画面の内訳表示用)。"""
-        return self.low_coverage + self.short_match + self.conflicted
+        return (self.low_coverage + self.short_match + self.scattered
+                + self.head_lost + self.conflicted)
 
 
 def _proposal_id(kind: str, orig_start: float, start: float, end: float) -> str:
@@ -131,12 +149,17 @@ def _proposal_id(kind: str, orig_start: float, start: float, end: float) -> str:
     return hashlib.blake2b(seed.encode("utf-8"), digest_size=6).hexdigest()
 
 
-def _evidence(m: Measured, d_start: float, d_end: float, keep_tail: bool) -> str:
+def _evidence(m: Measured, d_start: float, d_end: float, keep_tail: bool,
+              head_comp: float = 0.0) -> str:
     base = (f"一致 {m.matched}/{m.total} 文字(被覆 {m.coverage:.0%})・"
             f"ずれ 開始 {d_start:+.1f} 秒")
-    if keep_tail:
-        return base + "・終わりは測れず(いまの長さを保つ)"
-    return base + f" / 終了 {d_end:+.1f} 秒"
+    if not keep_tail:
+        base += f" / 終了 {d_end:+.1f} 秒"
+    else:
+        base += "・終わりは測れず(いまの長さを保つ)"
+    if head_comp >= 0.1:
+        base += f"・頭の欠け {m.head_gap} 字を {head_comp:.1f} 秒手前に補正"
+    return base
 
 
 def inspect_times(
@@ -145,8 +168,10 @@ def inspect_times(
     *,
     min_coverage: float = MIN_COVERAGE,
     min_matched: int = MIN_MATCHED,
+    min_density: float = MIN_DENSITY,
     time_delta: float = TIME_DELTA,
     tail_gap_limit: int = TAIL_GAP_LIMIT,
+    head_comp_max: float = HEAD_COMP_MAX,
     **anchor_kw: Any,
 ) -> InspectResult:
     """実測と突き合わせて、時刻の提案を作る(§3)。
@@ -166,6 +191,7 @@ def inspect_times(
     # 照合には実音声の時刻を渡す(保存値にはずれ補正が乗っていない区間がある)
     spans = [(s.text, *audio_span(s, proj.time_offset)) for s in proj.segments]
     measured = measure_segments(spans, words, **anchor_kw)
+    raw_spans: list[tuple[float, float]] = []   # 余白を付ける前の実測範囲
 
     for seg, m in zip(proj.segments, measured):
         if m is None:
@@ -195,30 +221,59 @@ def inspect_times(
             result.low_coverage += 1
             continue
 
+        # 一致の密度(字/秒)。低すぎる「一致」は広い範囲に散らばった偶然で、
+        # 本文が発話と食い違っているときにこうなる(実測 0.8 字/秒の例)。
+        rate = m.matched / max(0.1, m.end - m.start)
+        if rate < min_density:
+            result.scattered += 1
+            continue
+
+        # 本文の頭が聞き取られていない分、開始は実際より遅く出る。欠けた
+        # 文字数をこの区間の実測発話速度で秒に換算し、手前に戻す。
+        # 聴き取り 2 回目: 換算 5.3 秒の区間を人は「約 5 秒切れている」と
+        # 判定しており、ほぼ一致した。
+        head_comp = m.head_gap / rate
+        if head_comp > head_comp_max:
+            result.head_lost += 1
+            continue
+        start = max(0.0, m.start - head_comp)
+        d_start = start - now_start
+
         if abs(d_start) < time_delta:
             result.close_enough += 1
             continue
 
         # 末尾が乗っていない区間の終了は信用せず、いまの長さを保って
         # 開始だけ動かす(区間全体が同じ量ずれているのが典型的なドリフト)。
+        # 開始側の余白は厚め(whisper は立ち上がりを遅く取る)。終了の余白は
+        # 実測できたときだけ足す(測っていない値に余白を足す意味はない)。
         keep_tail = m.tail_gap >= tail_gap_limit
-        end = (m.start + (now_end - now_start)) if keep_tail else m.end
+        pad_start = max(0.0, start - START_PAD)
+        pad_end = (pad_start + (now_end - now_start)) if keep_tail \
+            else m.end + END_PAD
 
         result.proposals.append(Proposal(
-            id=_proposal_id(PROPOSAL_TIME, float(seg.orig_start), m.start, end),
+            id=_proposal_id(PROPOSAL_TIME, float(seg.orig_start),
+                            pad_start, pad_end),
             type=PROPOSAL_TIME,
             target_orig_start=float(seg.orig_start),
-            payload={"start": round(m.start, 2), "end": round(end, 2)},
-            evidence=_evidence(m, d_start, d_end, keep_tail),
+            payload={"start": round(pad_start, 2), "end": round(pad_end, 2)},
+            evidence=_evidence(m, d_start, d_end, keep_tail, head_comp),
             confidence=m.coverage,
         ))
+        raw_spans.append((start, start + (now_end - now_start) if keep_tail
+                          else m.end))
 
-    result.proposals, result.conflicted = drop_conflicts(result.proposals)
+    # 取り合いの判定は余白を付ける前の実測範囲で行う。余白込みで比べると、
+    # 隣り合う正当な発言どうしが余白のぶんだけ重なって巻き添えになる。
+    result.proposals, result.conflicted = drop_conflicts(
+        result.proposals, spans=raw_spans)
     return result
 
 
 def drop_conflicts(proposals: Sequence[Proposal],
                    overlap_ratio: float = CONFLICT_OVERLAP,
+                   spans: Optional[Sequence[tuple[float, float]]] = None,
                    ) -> tuple[list[Proposal], int]:
     """同じ音声位置を取り合う提案を、全部引っ込める。
 
@@ -228,16 +283,18 @@ def drop_conflicts(proposals: Sequence[Proposal],
 
     隣り合う発言が接しているだけ(重なりゼロか僅か)の組は正当なので残す。
     判定は「短いほうの長さの半分を超えて重なるか」。
+    spans を渡すと payload の代わりにその範囲で判定する(余白を付ける前の
+    実測範囲で比べるため。余白込みだと隣どうしが巻き添えになる)。
     """
-    order = sorted(range(len(proposals)),
-                   key=lambda i: float(proposals[i].payload.get("start", 0.0)))
+    if spans is None:
+        spans = [(float(p.payload.get("start", 0.0)),
+                  float(p.payload.get("end", 0.0))) for p in proposals]
+    order = sorted(range(len(proposals)), key=lambda i: spans[i][0])
     bad: set[int] = set()
     for a_pos, i in enumerate(order):
-        s1 = float(proposals[i].payload["start"])
-        e1 = float(proposals[i].payload["end"])
+        s1, e1 = spans[i]
         for j in order[a_pos + 1:]:
-            s2 = float(proposals[j].payload["start"])
-            e2 = float(proposals[j].payload["end"])
+            s2, e2 = spans[j]
             if s2 >= e1:
                 break               # start 順なので、これ以降は重ならない
             overlap = min(e1, e2) - s2

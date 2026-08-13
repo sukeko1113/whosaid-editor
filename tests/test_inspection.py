@@ -232,6 +232,58 @@ def test_conflict_drop_is_counted():
     assert got.conflicted == 2
 
 
+def test_unheard_head_is_compensated():
+    """頭の欠けは、その区間の実測発話速度で秒に換算して手前に戻す。
+
+    開始は「最初に一致した文字」から取るので、頭が聞き取られていないと
+    その分だけ遅く出る(聴き取り 2 回目: 換算 5.3 秒 ≒ 人の判定「約 5 秒」)。
+    """
+    heard = "きょうのてんきはとてもすごしやすいですね"     # 20 字が実測にある
+    proj = Project(audio_path="a.m4a", duration=120.0)
+    # 頭の 6 字(えーとあのー相当)は聞き取られていない
+    proj.segments = [Segment(index=0, start=40.0, end=50.0,
+                             text="えーとあのー" + heard, cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.2))    # 5 字/秒
+    assert len(got.proposals) == 1
+    p = got.proposals[0]
+    # 30.0 − 換算 1.2 秒 − 余白 0.3 秒 = 28.5
+    assert abs(p.payload["start"] - 28.5) < 0.05
+    assert "頭の欠け 6 字を 1.2 秒手前に補正" in p.evidence
+
+
+def test_hopeless_head_is_not_proposed():
+    """頭の欠けが大きすぎる区間は、開始を測れていないので提案しない。
+
+    補正が実測より大きくなったら、それはもう推定であって実測ではない。
+    """
+    heard = "きょうのてんきはとてもすごしやすいですねこのごろは"
+    proj = Project(audio_path="a.m4a", duration=120.0)
+    # 頭の 13 字が聞き取られていない(換算 6.5 秒 > 上限 6 秒)
+    proj.segments = [Segment(index=0, start=40.0, end=55.0,
+                             text="あ" * 13 + heard, cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.5))    # 2 字/秒
+    assert got.proposals == []
+    assert got.head_lost == 1
+
+
+def test_scattered_match_is_not_proposed():
+    """一致が広い範囲に散らばりすぎた区間は提案しない。
+
+    本文が発話と食い違っていると、あちこちの数文字がまばらに当たって
+    「一致」に見える(聴き取り 2 回目: 内容違いの区間は 0.8 字/秒だった)。
+    """
+    text = "はいそれではじかいのかいごう"
+    proj = Project(audio_path="a.m4a", duration=120.0)
+    proj.segments = [Segment(index=0, start=20.0, end=36.0,
+                             text=text, cluster="0:A")]
+    # 本文の文字が 2 秒おきにまばらに現れる(密度 0.5 字/秒)
+    ws = [Word(text=ch, start=30.0 + i * 2.0, end=30.2 + i * 2.0)
+          for i, ch in enumerate(text)]
+    got = inspect_times(proj, ws)
+    assert got.proposals == []
+    assert got.scattered == 1
+
+
 def test_heard_tail_uses_measured_end():
     """末尾まで乗っていれば、終了も実測で直す(従来どおり)。"""
     got = inspect_times(project(drift=6.8), measured_words())

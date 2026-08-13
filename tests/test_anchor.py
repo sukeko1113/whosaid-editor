@@ -21,7 +21,6 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.align import Word                                      # noqa: E402
 from src.anchor import (                                        # noqa: E402
-    PAD,
     Track,
     measure,
     measure_segments,
@@ -121,8 +120,8 @@ def test_measure_exact_match():
     track = prepare(evenly("きょうはあついですね", 10.0, 0.5))
     got = measure("きょうはあついですね", track, 0.0, 100.0)
     assert got is not None
-    assert abs(got.start - (10.0 - PAD)) < 1e-9
-    assert abs(got.end - (15.0 + PAD)) < 1e-9
+    assert abs(got.start - 10.0) < 1e-9
+    assert abs(got.end - 15.0) < 1e-9
     assert got.coverage == 1.0 and got.matched == got.total == 10
 
 
@@ -148,7 +147,7 @@ def test_measure_reports_partial_coverage():
     assert got.matched == 11 and got.total == 17
     assert 0.6 < got.coverage < 0.7
     # 始まりは「一致した最初の文字」から取る(フィラーの分は含まない)
-    assert abs(got.start - (0.0 - PAD)) < 1e-9 or got.start == 0.0
+    assert got.start == 0.0
     # 頭の 6 文字(えーとあのー)が乗らなかった、と分かる
     assert got.head_gap == 6 and got.tail_gap == 0
 
@@ -188,9 +187,9 @@ def test_measure_segments_matches_each_span():
     spans, ws = _three_segments()
     got = measure_segments(spans, ws)
     assert all(g is not None for g in got)
-    assert abs(got[0].start - (0.0 - PAD)) < 1e-9 or got[0].start == 0.0
-    assert abs(got[1].start - (6.0 - PAD)) < 1e-9
-    assert abs(got[2].start - (12.0 - PAD)) < 1e-9
+    assert got[0].start == 0.0
+    assert abs(got[1].start - 6.0) < 1e-9
+    assert abs(got[2].start - 12.0) < 1e-9
     assert all(g.coverage == 1.0 for g in got)
 
 
@@ -200,7 +199,7 @@ def test_measure_segments_finds_drifted_times():
     drifted = [(t, s + 6.8, e + 6.8) for t, s, e in spans]
     got = measure_segments(drifted, ws)
     assert all(g is not None for g in got)
-    assert abs(got[1].start - (6.0 - PAD)) < 1e-9      # 実測の位置に戻る
+    assert abs(got[1].start - 6.0) < 1e-9      # 実測の位置に戻る
 
 
 def test_measure_segments_narrow_window_then_wide():
@@ -212,7 +211,7 @@ def test_measure_segments_narrow_window_then_wide():
                    far[1][2] + 30.0) is None           # 1 度目の窓では届かない
     got = measure_segments(far, ws)
     assert got[1] is not None                          # 2 度目で拾える
-    assert abs(got[1].start - (6.0 - PAD)) < 1e-9
+    assert abs(got[1].start - 6.0) < 1e-9
 
 
 def test_measure_segments_does_not_go_backwards():
@@ -226,7 +225,7 @@ def test_measure_segments_does_not_go_backwards():
     got = measure_segments(spans, ws)
     assert got[0] is not None and got[2] is not None
     assert got[0].start < got[2].start
-    assert abs(got[2].start - (20.0 - PAD)) < 1e-9     # 後ろの方に当たる
+    assert abs(got[2].start - 20.0) < 1e-9     # 後ろの方に当たる
 
 
 def test_measure_segments_prefers_the_near_occurrence():
@@ -242,7 +241,7 @@ def test_measure_segments_prefers_the_near_occurrence():
     # 20 秒側の発言。窓を広く取ると 0 秒側にも届く
     got = measure_segments([(phrase, 20.0, 24.5)], ws)
     assert got[0] is not None
-    assert abs(got[0].start - (20.0 - PAD)) < 1e-9
+    assert abs(got[0].start - 20.0) < 1e-9
 
 
 def test_measure_segments_still_finds_far_matches():
@@ -251,7 +250,7 @@ def test_measure_segments_still_finds_far_matches():
     ws = evenly(phrase, 40.0, 0.5)
     got = measure_segments([(phrase, 20.0, 24.5)], ws)      # 20 秒ずれている
     assert got[0] is not None
-    assert abs(got[0].start - (40.0 - PAD)) < 1e-9
+    assert abs(got[0].start - 40.0) < 1e-9
 
 
 def test_measure_segments_without_words():
@@ -291,8 +290,8 @@ def test_a_lucky_short_match_does_not_block_the_rest():
     spans.insert(1, ("まったくちがうはつげんです", 4.6, 5.9))
     got = measure_segments(spans, ws)
     assert got[2] is not None and got[3] is not None, "後ろの区間が巻き添えになった"
-    assert abs(got[2].start - (6.0 - PAD)) < 1e-9
-    assert abs(got[3].start - (12.0 - PAD)) < 1e-9
+    assert abs(got[2].start - 6.0) < 1e-9
+    assert abs(got[3].start - 12.0) < 1e-9
 
 
 # ======================================================================
