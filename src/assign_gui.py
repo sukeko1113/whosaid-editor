@@ -708,8 +708,11 @@ class AssignWindow(tk.Toplevel):
                 mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
             else:
                 mark = "✓"
-        # 時刻を直した区間は一覧でも分かるようにする(✓/△ と同じ考え方)
-        time_cell = ("✎ " if seg.time_edited else "") + fmt_hms(seg.start)
+        # 時刻をどこまで人が確かめたかも見えるようにする(話者の ✓/△ と同じ)
+        time_mark = ""
+        if seg.time_edited:
+            time_mark = "✎ " if seg.time_reviewed else "✎△"
+        time_cell = time_mark + fmt_hms(seg.start)
         values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", seg.preview(70))
         return values, tuple(tags)
@@ -868,7 +871,9 @@ class AssignWindow(tk.Toplevel):
             f"[{fmt_hms(seg.start)} → {fmt_hms(seg.end)}]  {seg.duration:.0f}秒{long_note}   "
             f"{seg.cluster_label}({self.suggester.cluster_summary(seg.cluster)})   "
             f"{state}"
-            + ("   ✎時刻を修正済み" if seg.time_edited else "")
+            + ("" if not seg.time_edited
+               else "   ✎時刻を修正済み" if seg.time_reviewed
+               else "   ✎△時刻は推定(未確認)")
             + (f"   ずれ補正 {self.proj.time_offset:+.1f}秒"
                if self.proj.time_offset and not seg.time_edited else "")
         )
@@ -942,6 +947,7 @@ class AssignWindow(tk.Toplevel):
 
         seg.start, seg.end = start, end
         seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = True        # 人が画面で決めた時刻(機械の推定と区別する)
         self._dirty = True
         self._show_times()
         self._update_seginfo()
@@ -965,6 +971,7 @@ class AssignWindow(tk.Toplevel):
         seg.start = float(seg.orig_start)
         seg.end = float(seg.orig_end)
         seg.time_edited = False
+        seg.time_reviewed = False
         self._dirty = True
         self._show_times()
         self._update_seginfo()

@@ -175,7 +175,7 @@ whosaid-editor/
 
 ```jsonc
 {
-  "schema": 2,
+  "schema": 4,
   "audio_path": "C:\\...\\meeting.m4a",
   "duration": 3600.0,
   "speakers": [ { "id": "sp01", "name": "佐藤", "note": "理事長", "order": 0 } ],
@@ -187,7 +187,11 @@ whosaid-editor/
       "chunk": 0,
       "speaker_id": "sp01",    // null なら未確定
       "reviewed": true,        // false = まとめて適用しただけ(未確認)
-      "text_edited": false     // true なら再実行時も本文を上書きしない
+      "text_edited": false,    // true なら再実行時も本文を上書きしない
+      "time_edited": false,    // true なら以後この区間にずれ補正を足さない
+      "time_reviewed": false,  // true = 時刻を自分の耳で確かめた
+      "orig_start": 0.0,       // AI が出した元の時刻。人が直しても動かさない
+      "orig_end": 25.0
     }
   ]
 }

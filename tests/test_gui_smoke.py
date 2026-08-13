@@ -191,6 +191,10 @@ def run() -> int:
         check("終了をナッジできる", abs(seg3.end - (orig3[1] + 1.0)) < 1e-6)
         check("そのとき開始は動かない", abs(seg3.start - 96.5) < 1e-6)
         check("一覧に ✎ が出る", win.tree.item("s3", "values")[0].startswith("✎"))
+        check("画面で直した時刻は確認済みになる", seg3.time_reviewed is True)
+        check("確認済みは ✎ で、✎△ にはしない",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        check("区間ヘッダにも確認済みと出る", "✎時刻を修正済み" in win.var_seginfo.get())
 
         win.var_start.set("ここは時刻を書く欄")
         win._commit_time("start")
@@ -202,6 +206,26 @@ def run() -> int:
         check("印が外れる", seg3.time_edited is False)
         check("元の時刻は保持されている", (seg3.orig_start, seg3.orig_end) == orig3)
         check("一覧の ✎ も消える", not win.tree.item("s3", "values")[0].startswith("✎"))
+        check("確認済みの印も外れる", seg3.time_reviewed is False)
+
+        # --- 時刻は入れたが自分の耳では未確認(✎△) --------------------------
+        # 機械が出した時刻を当てただけの状態。いまこれを作る操作は無いので直に
+        # 組み立てる(点検の提案をまとめて適用したときにこの状態になる)。
+        seg3.start, seg3.end = orig3[0] + 6.0, orig3[1] + 6.0
+        seg3.time_edited, seg3.time_reviewed = True, False
+        win._update_row(3)
+        win.goto(3)
+        check("未確認の時刻は一覧で ✎△",
+              win.tree.item("s3", "values")[0].startswith("✎△"))
+        check("区間ヘッダにも未確認と出る",
+              "✎△時刻は推定(未確認)" in win.var_seginfo.get())
+        win._shift_time(+0.1)
+        check("画面で直せば確認済みに変わる", seg3.time_reviewed is True)
+        check("一覧の印も ✎ に変わる",
+              win.tree.item("s3", "values")[0].startswith("✎ "))
+        win.revert_time()                                   # 後片付け
+        check("元に戻すと時刻も印も消える",
+              (seg3.start, seg3.end) == orig3 and seg3.time_reviewed is False)
 
         # 実データで詰まった 1.1 秒の相づちを 6.8 秒ずらす、と同じ形。
         # 「区間ごと」ボタンなら、長さより大きく動かしても潰れない
