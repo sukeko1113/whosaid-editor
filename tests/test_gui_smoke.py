@@ -309,6 +309,52 @@ def run() -> int:
                         payload={"start": 1.0, "end": 2.0}, evidence="",
                         confidence=1.0)
         check("対象が無ければ当てない", win.apply_proposal(gone, reviewed=True) is False)
+
+        # --- まとめて適用は順序に依存しない ---------------------------------
+        # ドリフト帯: 隣り合う 4 区間が全部 +7 秒ずれている。1 件ずつ前から
+        # 当てると、まだ動いていない隣の古い位置に切り詰められて潰れる。
+        # 行き先を先に全部解いてから書くので、何件でも同時に動かせる。
+        band = []
+        for i in (16, 17, 18, 19):
+            s = proj.segments[i]
+            band.append(Proposal(
+                id=f"b{i}", type="time", target_orig_start=float(s.orig_start),
+                payload={"start": float(s.orig_start) + 7.0,
+                         "end": float(s.orig_end) + 7.0},
+                evidence="", confidence=0.9))
+        ok, failed = win.apply_proposals_bulk(band)
+        check("ドリフト帯を全件まとめて当てられる",
+              len(ok) == 4 and not failed)
+        check("全件が提案どおりの位置に入る",
+              all(abs(proj.segments[i].start - (proj.segments[i].orig_start + 7.0))
+                  < 1e-6 for i in (16, 17, 18, 19)))
+        check("まとめて適用は全件 ✎△",
+              all(proj.segments[i].time_edited and not proj.segments[i].time_reviewed
+                  for i in (16, 17, 18, 19)))
+        check("承認済みとして記録される",
+              all(p.status == "accepted" for p in band))
+        # 隣どうしは重ならない(接点で切り詰め済み)
+        check("適用後も隣と重ならない",
+              all(proj.segments[i].end <= proj.segments[i + 1].start + 1e-6
+                  for i in (16, 17, 18)))
+
+        # 人が耳で確定した区間には、まとめて適用でも触れない
+        seg16 = proj.segments[16]
+        seg16.time_reviewed = True
+        again = Proposal(id="b16x", type="time",
+                         target_orig_start=float(seg16.orig_start),
+                         payload={"start": float(seg16.orig_start) + 9.0,
+                                  "end": float(seg16.orig_end) + 9.0},
+                         evidence="", confidence=0.9)
+        ok, failed = win.apply_proposals_bulk([again])
+        check("確定済み(✎)はまとめて適用でも動かない",
+              not ok and len(failed) == 1
+              and abs(seg16.start - (seg16.orig_start + 7.0)) < 1e-6)
+        for i in (16, 17, 18, 19):                          # 後片付け
+            s = proj.segments[i]
+            s.start, s.end = float(s.orig_start), float(s.orig_end)
+            s.time_edited = s.time_reviewed = False
+        win.reload_tree()
         for i in (9,):                                      # 後片付け
             s = proj.segments[i]
             s.start, s.end = s.orig_start, s.orig_end

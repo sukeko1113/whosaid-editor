@@ -1030,7 +1030,7 @@ class AssignWindow(tk.Toplevel):
         self.play_span(start, end, pre_roll=0.0)
 
     def _write_times(self, seg: Segment, start: float, end: float, *,
-                     reviewed: bool) -> None:
+                     reviewed: bool, refresh: bool = True) -> None:
         """区間に時刻を書く、ただ 1 つの経路。
 
         画面で直したときも、点検の提案を当てたときも必ずここを通す。
@@ -1038,11 +1038,15 @@ class AssignWindow(tk.Toplevel):
 
         reviewed: その時刻を人が耳で確かめたか。画面で決めた時刻は True、
         点検の提案をまとめて当てただけなら False(✎△ のまま残す)。
+        refresh: 画面を描き直すか。まとめて適用では 1 件ごとに描き直すと
+        百件級で待たされるので、呼び出し側が最後に 1 回だけ描き直す。
         """
         seg.start, seg.end = start, end
         seg.time_edited = True          # 以後この区間にずれ補正を足さない
         seg.time_reviewed = reviewed
         self._dirty = True
+        if not refresh:
+            return
         if seg.index == self.current:
             self._show_times()
             self._update_seginfo()
@@ -1069,30 +1073,91 @@ class AssignWindow(tk.Toplevel):
             f"(✎ {fmt_hms_frac(seg.start)} → {fmt_hms_frac(seg.end)})。"
         )
 
+    def plan_proposals(
+        self, proposals: Iterable[Proposal],
+    ) -> tuple[list[tuple[Segment, float, float, Proposal]], list[Proposal]]:
+        """提案の行き先を先に全部解く(適用順序で結果が変わらないようにする)。
+
+        1 件ずつ隣に合わせて切り詰めながら書くと、まとめて適用の結果が
+        適用順序に依存する。ドリフト帯を前から順に当てると、まだ動いて
+        いない隣の古い位置に切り詰められて、後の提案ほど潰れる
+        (+7 秒帯の再現実験では昇順で 4 件中 3 件が適用不可になった)。
+
+        そこで隣の位置は「同じバッチに提案があればその提案値、なければ
+        いまの位置」として先に全件を解き、書き込みはそのあと一括で行う。
+
+        戻り値: (書き込む計画, 当てられなかった提案)。
+        """
+        resolved: dict[int, tuple[Segment, Proposal]] = {}
+        failed: list[Proposal] = []
+        for p in proposals:
+            seg = target_segment(self.proj, p)
+            # 人が耳で確定した時刻は上書きしない(§3.4)。提案の生成後に
+            # ユーザーが確定した場合もここで止まる。
+            if seg is None or seg.time_reviewed or seg.index in resolved:
+                failed.append(p)
+                continue
+            resolved[seg.index] = (seg, p)
+
+        def dest_end(i: int) -> Optional[float]:
+            """区間 i の「行き先の終了」。バッチ内なら提案値、外ならいまの値。"""
+            if i < 0:
+                return None
+            if i in resolved:
+                seg, p = resolved[i]
+                return float(p.payload.get("end", seg.end))
+            return audio_span(self.proj.segments[i], self.proj.time_offset)[1]
+
+        def dest_start(i: int) -> Optional[float]:
+            if i >= len(self.proj.segments):
+                return None
+            if i in resolved:
+                seg, p = resolved[i]
+                return float(p.payload.get("start", seg.start))
+            return audio_span(self.proj.segments[i], self.proj.time_offset)[0]
+
+        planned: list[tuple[Segment, float, float, Proposal]] = []
+        for i in sorted(resolved):
+            seg, p = resolved[i]
+            start = float(p.payload.get("start", seg.start))
+            end = float(p.payload.get("end", seg.end))
+            clipped = clip_to_neighbours(start, end,
+                                         dest_end(i - 1), dest_start(i + 1))
+            if clipped is None:
+                failed.append(p)    # 切り詰めると潰れる。当てないほうがいい
+                continue
+            start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+            planned.append((seg, start, end, p))
+        return planned, failed
+
     def apply_proposal(self, proposal: Proposal, *, reviewed: bool) -> bool:
         """点検の提案を 1 件当てる。当てられなければ False を返す。
 
-        書き込みは画面の時刻編集と同じ _write_times を通す。隣の区間と
-        重なる提案は接点で切り詰める(1 件ずつ承認しても、まとめて適用しても
-        重ならないようにするため)。
+        書き込みは画面の時刻編集と同じ _write_times を通す。
         """
-        seg = target_segment(self.proj, proposal)
-        if seg is None:
+        planned, _ = self.plan_proposals([proposal])
+        if not planned:
             return False
-        start = float(proposal.payload.get("start", seg.start))
-        end = float(proposal.payload.get("end", seg.end))
-
-        i = seg.index
-        prev_end = (audio_span(self.proj.segments[i - 1], self.proj.time_offset)[1]
-                    if i > 0 else None)
-        next_start = (audio_span(self.proj.segments[i + 1], self.proj.time_offset)[0]
-                      if i + 1 < len(self.proj.segments) else None)
-        clipped = clip_to_neighbours(start, end, prev_end, next_start)
-        if clipped is None:
-            return False            # 切り詰めると潰れる。当てないほうがいい
-        start, end = clamp_times(*clipped, self.proj.duration, moved="end")
+        seg, start, end, _p = planned[0]
         self._write_times(seg, start, end, reviewed=reviewed)
         return True
+
+    def apply_proposals_bulk(
+        self, proposals: Iterable[Proposal],
+    ) -> tuple[list[Proposal], list[Proposal]]:
+        """提案をまとめて当てる(すべて ✎△。人の耳の確認は後から)。
+
+        戻り値: (当てられた提案, 当てられなかった提案)。status もここで更新する。
+        """
+        planned, failed = self.plan_proposals(proposals)
+        for seg, start, end, p in planned:
+            self._write_times(seg, start, end, reviewed=False, refresh=False)
+            p.status = "accepted"
+        if planned:
+            self.reload_tree()
+            self._show_times()
+            self._update_seginfo()
+        return [p for _, _, _, p in planned], failed
 
     def revert_time(self) -> None:
         """パイプラインが出した元の時刻に戻す(以後はまたずれ補正が効く)。"""
@@ -1894,11 +1959,14 @@ class AssignWindow(tk.Toplevel):
                            pre_roll=min(0.4, max(0.05, (end - start) * 0.25)))
 
         def bulk(keys) -> None:
-            for key in keys:
-                self.decide_proposal(by_id[key], "bulk")
-            self._set_action(
-                f"{len(keys)} 件をまとめて当てました(✎△)。"
-                "聴いて確かめると ✎ になります。")
+            ok, failed = self.apply_proposals_bulk([by_id[k] for k in keys])
+            for p in failed:
+                p.status = "rejected"       # 当てられない提案は繰り返さない
+            msg = (f"{len(ok)} 件をまとめて当てました(✎△)。"
+                   "聴いて確かめると ✎ になります。")
+            if failed:
+                msg += f" {len(failed)} 件は当てられませんでした。"
+            self._set_action(msg)
 
         dlg = ProposalDialog(
             self, self._proposal_rows(proposals),
