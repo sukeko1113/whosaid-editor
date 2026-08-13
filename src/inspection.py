@@ -249,8 +249,13 @@ def inspect_times(
         # 実測できたときだけ足す(測っていない値に余白を足す意味はない)。
         keep_tail = m.tail_gap >= tail_gap_limit
         pad_start = max(0.0, start - START_PAD)
-        pad_end = (pad_start + (now_end - now_start)) if keep_tail \
-            else m.end + END_PAD
+        if keep_tail:
+            pad_end = pad_start + (now_end - now_start)
+        else:
+            # 上限未満の小さな尻欠けも、頭と同じ換算で先へ伸ばす。
+            # 聴き取り 3 回目: 尻欠け 2 字(換算 0.8 秒)の区間で、
+            # 最後の「はい」が切れていた。
+            pad_end = m.end + m.tail_gap / rate + END_PAD
 
         result.proposals.append(Proposal(
             id=_proposal_id(PROPOSAL_TIME, float(seg.orig_start),

@@ -289,7 +289,27 @@ def test_heard_tail_uses_measured_end():
     got = inspect_times(project(drift=6.8), measured_words())
     p = got.proposals[0]
     assert "終わりは測れず" not in p.evidence
-    assert abs(p.payload["end"] - 4.55) < 0.2       # 実測の終了(4.5 + 余白)
+    assert abs(p.payload["end"] - 4.7) < 0.2       # 実測の終了(4.5 + 余白)
+
+
+def test_small_tail_gap_extends_the_end():
+    """上限未満の小さな尻欠けは、頭と同じ換算で終了を先へ伸ばす。
+
+    聴き取り 3 回目: 尻欠け 2 字の区間で最後の「はい」が切れていた。
+    実測の終了は「最後に一致した文字」までしか届かないので、欠けた分を
+    発話速度で換算して足す。
+    """
+    heard = "きょうのてんきはとてもすごしやすい"     # 17 字は実測にある
+    proj = Project(audio_path="a.m4a", duration=120.0)
+    # 末尾の「よね」2 字は聞き取られていない(尻欠け 2 < 上限 3)
+    proj.segments = [Segment(index=0, start=40.0, end=44.0,
+                             text=heard + "よね", cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.2))    # 5 字/秒
+    assert len(got.proposals) == 1
+    p = got.proposals[0]
+    # 実測終了 33.4 + 換算 0.4 秒 + 余白 0.2 秒 = 34.0
+    assert abs(p.payload["end"] - 34.0) < 0.05
+    assert "終わりは測れず" not in p.evidence
 
 
 def test_unmatched_segments_are_counted():
