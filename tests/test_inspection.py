@@ -284,6 +284,40 @@ def test_scattered_match_is_not_proposed():
     assert got.scattered == 1
 
 
+def test_stretched_match_is_not_proposed():
+    """実測が区間の長さより大きく伸びていたら信用しない。
+
+    照合が遠くまで届きすぎている印で、区間の外の沈黙や別の発言まで
+    抱き込んでいる(実測: 保存 4.7 秒の区間が 25.7 秒に伸びた例)。
+    """
+    heard = "きょうのてんきはとてもすごしやすいですね"
+    proj = Project(audio_path="a.m4a", duration=200.0)
+    # 区間は 5 秒ぶんのつもりだが、実測は 20 秒に散らばっている
+    proj.segments = [Segment(index=0, start=40.0, end=45.0,
+                             text=heard, cluster="0:A")]
+    ws = [Word(text=ch, start=30.0 + i, end=30.5 + i)
+          for i, ch in enumerate(heard)]        # 1 字 1 秒 = 20 秒ぶん
+    got = inspect_times(proj, ws)
+    assert got.proposals == []
+    assert got.stretched + got.scattered == 1
+
+
+def test_long_segment_may_stretch_a_little():
+    """長い区間の数十秒の伸びは正常。比で見るので巻き込まない。
+
+    実測: 保存 201 秒の区間が +18.8 秒伸びていたが、聴き取りでは当たりだった。
+    """
+    heard = "きょうのてんきはとてもすごしやすいですね" * 10
+    proj = Project(audio_path="a.m4a", duration=400.0)
+    proj.segments = [Segment(index=0, start=150.0, end=350.0,
+                             text=heard, cluster="0:A")]
+    # 実測は 100 秒から 220 秒(伸び +18 秒相当だが比では 1.09 倍)
+    ws = [Word(text=ch, start=100.0 + i * 1.09, end=100.5 + i * 1.09)
+          for i, ch in enumerate(heard)]
+    got = inspect_times(proj, ws, wide_window=200.0)
+    assert got.stretched == 0
+
+
 def test_heard_tail_uses_measured_end():
     """末尾まで乗っていれば、終了も実測で直す(従来どおり)。"""
     got = inspect_times(project(drift=6.8), measured_words())

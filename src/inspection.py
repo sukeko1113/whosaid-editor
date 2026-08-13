@@ -68,6 +68,14 @@ MIN_DENSITY = 1.5
 # 提案しない(補正が実測より大きくなったら、それはもう推定であって実測ではない)。
 HEAD_COMP_MAX = 6.0
 
+# 実測の範囲が、いまの区間の長さのこの倍(＋1 秒)を超えて伸びていたら、
+# 照合が遠くまで届きすぎている。区間の中に無いはずの沈黙や別の発言まで
+# 抱き込んでいるので、時刻も分割候補も信用できない。
+# 実測(67 分会議): 保存 4.7 秒の区間が 25.7 秒に伸びていた例がある。
+# 判定を比にするのは、長い区間の数十秒の伸びは正常だから
+# (保存 201 秒に対する +18.8 秒の区間は、聴き取りで当たりだった)。
+STRETCH_RATIO = 1.5
+
 # 提案どうしの実測範囲が、短いほうの半分を超えて重なっていたら「取り合い」。
 # 挨拶やお礼の応酬(「よろしくお願いします」の連発)では、複数の区間が同じ
 # 音声位置に当たる。正しいのは高々 1 つで、どれかは機械には決められない。
@@ -121,6 +129,7 @@ class InspectResult:
     low_coverage: int = 0       # 一致はしたが乗りが足りない
     short_match: int = 0        # 一致した文字が少なすぎる(偶然かもしれない)
     scattered: int = 0          # 一致が広い範囲に散らばりすぎている
+    stretched: int = 0          # 実測の範囲が区間より大きく伸びている
     head_lost: int = 0          # 頭の欠けが大きすぎて開始を測れない
     close_enough: int = 0       # 開始のずれが小さいので出す必要がない
     conflicted: int = 0         # 他の提案と同じ音声位置を取り合った
@@ -130,13 +139,14 @@ class InspectResult:
     def checked(self) -> int:
         return (len(self.proposals) + self.reviewed + self.unmatched
                 + self.low_coverage + self.short_match + self.scattered
-                + self.head_lost + self.close_enough + self.conflicted)
+                + self.stretched + self.head_lost + self.close_enough
+                + self.conflicted)
 
     @property
     def weak(self) -> int:
         """根拠が弱くて出さなかった数(画面の内訳表示用)。"""
         return (self.low_coverage + self.short_match + self.scattered
-                + self.head_lost + self.conflicted)
+                + self.stretched + self.head_lost + self.conflicted)
 
 
 def _proposal_id(kind: str, orig_start: float, start: float, end: float) -> str:
@@ -172,6 +182,7 @@ def inspect_times(
     time_delta: float = TIME_DELTA,
     tail_gap_limit: int = TAIL_GAP_LIMIT,
     head_comp_max: float = HEAD_COMP_MAX,
+    stretch_ratio: float = STRETCH_RATIO,
     **anchor_kw: Any,
 ) -> InspectResult:
     """実測と突き合わせて、時刻の提案を作る(§3)。
@@ -226,6 +237,12 @@ def inspect_times(
         rate = m.matched / max(0.1, m.end - m.start)
         if rate < min_density:
             result.scattered += 1
+            continue
+
+        # 実測が区間の長さより大きく伸びていたら、照合が遠くまで届きすぎ。
+        # 区間の外の沈黙や別の発言まで抱き込んでいるので信用しない。
+        if (m.end - m.start) > (now_end - now_start) * stretch_ratio + 1.0:
+            result.stretched += 1
             continue
 
         # 本文の頭が聞き取られていない分、開始は実際より遅く出る。欠けた
