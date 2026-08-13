@@ -618,7 +618,9 @@ def run() -> int:
                         payload={"start": 1.0, "end": 2.0}, evidence="",
                         confidence=0.5)
         win.decide_proposal(lost, "accept")
-        check("当てられない提案は却下として残す", lost.status == "rejected")
+        # 却下ではなく pending のまま残す。隣が動いた後なら当てられたかも
+        # しれず、却下として記録すると正当な提案が二度と出なくなる
+        check("当てられない提案は pending のまま", lost.status == "pending")
 
         # 却下した提案は次の点検で出し直さない(sidecar に判断が残る)
         path = proposals_path(win._work_dir(), "ff00")

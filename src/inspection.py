@@ -430,3 +430,14 @@ def merge_history(fresh: Sequence[Proposal],
     decided = {p.id: p.status for p in history
                if p.status in ("accepted", "rejected")}
     return [p for p in fresh if p.id not in decided]
+
+
+def decided_history(history: Sequence[Proposal]) -> list[Proposal]:
+    """保存し直すときに引き継ぐべき、判断済みの記録。
+
+    sidecar を最新の提案だけで上書きすると、点検を 2 回挟んだだけで
+    却下の記録が消え、同じ提案が三たび出てくる(§6.1 違反)。保存側は
+    必ず「今回の提案 + これ」を書くこと。pending は引き継がない
+    (古い pending は次の点検で作り直されるか、実測が変わって消える)。
+    """
+    return [p for p in history if p.status in ("accepted", "rejected")]

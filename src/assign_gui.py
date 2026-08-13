@@ -31,6 +31,7 @@ from .config import load_config
 from .inspection import (
     Proposal,
     clip_to_neighbours,
+    decided_history,
     inspect_times,
     load_proposals,
     merge_history,
@@ -1884,7 +1885,8 @@ class AssignWindow(tk.Toplevel):
         """実測が揃った。照合して提案を作り、一覧を出す。"""
         result = inspect_times(self.proj, words)
         path = proposals_path(self._work_dir(), self.proj.audio_fingerprint)
-        fresh = merge_history(result.proposals, load_proposals(path))
+        history = load_proposals(path)
+        fresh = merge_history(result.proposals, history)
 
         summary = (f"{result.checked} 区間を点検: 提案 {len(fresh)} 件"
                    f"(確認済み {result.reviewed} / 照合できず {result.unmatched} / "
@@ -1897,7 +1899,7 @@ class AssignWindow(tk.Toplevel):
                 parent=self,
             )
             return
-        self._open_proposals(fresh, path)
+        self._open_proposals(fresh, path, decided_history(history))
 
     def _proposal_rows(self, proposals) -> list[ProposalRow]:
         """提案を一覧の行にする。ここでしか画面用の言い回しを作らない。"""
@@ -1927,16 +1929,19 @@ class AssignWindow(tk.Toplevel):
 
         decision: "accept"(聴いて承認 → ✎) / "bulk"(まとめて適用 → ✎△)
                   / "reject"(却下)
-        当てられなかった提案は却下として残す。次の点検で同じものを
-        出し直しても、また当てられないため。
+        当てられなかった提案は pending のまま残す。隣が動いた後なら
+        当てられたかもしれず、再点検で出直せるようにするため。却下として
+        記録すると、同じ根拠の正当な提案が二度と出なくなる。
+        再提示を抑止するのは、人が明示的に却下したものだけ。
         """
         if decision == "reject":
             proposal.status = "rejected"
             return
-        applied = self.apply_proposal(proposal, reviewed=(decision == "accept"))
-        proposal.status = "accepted" if applied else "rejected"
+        if self.apply_proposal(proposal, reviewed=(decision == "accept")):
+            proposal.status = "accepted"
 
-    def _open_proposals(self, proposals, path: Optional[Path]) -> None:
+    def _open_proposals(self, proposals, path: Optional[Path],
+                        history: Iterable[Proposal] = ()) -> None:
         by_id = {p.id: p for p in proposals}
 
         def play(key: str, *, proposed: bool = True) -> None:
@@ -1960,8 +1965,7 @@ class AssignWindow(tk.Toplevel):
 
         def bulk(keys) -> None:
             ok, failed = self.apply_proposals_bulk([by_id[k] for k in keys])
-            for p in failed:
-                p.status = "rejected"       # 当てられない提案は繰り返さない
+            # 当てられなかった分は pending のまま(隣が動けば次は当たるかもしれない)
             msg = (f"{len(ok)} 件をまとめて当てました(✎△)。"
                    "聴いて確かめると ✎ になります。")
             if failed:
@@ -1977,8 +1981,10 @@ class AssignWindow(tk.Toplevel):
             on_reject=lambda k: self.decide_proposal(by_id[k], "reject"),
         )
         self.wait_window(dlg)
-        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)
-        save_proposals(path, proposals)
+        # 判断を残す。却下したものを再点検で出し直さないため(§6.1)。
+        # 過去の判断済み(history)も一緒に書き戻す。今回の提案だけで
+        # 上書きすると、点検を 2 回挟んだだけで却下の記録が消える。
+        save_proposals(path, [*proposals, *history])
         self.update_status()
 
     def _on_close(self) -> None:

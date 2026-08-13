@@ -24,6 +24,7 @@ from src.inspection import (                              # noqa: E402
     PROPOSAL_TIME,
     Proposal,
     clip_to_neighbours,
+    decided_history,
     drop_conflicts,
     inspect_times,
     load_proposals,
@@ -521,6 +522,43 @@ def test_accepted_proposals_are_not_shown_again():
 def test_undecided_history_does_not_hide_anything():
     fresh = inspect_times(project(drift=6.8), measured_words()).proposals
     assert len(merge_history(fresh, list(fresh))) == len(fresh)      # pending
+
+
+def test_reject_history_survives_repeated_inspections():
+    """却下の記録は、点検を何回挟んでも消えない(§6.1)。
+
+    保存を「今回の提案だけ」で上書きすると、2 回目の保存で前回の却下が
+    落ち、3 回目の点検で同じ提案が出てくる。「今回の提案 + 判断済みの
+    履歴」を書き戻すのが正しい。
+    """
+    def fresh_proposals():
+        return inspect_times(project(drift=6.8), measured_words()).proposals
+
+    with tempfile.TemporaryDirectory() as d:
+        path = proposals_path(d, "ff00")
+        # 1 回目: 1 件目を却下して保存
+        r1 = fresh_proposals()
+        rejected_id = r1[0].id
+        r1[0].status = "rejected"
+        save_proposals(path, [*r1, *decided_history(load_proposals(path))])
+        # 2 回目: 却下済みは出ない。保存し直しても記録は残る
+        h2 = load_proposals(path)
+        fresh2 = merge_history(fresh_proposals(), h2)
+        assert rejected_id not in [p.id for p in fresh2]
+        save_proposals(path, [*fresh2, *decided_history(h2)])
+        # 3 回目: まだ出ない(今回の提案だけで上書きすると、ここで再登場していた)
+        h3 = load_proposals(path)
+        fresh3 = merge_history(fresh_proposals(), h3)
+        assert rejected_id not in [p.id for p in fresh3]
+
+
+def test_decided_history_drops_stale_pending():
+    """pending は引き継がない(次の点検で作り直されるため)。"""
+    got = inspect_times(project(drift=6.8), measured_words()).proposals
+    got[0].status = "accepted"
+    got[1].status = "rejected"
+    kept = decided_history(got)
+    assert [p.status for p in kept] == ["accepted", "rejected"]
 
 
 def test_new_evidence_comes_back_even_after_rejection():
