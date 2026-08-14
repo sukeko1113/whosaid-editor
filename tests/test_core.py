@@ -981,11 +981,62 @@ def test_unreviewed_time_survives_save_and_load():
         p = Path(d) / "a.speakers.json"
         proj.save(p)
         data = json.loads(p.read_text(encoding="utf-8"))
-        assert data["schema"] == SCHEMA_VERSION == 4
+        assert data["schema"] == SCHEMA_VERSION == 5
         again = Project.load(p)
     assert again.segments[0].time_edited is True
     assert again.segments[0].time_reviewed is False    # 既定値で上書きされない
     assert again.segments[1].time_reviewed is True
+
+
+# ======================================================================
+# 検証履歴の器(schema 5)
+# ======================================================================
+
+def test_v4_file_reads_with_empty_history_fields():
+    """v4 以前のファイルは既定値だけで読め、保存すると v5 になる。"""
+    old = {
+        "schema": 4,
+        "audio_path": "a.m4a",
+        "duration": 100.0,
+        "segments": [
+            {"index": 0, "start": 0.0, "end": 5.0, "text": "あ", "cluster": "0:A"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        proj = Project.load(p)
+        assert proj.source_sha256 == ""
+        assert proj.engine == {}
+        assert proj.doc_revision == 0
+        assert proj.edit_log == []
+        # 開いて保存しただけでは版を進めない(開いた事実は版ではない)
+        proj.save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["schema"] == 5
+    assert data["doc_revision"] == 0
+
+
+def test_history_fields_round_trip():
+    """v5 の 4 フィールドが保存・読込で欠けない。"""
+    proj = Project(audio_path="a.m4a", duration=10.0)
+    proj.segments = [Segment(index=0, start=0.0, end=5.0, text="あ",
+                             cluster="0:A")]
+    proj.source_sha256 = "ab" * 32
+    proj.engine = {"mode": "cloud", "model": "gemini-2.5-flash",
+                   "app_version": "2.1.0", "at": "2026-08-14T05:00:00Z"}
+    proj.doc_revision = 3
+    proj.edit_log = [{"at": "2026-08-14T05:01:00Z", "actor": "user",
+                      "kind": "time", "target": 0.0,
+                      "before": [0.0, 5.0], "after": [1.0, 6.0]}]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.speakers.json"
+        proj.save(p)
+        again = Project.load(p)
+    assert again.source_sha256 == "ab" * 32
+    assert again.engine["model"] == "gemini-2.5-flash"
+    assert again.doc_revision == 3
+    assert again.edit_log[0]["kind"] == "time"
 
 
 def test_split_inherits_time_reviewed():

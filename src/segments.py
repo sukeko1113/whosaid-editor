@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -296,6 +296,22 @@ class Project:
     # 再生位置のずれ補正(秒)。Gemini の時刻推定が実音声より早い/遅いときに
     # 使う。録音ごとに傾向が違うので、設定ではなく作業ファイルに持たせる。
     time_offset: float = 0.0
+    # ---- ここから v5(検証履歴)。追加は文書レベルのみで、区間の形は変えない ----
+    # 元音声の SHA-256。「この書面はこの録音から作った」を第三者が
+    # Get-FileHash / certutil / sha256sum で検算するための値。
+    # 指紋(audio_fingerprint)とは役割が違う: あちらはキャッシュの同一性判定。
+    source_sha256: str = ""
+    # 処理経路の記録(自由形式)。慣例のキー: mode("cloud"/"local")・model・
+    # app_version・at(UTC の ISO8601)。将来のモデル出所記録(Model BOM)にも
+    # ここを拡張して使う。
+    engine: dict[str, Any] = field(default_factory=dict)
+    # Word を出力するたびに +1 し、書面に「版」として併記する。
+    # ファイルを開いただけでは進めない(開いた事実は版ではない)。
+    doc_revision: int = 0
+    # 追記型の編集履歴。慣例のキー: at(UTC)・actor("user"/"inspect")・
+    # kind(time/text/speaker/…)・target(orig_start)・before/after・batch_id。
+    # v5 では器だけを定義し、記録の書き込みは編集履歴の実装(Day 45)で行う。
+    edit_log: list[dict[str, Any]] = field(default_factory=list)
     speakers: list[Speaker] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     json_path: Optional[str] = None      # 保存先(load 時に設定)
@@ -476,6 +492,10 @@ class Project:
             "verbatim": self.verbatim,
             "audio_fingerprint": self.audio_fingerprint,
             "time_offset": self.time_offset,
+            "source_sha256": self.source_sha256,
+            "engine": self.engine,
+            "doc_revision": self.doc_revision,
+            "edit_log": self.edit_log,
             "speakers": [sp.to_dict() for sp in self.speakers],
             "segments": [sg.to_dict() for sg in self.segments],
         }
@@ -490,6 +510,11 @@ class Project:
             verbatim=bool(d.get("verbatim", False)),
             audio_fingerprint=str(d.get("audio_fingerprint", "")),
             time_offset=float(d.get("time_offset", 0.0) or 0.0),
+            # v4 以前のファイルには無い。既定値で読めば移行処理は不要
+            source_sha256=str(d.get("source_sha256", "")),
+            engine=dict(d.get("engine") or {}),
+            doc_revision=int(d.get("doc_revision", 0) or 0),
+            edit_log=list(d.get("edit_log") or []),
             speakers=[Speaker.from_dict(x) for x in d.get("speakers", [])],
             segments=[Segment.from_dict(x) for x in d.get("segments", [])],
         )

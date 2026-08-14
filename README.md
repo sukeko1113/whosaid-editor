@@ -175,9 +175,13 @@ whosaid-editor/
 
 ```jsonc
 {
-  "schema": 4,
+  "schema": 5,
   "audio_path": "C:\\...\\meeting.m4a",
   "duration": 3600.0,
+  "source_sha256": "",     // 元音声の SHA-256。第三者が検算するための値
+  "engine": {},            // 処理経路の記録(クラウド/ローカル・モデル等)
+  "doc_revision": 0,       // Word を出力するたびに +1(書面に「版」として併記)
+  "edit_log": [],          // 追記型の編集履歴(編集履歴の実装で記録される)
   "speakers": [ { "id": "sp01", "name": "佐藤", "note": "理事長", "order": 0 } ],
   "segments": [
     {
