@@ -26,7 +26,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Iterable, Optional
 
 from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
-from .audio import extract_peaks
+from .audio import audio_hashes, extract_peaks
 from .config import load_config
 from .inspection import (
     Proposal,
@@ -563,6 +563,9 @@ class AssignWindow(tk.Toplevel):
         self.btn_undo_bulk.pack(side="left")
         ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
         ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
+        # 「この書面はこの録音から作った」の検算(SHA-256 の再計算と突き合わせ)
+        ttk.Button(bottom, text="元音声と照合", command=self.verify_source_audio)\
+            .pack(side="right", padx=(0, 6))
 
         self.var_backend.set({
             "ffplay": "再生: ffplay(同梱)",
@@ -1745,8 +1748,75 @@ class AssignWindow(tk.Toplevel):
         except tk.TclError:
             pass    # ウィンドウが閉じられた
 
+    def ensure_source_sha(self) -> bool:
+        """元音声の SHA-256 が未記録なら計算して記録する。
+
+        古い作業ファイル(v4 以前)には無いので、Word 出力の前にここで埋める。
+        音声が無い・読めないときは False(出力自体は続けてよい。検証要約に
+        SHA-256 の行が出ないだけ)。
+        """
+        if self.proj.source_sha256:
+            return True
+        audio = Path(self.proj.audio_path)
+        if not audio.exists():
+            return False
+        self._set_action("元音声の SHA-256 を計算しています...")
+        self.update_idletasks()
+        _fp, sha = audio_hashes(audio)
+        if not sha:
+            self._set_action("元音声を読めなかったため、SHA-256 は未記録のままです。")
+            return False
+        self.proj.source_sha256 = sha
+        self._dirty = True
+        self._set_action(f"元音声の SHA-256 を記録しました({sha[:16]}…)。")
+        return True
+
+    def verify_source_audio(self) -> None:
+        """いまの元音声を読み直して、記録した SHA-256 と一致するか確かめる。
+
+        「この書面はこの録音から作った」の検算。第三者は Get-FileHash 等で
+        同じ値を計算できる。
+        """
+        audio = Path(self.proj.audio_path)
+        if not audio.exists():
+            messagebox.showinfo("照合できません",
+                                f"元音声が見つかりません:\n{audio}", parent=self)
+            return
+        if not self.proj.source_sha256:
+            # 未記録なら、照合ではなく初回の記録として扱う
+            if self.ensure_source_sha():
+                self.save()
+                messagebox.showinfo(
+                    "記録しました",
+                    "元音声の SHA-256 を記録しました。\n\n"
+                    f"{self.proj.source_sha256}\n\n"
+                    "次回からは、この値と一致するかを照合できます。",
+                    parent=self)
+            return
+        self._set_action("元音声を読み直して照合しています...")
+        self.update_idletasks()
+        _fp, sha = audio_hashes(audio)
+        if sha == self.proj.source_sha256:
+            self._set_action("元音声と一致しました。")
+            messagebox.showinfo(
+                "一致しました",
+                "元音声の SHA-256 は記録と一致しています。\n\n"
+                f"{sha}",
+                parent=self)
+        else:
+            self._set_action("元音声が記録と一致しません。")
+            messagebox.showwarning(
+                "一致しません",
+                "元音声の SHA-256 が記録と違います。ファイルが差し替わって"
+                "いるか、内容が変わっています。\n\n"
+                f"記録: {self.proj.source_sha256}\n"
+                f"現在: {sha or '(読めませんでした)'}",
+                parent=self)
+
     def export_docx(self) -> None:
         self._commit_text()
+        # 検証要約に載せる SHA-256 が未記録なら、ここで埋めてから保存する
+        self.ensure_source_sha()
         self.save()
 
         dlg = tk.Toplevel(self)
@@ -1815,6 +1885,8 @@ class AssignWindow(tk.Toplevel):
         if not path:
             return
         try:
+            # 版はこの出力で 1 つ進める(出力できたときだけ確定して保存する)
+            next_revision = self.proj.doc_revision + 1
             out = write_docx(
                 self.proj, path,
                 title=var_title.get() or None,
@@ -1822,6 +1894,7 @@ class AssignWindow(tk.Toplevel):
                 merge_consecutive=var_merge.get(),
                 include_attendees=var_attend.get(),
                 drop_noise=var_noise.get(),
+                revision=next_revision,
             )
             if var_txt.get():
                 write_text(self.proj, Path(path).with_suffix(".txt"),
@@ -1829,6 +1902,9 @@ class AssignWindow(tk.Toplevel):
         except Exception:
             messagebox.showerror("出力エラー", traceback.format_exc(), parent=self)
             return
+        self.proj.doc_revision = next_revision
+        self._dirty = True
+        self.save()
         if messagebox.askyesno("出力完了", f"{out}\n\nファイルを開きますか?", parent=self):
             _open_path(out)
 

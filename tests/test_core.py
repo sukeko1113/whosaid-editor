@@ -46,6 +46,54 @@ from src.transcribe import (  # noqa: E402
 
 
 # ======================================================================
+# 音声のハッシュ(指紋と SHA-256)
+# ======================================================================
+
+def test_audio_hashes_computes_both_in_one_pass():
+    """指紋と SHA-256 を同時に返し、SHA-256 は外部ツールの計算と一致する。"""
+    import hashlib
+
+    from src.audio import audio_fingerprint, audio_hashes
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.wav"
+        payload = b"RIFF" + bytes(range(256)) * 512
+        p.write_bytes(payload)
+
+        fp, sha = audio_hashes(p)
+        # SHA-256 は素のファイル内容のハッシュ(certutil 等で検算できる値)
+        assert sha == hashlib.sha256(payload).hexdigest()
+        assert len(sha) == 64
+        # 指紋は既存アルゴリズム(サイズをシードに含む BLAKE2b 64bit)と同一
+        assert fp == audio_fingerprint(p)
+        h = hashlib.blake2b(digest_size=8)
+        h.update(str(len(payload)).encode("ascii"))
+        h.update(payload)
+        assert fp == h.hexdigest()
+
+
+def test_audio_hashes_missing_file():
+    from src.audio import audio_fingerprint, audio_hashes
+
+    missing = Path("C:/no/such/dir/none.wav")
+    assert audio_hashes(missing) == ("", "")
+    assert audio_fingerprint(missing) == ""
+
+
+def test_audio_hashes_change_with_content():
+    """1 バイト変われば両方とも別の値になる(同一性判定の前提)。"""
+    from src.audio import audio_hashes
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.wav"
+        p.write_bytes(b"abcdefg")
+        before = audio_hashes(p)
+        p.write_bytes(b"abcdefh")
+        after = audio_hashes(p)
+    assert before[0] != after[0] and before[1] != after[1]
+
+
+# ======================================================================
 # 名簿パース
 # ======================================================================
 
@@ -933,11 +981,102 @@ def test_unreviewed_time_survives_save_and_load():
         p = Path(d) / "a.speakers.json"
         proj.save(p)
         data = json.loads(p.read_text(encoding="utf-8"))
-        assert data["schema"] == SCHEMA_VERSION == 4
+        assert data["schema"] == SCHEMA_VERSION == 5
         again = Project.load(p)
     assert again.segments[0].time_edited is True
     assert again.segments[0].time_reviewed is False    # 既定値で上書きされない
     assert again.segments[1].time_reviewed is True
+
+
+# ======================================================================
+# 検証履歴の器(schema 5)
+# ======================================================================
+
+def test_v4_file_reads_with_empty_history_fields():
+    """v4 以前のファイルは既定値だけで読め、保存すると v5 になる。"""
+    old = {
+        "schema": 4,
+        "audio_path": "a.m4a",
+        "duration": 100.0,
+        "segments": [
+            {"index": 0, "start": 0.0, "end": 5.0, "text": "あ", "cluster": "0:A"},
+        ],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "old.speakers.json"
+        p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        proj = Project.load(p)
+        assert proj.source_sha256 == ""
+        assert proj.engine == {}
+        assert proj.doc_revision == 0
+        assert proj.edit_log == []
+        # 開いて保存しただけでは版を進めない(開いた事実は版ではない)
+        proj.save(p)
+        data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["schema"] == 5
+    assert data["doc_revision"] == 0
+
+
+def test_write_docx_verification_summary():
+    """Word の末尾に検証要約(SHA-256・処理経路・版・確認状態)が付く。"""
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    proj.segments[0].speaker_id = sid
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = sid          # まとめて適用(未確認)扱い
+    proj.segments[0].time_edited = True
+    proj.segments[0].time_reviewed = True
+    proj.source_sha256 = "cd" * 32
+    proj.engine = {"mode": "cloud", "model": "gemini-2.5-flash",
+                   "at": "2026-08-14T05:00:00Z"}
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, revision=3)
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs)
+    assert "検証要約" in text
+    assert "cd" * 32 in text
+    assert "クラウド / gemini-2.5-flash" in text
+    assert "revision 3" in text
+    assert "聴いて確定 1" in text and "まとめて適用 1" in text
+    assert "聴いて確認 1" in text                  # 時刻の ✎
+    assert "保証するものではありません" in text
+
+
+def test_write_docx_verification_can_be_omitted():
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, include_verification=False)
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs)
+    assert "検証要約" not in text
+
+
+def test_history_fields_round_trip():
+    """v5 の 4 フィールドが保存・読込で欠けない。"""
+    proj = Project(audio_path="a.m4a", duration=10.0)
+    proj.segments = [Segment(index=0, start=0.0, end=5.0, text="あ",
+                             cluster="0:A")]
+    proj.source_sha256 = "ab" * 32
+    proj.engine = {"mode": "cloud", "model": "gemini-2.5-flash",
+                   "app_version": "2.1.0", "at": "2026-08-14T05:00:00Z"}
+    proj.doc_revision = 3
+    proj.edit_log = [{"at": "2026-08-14T05:01:00Z", "actor": "user",
+                      "kind": "time", "target": 0.0,
+                      "before": [0.0, 5.0], "after": [1.0, 6.0]}]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.speakers.json"
+        proj.save(p)
+        again = Project.load(p)
+    assert again.source_sha256 == "ab" * 32
+    assert again.engine["model"] == "gemini-2.5-flash"
+    assert again.doc_revision == 3
+    assert again.edit_log[0]["kind"] == "time"
 
 
 def test_split_inherits_time_reviewed():

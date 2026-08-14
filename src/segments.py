@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
@@ -296,6 +296,22 @@ class Project:
     # 再生位置のずれ補正(秒)。Gemini の時刻推定が実音声より早い/遅いときに
     # 使う。録音ごとに傾向が違うので、設定ではなく作業ファイルに持たせる。
     time_offset: float = 0.0
+    # ---- ここから v5(検証履歴)。追加は文書レベルのみで、区間の形は変えない ----
+    # 元音声の SHA-256。「この書面はこの録音から作った」を第三者が
+    # Get-FileHash / certutil / sha256sum で検算するための値。
+    # 指紋(audio_fingerprint)とは役割が違う: あちらはキャッシュの同一性判定。
+    source_sha256: str = ""
+    # 処理経路の記録(自由形式)。慣例のキー: mode("cloud"/"local")・model・
+    # app_version・at(UTC の ISO8601)。将来のモデル出所記録(Model BOM)にも
+    # ここを拡張して使う。
+    engine: dict[str, Any] = field(default_factory=dict)
+    # Word を出力するたびに +1 し、書面に「版」として併記する。
+    # ファイルを開いただけでは進めない(開いた事実は版ではない)。
+    doc_revision: int = 0
+    # 追記型の編集履歴。慣例のキー: at(UTC)・actor("user"/"inspect")・
+    # kind(time/text/speaker/…)・target(orig_start)・before/after・batch_id。
+    # v5 では器だけを定義し、記録の書き込みは編集履歴の実装(Day 45)で行う。
+    edit_log: list[dict[str, Any]] = field(default_factory=list)
     speakers: list[Speaker] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     json_path: Optional[str] = None      # 保存先(load 時に設定)
@@ -476,6 +492,10 @@ class Project:
             "verbatim": self.verbatim,
             "audio_fingerprint": self.audio_fingerprint,
             "time_offset": self.time_offset,
+            "source_sha256": self.source_sha256,
+            "engine": self.engine,
+            "doc_revision": self.doc_revision,
+            "edit_log": self.edit_log,
             "speakers": [sp.to_dict() for sp in self.speakers],
             "segments": [sg.to_dict() for sg in self.segments],
         }
@@ -490,6 +510,11 @@ class Project:
             verbatim=bool(d.get("verbatim", False)),
             audio_fingerprint=str(d.get("audio_fingerprint", "")),
             time_offset=float(d.get("time_offset", 0.0) or 0.0),
+            # v4 以前のファイルには無い。既定値で読めば移行処理は不要
+            source_sha256=str(d.get("source_sha256", "")),
+            engine=dict(d.get("engine") or {}),
+            doc_revision=int(d.get("doc_revision", 0) or 0),
+            edit_log=list(d.get("edit_log") or []),
             speakers=[Speaker.from_dict(x) for x in d.get("speakers", [])],
             segments=[Segment.from_dict(x) for x in d.get("segments", [])],
         )
@@ -554,6 +579,38 @@ def _merge_runs(
     return [(start, sid, "".join(parts)) for start, sid, parts in runs]
 
 
+def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
+    """docx 末尾の「検証要約」の (項目, 値) を作る。
+
+    書くのは確認の履歴であって、正しさの保証ではない。何をどの経路で処理し、
+    人がどこまで確認したかを、第三者が検算できる形で残す(スキーマ v5)。
+    """
+    rows: list[tuple[str, str]] = [
+        ("元音声", f"{Path(proj.audio_path).name} ({fmt_hms(proj.duration)})"),
+    ]
+    if proj.source_sha256:
+        rows.append(("SHA-256", proj.source_sha256))
+    if proj.engine:
+        mode = {"cloud": "クラウド", "local": "ローカル"}.get(
+            str(proj.engine.get("mode", "")), str(proj.engine.get("mode", "")))
+        model = str(proj.engine.get("model", ""))
+        at = str(proj.engine.get("at", ""))
+        rows.append(("処理経路", " / ".join(x for x in (mode, model, at) if x)))
+    rows.append(("版", f"revision {revision} (schema {SCHEMA_VERSION})"))
+
+    heard = proj.reviewed_count
+    bulk = proj.unreviewed_count
+    unassigned = proj.total_count - proj.assigned_count
+    rows.append(("話者の確認", f"聴いて確定 {heard} / まとめて適用 {bulk} / "
+                              f"未確定 {unassigned}"))
+    t_heard = sum(1 for s in proj.segments if s.time_edited and s.time_reviewed)
+    t_bulk = sum(1 for s in proj.segments if s.time_edited and not s.time_reviewed)
+    rows.append(("時刻の修正", f"聴いて確認 {t_heard} / 適用のみ {t_bulk}"))
+    rows.append(("注意", "本書の記載は確認の履歴であり、内容の正しさや"
+                        "法的効力を保証するものではありません。"))
+    return rows
+
+
 def build_note(proj: Project) -> str:
     """docx 冒頭に入れる但し書き。何がどこまで人手で確認されたかを明示する。"""
     parts = [
@@ -578,8 +635,14 @@ def write_docx(
     include_note: bool = True,
     include_attendees: bool = True,
     drop_noise: bool = True,
+    include_verification: bool = True,
+    revision: Optional[int] = None,
 ) -> Path:
-    """割当結果を Word ファイルに書き出す。"""
+    """割当結果を Word ファイルに書き出す。
+
+    include_verification: 末尾に検証要約(元音声・SHA-256・処理経路・版・
+    確認状態)を付ける。revision はこの出力の版番号(省略時は記録済みの値)。
+    """
     from docx import Document
     from docx.shared import Pt, RGBColor
     from docx.oxml.ns import qn
@@ -629,6 +692,21 @@ def write_docx(
             # ユーザーが意図的に「不明」等と判断した区間はグレー
             name_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
         p.add_run(text)
+
+    if include_verification:
+        doc.add_paragraph()
+        head = doc.add_paragraph()
+        run = head.add_run("―― 検証要約 ――")
+        run.bold = True
+        for label, value in build_verification(
+                proj, revision if revision is not None else proj.doc_revision):
+            p = doc.add_paragraph()
+            r = p.add_run(f"{label}: ")
+            r.bold = True
+            r.font.size = Pt(9)
+            v = p.add_run(value)
+            v.font.size = Pt(9)
+            v.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
 
     doc.save(str(output_path))
     return output_path

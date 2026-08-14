@@ -102,6 +102,22 @@ def run() -> int:
     check("モデルが違えば別のキャッシュ",
           words_cache_path("w", "abcd1234", "base") != p)
 
+    # 手動配置フォルダの差し替えは、モデル名が同じでも中身が別物。
+    # フォルダをキーに含めないと、差し替え前の実測を使い回してしまう
+    d1 = words_cache_path("w", "abcd1234", "small", model_dir="C:/models/a")
+    d2 = words_cache_path("w", "abcd1234", "small", model_dir="C:/models/b")
+    check("フォルダが違えば別のキャッシュ", d1 != d2 and d1 != p)
+    check("同じフォルダなら同じキャッシュ",
+          d1 == words_cache_path("w", "abcd1234", "small",
+                                 model_dir="C:/models/a"))
+
+    # HF のリポ ID には「/」が入る。そのままだとキャッシュのファイル名が
+    # 下位フォルダに割れて、掃除や走査の前提が崩れる
+    hf = words_cache_path("w", "abcd1234", "kotoba-tech/kotoba-whisper-v2.0-faster")
+    check("リポ ID でもフォルダが割れない",
+          hf is not None and hf.parent.name == "align"
+          and "/" not in hf.name and "\\" not in hf.name)
+
     check("モデル名はそのまま渡す", resolve_model("small") == "small")
     try:
         resolve_model("small", model_dir="C:/no/such/folder")

@@ -831,6 +831,36 @@ def run() -> int:
         write_docx(reloaded, out)
         check("Word 出力", out.exists() and out.stat().st_size > 0)
 
+        # --- 元音声の SHA-256(記録と照合) --------------------------------
+        # 見本の音声ファイルは無いので、実体を作って記録→照合→改変を試す
+        audio_file = Path(proj.audio_path)
+        audio_file.write_bytes(b"RIFF-dummy-audio-content")
+        check("未記録なら計算して記録する",
+              win.ensure_source_sha() is True
+              and len(proj.source_sha256) == 64)
+        first_sha = proj.source_sha256
+        check("記録済みなら再計算しない",
+              win.ensure_source_sha() is True
+              and proj.source_sha256 == first_sha)
+
+        infos: list = []
+        real_info = assign_gui.messagebox.showinfo
+        real_warn = assign_gui.messagebox.showwarning
+        assign_gui.messagebox.showinfo = lambda t, *a, **k: infos.append(("i", t))
+        assign_gui.messagebox.showwarning = lambda t, *a, **k: infos.append(("w", t))
+        try:
+            win.verify_source_audio()
+            check("一致すれば一致と伝える", infos[-1] == ("i", "一致しました"))
+            audio_file.write_bytes(b"RIFF-dummy-audio-CHANGED")
+            win.verify_source_audio()
+            check("中身が変われば不一致と警告する",
+                  infos[-1] == ("w", "一致しません"))
+            check("警告しても記録は書き換えない", proj.source_sha256 == first_sha)
+        finally:
+            assign_gui.messagebox.showinfo = real_info
+            assign_gui.messagebox.showwarning = real_warn
+            audio_file.unlink(missing_ok=True)
+
         win.player.close()
         win.destroy()
         root.destroy()
