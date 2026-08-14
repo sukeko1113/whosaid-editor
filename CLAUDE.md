@@ -3,8 +3,15 @@
 ## プロジェクト概要
 
 whosaid-editor: 日本語会議音声の逐語反訳＋話者割当エディタ（Windows デスクトップ / Python + Tkinter）。
-転写は Gemini API（gemini-2.5-flash）。製品価値は転写速度ではなく「誰が言ったかの検証済み記録」。
+製品価値は転写速度ではなく「誰が言ったかの検証済み記録」。
 AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴いて確定する。
+
+転写は 2 経路（`EngineSpec` で選ぶ。設計書 `claude/claude_ローカル転写_設計書.md`）:
+
+- **ローカル（既定）**: faster-whisper。端末内で完結し、API キーも要らない。
+  ただし**声のまとまり（A/B/C）を作る者がいない**ので全区間が `?` になる。
+  話者分離は未実装（別設計書・Day 30 の必須項目）。
+- **クラウド（明示選択）**: Gemini API（gemini-2.5-flash）。A/B/C のクラスタが付く。
 
 ## 絶対に守る設計原則
 
@@ -29,11 +36,16 @@ AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴�
 ## テスト
 
 - `pytest tests/` は命名規約の関係で GUI・結合テストを黙って skip する。
-  全チェック（約 127 項目）は必ず個別実行で確認する:
+  全チェック（約 440 項目）は必ず個別実行で確認する:
   - `python tests\test_core.py`
-  - `python tests\test_gui_smoke.py`
+  - `python tests\test_anchor.py`
+  - `python tests\test_inspection.py`
   - `python tests\test_pipeline_integration.py`
+  - `python tests\test_gui_smoke.py`
+- 実モデル（faster-whisper）を使う確認は `python tests\test_align_integration.py`。
+  CI 対象外で、SAPI 合成音声を作って align.py と local_asr.py の両方を見る。
 - 新設テストも、個別実行で全チェックが走る構成にすること。
+  複数の `run()` を持つファイルは、短絡評価（`run() or run2()`）にしない。
 
 ## 作業の進め方（必須）
 
