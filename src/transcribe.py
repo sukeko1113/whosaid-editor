@@ -11,6 +11,8 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 
+from .segments import Utterance, utterances_to_segments
+
 
 # ======================================================================
 # プロンプト部品
@@ -633,22 +635,20 @@ def merge_consecutive(
     return out
 
 
-def parse_segments(
+def parse_utterances(
     text: str,
-    chunk_index: int = 0,
-    offset_seconds: float = 0.0,
     chunk_seconds: float | None = None,
-    start_index: int = 0,
     merge_same_speaker: bool = True,
-) -> list[dict]:
-    """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
+) -> list[Utterance]:
+    """1 チャンクの出力テキストを Utterance の並びに変換する。
 
-    - 時刻はチャンク内相対値として読み、offset_seconds を足して絶対秒にする
+    - 時刻はチャンク内の相対秒のまま返す(絶対秒にするのは共通の後段の仕事)
     - 時刻が巻き戻っている行は直前の時刻に合わせる(Gemini が稀に乱す)
     - 行頭が時刻でない行は、直前の区間の続きとして連結する
     - 区間の終了時刻は「次の区間の開始」、最後だけチャンク末尾
 
-    戻り値の各要素は Segment(...) にそのまま渡せるキーを持つ。
+    ここまでが「クラウド経路がやること」。ローカル経路(local_asr.py)は
+    同じ形の Utterance を faster-whisper から直接作る(設計書 §4.2)。
     """
     raw: list[dict] = []
     prev_rel = 0.0
@@ -717,21 +717,41 @@ def parse_segments(
     if raw and chunk_len > raw[-1]["rel_end"]:
         raw[-1]["rel_end"] = chunk_len
 
-    out: list[dict] = []
-    for i, r in enumerate(raw):
-        start = offset_seconds + r["rel"]
-        end = offset_seconds + r["rel_end"]
-        if end <= start:
-            end = start + 1.0
-        out.append({
-            "index": start_index + i,
-            "start": round(start, 2),
-            "end": round(end, 2),
-            "text": r["text"],
-            "cluster": f"{chunk_index}:{r['cluster']}",
-            "chunk": chunk_index,
-        })
-    return out
+    return [
+        Utterance(rel_start=r["rel"], rel_end=r["rel_end"],
+                  text=r["text"], cluster=r["cluster"])
+        for r in raw
+    ]
+
+
+def parse_segments(
+    text: str,
+    chunk_index: int = 0,
+    offset_seconds: float = 0.0,
+    chunk_seconds: float | None = None,
+    start_index: int = 0,
+    merge_same_speaker: bool = True,
+) -> list[dict]:
+    """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
+
+    parse_utterances(経路ごと)＋ utterances_to_segments(共通の後段)の
+    組み合わせに委ねている。戻り値の各要素は Segment(...) にそのまま渡せる
+    キーを持つ(従来どおり)。
+    """
+    segments = utterances_to_segments(
+        parse_utterances(text, chunk_seconds, merge_same_speaker),
+        chunk_index=chunk_index,
+        offset_seconds=offset_seconds,
+        start_index=start_index,
+    )
+    return [{
+        "index": s.index,
+        "start": s.start,
+        "end": s.end,
+        "text": s.text,
+        "cluster": s.cluster,
+        "chunk": s.chunk,
+    } for s in segments]
 
 
 # ======================================================================

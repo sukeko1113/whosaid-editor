@@ -299,6 +299,45 @@ class Segment:
         )
 
 
+def utterances_to_segments(
+    utterances: Iterable[Utterance],
+    *,
+    chunk_index: int = 0,
+    offset_seconds: float = 0.0,
+    start_index: int = 0,
+) -> list[Segment]:
+    """Utterance の並びを Segment に組み立てる(両経路の共通の後段)。
+
+    クラウド(Gemini)もローカル(faster-whisper)も、チャンク単位で Utterance を
+    作るところまでが経路ごとの仕事で、その先——チャンク先頭からの相対秒に
+    オフセットを足して絶対秒にする / クラスタ記号にチャンク番号の名前空間を
+    付ける / 通し番号を振る——は同じ。1 か所に集めておかないと、経路を足す
+    たびに同じ処理が増える(設計書 §4.2)。
+
+    ここで時刻をいじるのはオフセットの足し込みだけ。文字数按分
+    (redistribute_times)は通さない。按分は Gemini のタイムスタンプが
+    ドリフトする既知バグへの対策であって、実測時刻にかけるものではない。
+    クラウド経路では parse_utterances の中で既に済ませてある。
+    """
+    out: list[Segment] = []
+    for i, u in enumerate(utterances):
+        start = offset_seconds + u.rel_start
+        end = offset_seconds + u.rel_end
+        # 長さ 0 の区間は聴き直せない(再生しても何も鳴らない)ので、
+        # 最低限の長さを与えて操作できる状態にする。
+        if end <= start:
+            end = start + 1.0
+        out.append(Segment(
+            index=start_index + i,
+            start=round(start, 2),
+            end=round(end, 2),
+            text=u.text,
+            cluster=f"{chunk_index}:{u.cluster}",
+            chunk=chunk_index,
+        ))
+    return out
+
+
 # ----------------------------------------------------------------------
 # プロジェクト(1 音声ファイル分の作業状態)
 # ----------------------------------------------------------------------

@@ -42,10 +42,15 @@ from src.transcribe import (  # noqa: E402
     build_prompt,
     normalize_cluster_label,
     parse_segments,
+    parse_utterances,
 )
 from src.align import AlignUnavailable  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
-from src.segments import PSEUDO_UNKNOWN  # noqa: E402
+from src.segments import (  # noqa: E402
+    PSEUDO_UNKNOWN,
+    Utterance,
+    utterances_to_segments,
+)
 
 
 # ======================================================================
@@ -1215,6 +1220,60 @@ def test_carry_over_absorbs_only_matched_families():
     ]
     result, _ = _carry(old, new)
     assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
+# アダプタ境界(Utterance → Segment)
+#
+# クラウドもローカルも、チャンク単位で Utterance を作るところまでが
+# 経路ごとの仕事。その先は共通の後段が引き受ける(設計書 §4.2)。
+# ======================================================================
+
+def test_parse_utterances_keeps_relative_times():
+    """相対秒のまま返し、クラスタにチャンク番号を付けない。"""
+    us = parse_utterances(
+        "[00:10] 【A】 ひとつめ。\n[00:20] 【B】 ふたつめ。\n", chunk_seconds=60.0)
+    assert [u.rel_start for u in us] == [10.0, 20.0]
+    assert [u.cluster for u in us] == ["A", "B"]     # "0:A" ではない
+
+
+def test_utterances_to_segments_adds_offset_and_namespace():
+    """オフセットの足し込み・チャンク名前空間・通し番号は後段の仕事。"""
+    us = [
+        Utterance(rel_start=0.0, rel_end=5.0, text="あ", cluster="A"),
+        Utterance(rel_start=5.0, rel_end=9.0, text="い", cluster="B"),
+    ]
+    segs = utterances_to_segments(
+        us, chunk_index=2, offset_seconds=1800.0, start_index=40)
+    assert [s.index for s in segs] == [40, 41]
+    assert [s.start for s in segs] == [1800.0, 1805.0]
+    assert [s.end for s in segs] == [1805.0, 1809.0]
+    assert [s.cluster for s in segs] == ["2:A", "2:B"]
+    assert all(s.chunk == 2 for s in segs)
+
+
+def test_utterances_to_segments_does_not_redistribute():
+    """按分を通さない。渡した時刻がそのまま(オフセットぶんだけずれて)出る。
+
+    按分(redistribute_times)は Gemini のタイムスタンプがドリフトする既知バグ
+    への対策であって、実測時刻にかけるものではない(設計書 §4.1)。
+    ここに按分が紛れ込むと、ローカル経路で測った時刻が本文の長さで
+    作り直されてしまう。
+    """
+    # 本文の長さがばらばらで、間も詰まっている(按分が働けば必ず動く形)
+    us = [
+        Utterance(rel_start=0.0, rel_end=1.0, text="あ" * 200, cluster="?"),
+        Utterance(rel_start=1.0, rel_end=30.0, text="い", cluster="?"),
+    ]
+    segs = utterances_to_segments(us)
+    assert [(s.start, s.end) for s in segs] == [(0.0, 1.0), (1.0, 30.0)]
+
+
+def test_utterances_to_segments_gives_zero_length_a_minimum():
+    """長さ 0 の区間は聴き直せないので、最低限の長さを与える。"""
+    segs = utterances_to_segments(
+        [Utterance(rel_start=12.0, rel_end=12.0, text="ん", cluster="?")])
+    assert (segs[0].start, segs[0].end) == (12.0, 13.0)
 
 
 # ======================================================================
