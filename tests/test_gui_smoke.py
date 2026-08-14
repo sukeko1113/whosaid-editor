@@ -895,14 +895,34 @@ def run_main_window() -> int:
     print("\n[メイン画面 / 処理経路]")
     try:
         app = main_gui.App()
-        app.withdraw()
         try:
+            # --- 画面に収まるか ---------------------------------------
+            # 中身は 1000px を超える。窓を画面より高くすると、下端の
+            # 進捗とログがタスクバーの裏へ回って処理の様子が見えなくなる。
+            app.update()
+            check("窓が画面に収まる",
+                  app.winfo_height() <= app.winfo_screenheight() - 40)
+            bbox = app._canvas.bbox("all")
+            content_h = (bbox[3] - bbox[1]) if bbox else 0
+            check("中身が窓より高いときはスクロールできる",
+                  content_h > app._canvas.winfo_height()
+                  and app._canvas.yview()[1] < 1.0)
+            app._scroll_to_log()
+            app.update()
+            log_y = app.txt_log.winfo_rooty() - app._canvas.winfo_rooty()
+            check("送ればログ欄まで届く",
+                  0 <= log_y < app._canvas.winfo_height())
+            app.withdraw()
             # 既定はローカル。録音を外へ出す判断を既定に紛れ込ませない
             check("既定はローカル", app.var_engine.get() == ENGINE_LOCAL)
             check("ローカルでは API キー欄を触れない",
                   str(app.entry_api.cget("state")) == "disabled")
             check("ローカルでは逐語モードを触れない",
                   str(app.chk_verbatim.cget("state")) == "disabled")
+            # 入ったまま灰色にすると「有効なのに触れない」と読める。
+            # 実際には効かないので、チェックも外しておく。
+            check("ローカルでは逐語モードのチェックも外れる",
+                  app.var_verbatim.get() is False)
             check("ローカルでは従来方式を選べない",
                   str(app.rdo_mode_auto.cget("state")) == "disabled")
             check("ローカルのモデル候補が出る",
@@ -918,6 +938,18 @@ def run_main_window() -> int:
                   str(app.rdo_mode_auto.cget("state")) == "normal")
             check("クラウドのモデル候補に入れ替わる",
                   app.var_model.get() in main_gui.MODELS)
+
+            # クラウドで入れた逐語モードは、ローカルへ行って戻ると復活する
+            app.var_verbatim.set(True)
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            check("ローカルに移ると逐語モードが外れる",
+                  app.var_verbatim.get() is False)
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("クラウドへ戻すと逐語モードも戻る",
+                  app.var_verbatim.get() is True)
+            app.var_verbatim.set(False)
 
             # 選び直させないために、経路ごとのモデルを覚えている
             app.var_model.set("gemini-2.5-pro")
@@ -941,6 +973,28 @@ def run_main_window() -> int:
                       warned and warned[-1] == "入力")
             finally:
                 main_gui.messagebox.showwarning = real_warn
+
+            # ローカルで走らせても、クラウド用の逐語モード設定を潰さない
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            app.var_verbatim.set(True)
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            saved.clear()
+            app.var_input.set(__file__)          # 実在するファイルなら先へ進む
+            app.var_use_input_dir.set(True)
+            real_ask = main_gui.messagebox.askyesno
+            main_gui.messagebox.askyesno = lambda *a, **k: True
+            # 転写そのものは走らせない。走らせるとテストの隣に
+            # .work_<名前> フォルダを作ってしまう
+            app._run_worker = lambda *a, **k: None       # type: ignore[method-assign]
+            try:
+                app._start()
+            finally:
+                main_gui.messagebox.askyesno = real_ask
+            check("ローカルで走らせても逐語モードの設定を潰さない",
+                  saved.get("verbatim") is True)
+            check("経路も保存される", saved.get("engine") == ENGINE_LOCAL)
         finally:
             app.destroy()
     finally:

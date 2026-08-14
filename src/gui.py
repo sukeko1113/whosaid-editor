@@ -27,22 +27,14 @@ MODE_MANUAL = "manual"
 MODE_AUTO = "auto"
 
 ENGINE_LOCAL_DESC = (
-    "録音も本文も、この PC から出ません(ネットワークを遮断したままでも動きます)。"
-    "API キーは要りません。ただし声のまとまり(A/B/C…)は作られないため、"
-    "話者は割当画面で 1 件ずつ確定することになります。"
+    "録音も本文もこの PC から出ません(ネットワークを遮断したままでも動きます)。API キーは不要。\n"
+    "※ 声のまとまり(A/B/C…)は作られず、話者は 1 件ずつ確定します。逐語モードも指定できず、"
+    "相づち・言い淀みが脱落することがあります。"
 )
 ENGINE_CLOUD_DESC = (
-    "音声を Gemini へ送ります。声のまとまりが付くぶん割当は速く済みますが、"
-    "録音が外部のサービスへ出ます。API キーが要ります。"
+    "音声を Gemini へ送ります。声のまとまりが付いて割当は速くなりますが、録音が外部へ出ます。"
 )
-ENGINE_LOCAL_NOTE_AUTO = (
-    "※「AI にすべて任せる(従来方式)」はクラウドでのみ使えます"
-    "(ローカルには名簿から実名を推定する仕組みがありません)。"
-)
-ENGINE_LOCAL_NOTE_VERBATIM = (
-    "※ ローカルでは逐語モードを指定できません(書式を指示する仕組みが"
-    "ありません)。相づち・言い淀みは脱落することがあります。"
-)
+ENGINE_LOCAL_NOTE_AUTO = "※ ローカルでは使えません(名簿から実名を推定する仕組みがないため)。"
 
 MODE_MANUAL_DESC = (
     "AI は声質で発言者を A/B/C… に分けるだけ。実名は、区間ごとに音声を聴いて"
@@ -62,8 +54,11 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("780x900")
-        self.minsize(700, 720)
+        # 画面より高い窓を出すと、下端(進捗とログ)がタスクバーの裏へ回って
+        # 見えなくなる。中身はスクロールできるので、まず画面に収める。
+        height = max(560, min(900, self.winfo_screenheight() - 120))
+        self.geometry(f"800x{height}")
+        self.minsize(640, 480)
 
         self.cfg = load_config()
         self.msg_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
@@ -82,10 +77,35 @@ class App(tk.Tk):
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
         pad = {"padx": 10, "pady": 4}
+
+        # 中身は縦に長い(設定 + 進捗 + ログ)。画面の高さが足りない機械では
+        # 下のログが画面外へ押し出されて、処理の様子が見えなくなる。
+        # 説明を削って詰める手もあるが、この製品では「何が起きるか」を
+        # 先に伝えることのほうが大事なので、入れ物側をスクロールさせる。
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(self, highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        vsb.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vsb.set)
+        body = ttk.Frame(canvas)
+        body_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(body_id, width=e.width))
+        # ホイールは「主画面の上にいるとき」だけ拾う。bind_all を出しっぱなしに
+        # すると、割当画面(別ウィンドウ)のホイールまでこちらが食う。
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", self._on_wheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        self._canvas = canvas
+        body.columnconfigure(0, weight=1)
 
         # === 入力ファイル ===
-        frm_in = ttk.LabelFrame(self, text="音声ファイル")
+        frm_in = ttk.LabelFrame(body, text="音声ファイル")
         frm_in.grid(row=0, column=0, sticky="ew", **pad)
         frm_in.columnconfigure(0, weight=1)
         self.var_input = tk.StringVar()
@@ -93,7 +113,7 @@ class App(tk.Tk):
         ttk.Button(frm_in, text="参照...", command=self._pick_input).grid(row=0, column=1, padx=(0, 6), pady=6)
 
         # === 出力フォルダ ===
-        frm_out = ttk.LabelFrame(self, text="出力フォルダ")
+        frm_out = ttk.LabelFrame(body, text="出力フォルダ")
         frm_out.grid(row=1, column=0, sticky="ew", **pad)
         frm_out.columnconfigure(0, weight=1)
         self.var_output = tk.StringVar()
@@ -112,7 +132,7 @@ class App(tk.Tk):
         # === 処理経路(どこで転写するか) ===
         # 既定はローカル。クラウドは明示的に選んだときだけ使う。
         # 録音を外へ出す判断を、既定に紛れ込ませない。
-        frm_engine = ttk.LabelFrame(self, text="処理経路")
+        frm_engine = ttk.LabelFrame(body, text="処理経路")
         frm_engine.grid(row=2, column=0, sticky="ew", **pad)
         frm_engine.columnconfigure(0, weight=1)
         self.var_engine = tk.StringVar(value=ENGINE_LOCAL)
@@ -132,7 +152,7 @@ class App(tk.Tk):
             .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
 
         # === 話者の決め方(v2.0.0) ===
-        frm_mode = ttk.LabelFrame(self, text="話者の決め方")
+        frm_mode = ttk.LabelFrame(body, text="話者の決め方")
         frm_mode.grid(row=3, column=0, sticky="ew", **pad)
         frm_mode.columnconfigure(0, weight=1)
         self.var_mode = tk.StringVar(value=MODE_MANUAL)
@@ -148,13 +168,18 @@ class App(tk.Tk):
         )
         self.rdo_mode_auto.grid(row=2, column=0, sticky="w", padx=6)
         ttk.Label(frm_mode, text=MODE_AUTO_DESC, foreground="#666", wraplength=700)\
-            .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
+            .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 0))
+        # ローカルのときだけ、灰色にした理由をその場に出す。
+        # 遠くの欄に書いても、押せない理由には結び付かない。
+        self.lbl_auto_note = ttk.Label(
+            frm_mode, text="", foreground="#888", wraplength=700)
+        self.lbl_auto_note.grid(row=4, column=0, sticky="w", padx=28, pady=(0, 6))
         ttk.Button(
             frm_mode, text="保存済みの割当作業を開く...", command=self._open_saved_project,
-        ).grid(row=4, column=0, sticky="w", padx=6, pady=(0, 8))
+        ).grid(row=5, column=0, sticky="w", padx=6, pady=(0, 8))
 
         # === 詳細設定 ===
-        frm_adv = ttk.LabelFrame(self, text="詳細設定")
+        frm_adv = ttk.LabelFrame(body, text="詳細設定")
         frm_adv.grid(row=4, column=0, sticky="ew", **pad)
         frm_adv.columnconfigure(1, weight=1)
 
@@ -169,6 +194,8 @@ class App(tk.Tk):
         self.btn_api_save.grid(row=0, column=3, padx=(0, 6), pady=4)
 
         ttk.Label(frm_adv, text="モデル:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        # クラウドで選んでいた逐語モードの控え(ローカルの間は外しておく)
+        self._verbatim_for_cloud = False
         self.var_model = tk.StringVar(value=DEFAULT_LOCAL_MODEL)
         # 経路ごとに選んだモデルを覚えておく。切り替えて戻ったときに
         # 選び直させない(クラウドの gemini とローカルの small は別物)。
@@ -235,7 +262,7 @@ class App(tk.Tk):
         ).grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
         # === 出席者(候補者リスト) ===
-        self.frm_roster = ttk.LabelFrame(self, text="出席者(候補者リスト)")
+        self.frm_roster = ttk.LabelFrame(body, text="出席者(候補者リスト)")
         self.frm_roster.grid(row=5, column=0, sticky="ew", **pad)
         self.frm_roster.columnconfigure(0, weight=1)
         ttk.Label(self.frm_roster, text=ROSTER_HINT, foreground="#666", wraplength=700)\
@@ -247,7 +274,7 @@ class App(tk.Tk):
         self.txt_roster.configure(yscrollcommand=sb_roster.set)
 
         # === 操作ボタン ===
-        frm_btn = ttk.Frame(self)
+        frm_btn = ttk.Frame(body)
         frm_btn.grid(row=6, column=0, sticky="ew", **pad)
         self.btn_start = ttk.Button(frm_btn, text="文字起こし開始", command=self._start)
         self.btn_start.pack(side="left")
@@ -257,7 +284,7 @@ class App(tk.Tk):
         self.btn_open_out.pack(side="right")
 
         # === 進捗 ===
-        frm_prog = ttk.Frame(self)
+        frm_prog = ttk.Frame(body)
         frm_prog.grid(row=7, column=0, sticky="ew", **pad)
         frm_prog.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(frm_prog, mode="determinate")
@@ -267,11 +294,11 @@ class App(tk.Tk):
             .grid(row=0, column=1, padx=(8, 0))
 
         # === ログ ===
-        frm_log = ttk.LabelFrame(self, text="ログ")
+        frm_log = ttk.LabelFrame(body, text="ログ")
         frm_log.grid(row=8, column=0, sticky="nsew", **pad)
         frm_log.columnconfigure(0, weight=1)
         frm_log.rowconfigure(0, weight=1)
-        self.rowconfigure(8, weight=1)
+        body.rowconfigure(8, weight=1)
         self.txt_log = tk.Text(frm_log, height=10, wrap="word", state="disabled")
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         sb = ttk.Scrollbar(frm_log, orient="vertical", command=self.txt_log.yview)
@@ -313,6 +340,14 @@ class App(tk.Tk):
         # 経路を反映してからモデル欄と有効/無効を整える(mode の状態もここで揃う)
         self._update_engine_state()
 
+    def _on_wheel(self, event) -> None:
+        self._canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _scroll_to_log(self) -> None:
+        """ログが見えるところまで送る(処理中に見たいのはそこだけ)。"""
+        self.update_idletasks()
+        self._canvas.yview_moveto(1.0)
+
     def _update_engine_state(self) -> None:
         """処理経路の切替に応じて、要らない設定を触れなくする。
 
@@ -327,6 +362,16 @@ class App(tk.Tk):
         # いま表示しているモデルを、切り替える前の経路の側に覚えておく
         if self.var_model.get():
             self._model_by_engine[other] = self.var_model.get()
+
+        # 逐語モードは灰色にするだけでなく、チェックも外す。入ったまま
+        # 灰色にすると「有効なのに触れない」と読めてしまい、実際には
+        # 効いていないことが伝わらない。クラウドへ戻したら元に戻す。
+        if local:
+            if self.chk_verbatim.instate(("!disabled",)):
+                self._verbatim_for_cloud = bool(self.var_verbatim.get())
+            self.var_verbatim.set(False)
+        else:
+            self.var_verbatim.set(self._verbatim_for_cloud)
 
         engine = ENGINE_LOCAL if local else ENGINE_CLOUD
         values = list(LOCAL_MODELS) if local else list(MODELS)
@@ -345,8 +390,10 @@ class App(tk.Tk):
             if self.var_mode.get() == MODE_AUTO:
                 self.var_mode.set(MODE_MANUAL)
             self.rdo_mode_auto.configure(state="disabled")
+            self.lbl_auto_note.configure(text=ENGINE_LOCAL_NOTE_AUTO)
         else:
             self.rdo_mode_auto.configure(state="normal")
+            self.lbl_auto_note.configure(text="")
         self._update_mode_state()
 
     def _update_mode_state(self) -> None:
@@ -361,11 +408,9 @@ class App(tk.Tk):
             self.chk_timestamps.configure(state="disabled")
             self.chk_diarization.configure(state="disabled")
             if self.var_engine.get() == ENGINE_LOCAL:
+                # 中身は「処理経路」の説明で言い切っているので、ここでは繰り返さない
                 self.lbl_diar_note.configure(
-                    text="※ ローカルでは声のまとまりを作りません。全区間が未判別に"
-                         "なり、割当画面で 1 件ずつ確定します。\n"
-                         + ENGINE_LOCAL_NOTE_VERBATIM + "\n"
-                         + ENGINE_LOCAL_NOTE_AUTO
+                    text="※ ローカルでは声のまとまりを作らないため、全区間が未判別になります。"
                 )
             else:
                 self.lbl_diar_note.configure(
@@ -563,7 +608,10 @@ class App(tk.Tk):
             "mode": mode,
             "with_timestamps": with_ts,
             "with_diarization": with_diar,
-            "verbatim": verbatim,
+            # ローカルの間はチェックを外してあるので、そのまま保存すると
+            # クラウドで選んでいた設定を False で潰してしまう
+            "verbatim": verbatim if engine_mode == ENGINE_CLOUD
+                        else self._verbatim_for_cloud,
             "roster": roster,
             "last_input": in_path,
         })
@@ -577,6 +625,7 @@ class App(tk.Tk):
         self.btn_cancel.configure(state="normal")
         self.var_status.set("実行中...")
         self.progress.configure(value=0, maximum=1)
+        self._scroll_to_log()
 
         self._cancel_flag.clear()
         self._worker = threading.Thread(
