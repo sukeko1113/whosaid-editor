@@ -27,7 +27,12 @@ for _s in (sys.stdout, sys.stderr):
 
 from src import pipeline  # noqa: E402
 from src.audio import extract_peaks  # noqa: E402
-from src.segments import Project  # noqa: E402
+from src.segments import ENGINE_CLOUD, ENGINE_LOCAL, Project  # noqa: E402
+
+
+# クラウド経路(従来の既定)。ローカル経路の検査は run_local() にある。
+CLOUD = pipeline.EngineSpec(
+    mode=ENGINE_CLOUD, model="gemini-2.5-flash", api_key="dummy")
 
 
 FAKE_CHUNK_OUTPUT = """[00:00] 【A】 議事を始めます。
@@ -129,8 +134,7 @@ def run() -> int:
             proj = pipeline.run_segment_pipeline(
                 audio_path=audio,
                 output_dir=tmp,
-                api_key="dummy",
-                model="gemini-2.5-flash",
+                engine=CLOUD,
                 chunk_minutes=1,
                 on_log=logs.append,
                 on_progress=lambda c, t: None,
@@ -171,8 +175,7 @@ def run() -> int:
             proj2 = pipeline.run_segment_pipeline(
                 audio_path=audio,
                 output_dir=tmp,
-                api_key="dummy",
-                model="gemini-2.5-flash",
+                engine=CLOUD,
                 chunk_minutes=1,
                 on_log=logs2.append,
                 on_progress=lambda c, t: None,
@@ -190,8 +193,8 @@ def run() -> int:
             # --- 名簿を並べ替えて再実行しても人が入れ替わらないこと ---------
             # 話者 ID を振り直すと、確定済みの区間が別人を指してしまう
             proj3 = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False,
                 roster="鈴木\n佐藤(理事長)\n田中",      # 並べ替え + 先頭に別人
@@ -207,8 +210,8 @@ def run() -> int:
 
             # --- 名簿から消した人も、割当が残っていれば保持される -----------
             proj4 = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False,
                 roster="田中",
@@ -223,8 +226,8 @@ def run() -> int:
             proj4.segments[7].text_edited = True
             proj4.save()
             proj5 = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="田中",
             )
@@ -235,8 +238,8 @@ def run() -> int:
             # --- チャンク長を変えたらキャッシュを使い回さない ---------------
             calls["n"] = 0
             proj6 = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=2,    # 1分 → 2分
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=2,    # 1分 → 2分
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="田中",
             )
@@ -247,8 +250,8 @@ def run() -> int:
 
             # --- キャンセル ------------------------------------------------
             proj3 = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: True,
             )
@@ -257,8 +260,8 @@ def run() -> int:
             # --- 逐語モードは別キャッシュ ----------------------------------
             calls["n"] = 0
             pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, verbatim=True,
             )
@@ -278,8 +281,8 @@ def run() -> int:
 
             calls["n"] = 0
             proj_a = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
             )
@@ -298,8 +301,8 @@ def run() -> int:
             calls["n"] = 0
             logs3: list[str] = []
             proj_b = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=logs3.append, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
             )
@@ -326,8 +329,8 @@ def run() -> int:
             proj_b.save()
             calls["n"] = 0
             proj_c = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
             )
@@ -338,8 +341,8 @@ def run() -> int:
             # 強制やり直しならキャッシュを使わない(割当は保持する)
             calls["n"] = 0
             proj_d = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
                 force_retranscribe=True,
@@ -360,8 +363,8 @@ def run() -> int:
             audio = tmp / "meeting.m4a"
             make_tone(audio, 120)
             proj_x = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
             )
@@ -392,8 +395,8 @@ def run() -> int:
 
             logs_x: list[str] = []
             proj_y = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=logs_x.append, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤\n田中",
             )
@@ -433,8 +436,8 @@ def run() -> int:
             audio = tmp / "meeting.m4a"
             make_tone(audio, 120)
             proj_e = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤",
             )
@@ -448,8 +451,8 @@ def run() -> int:
             audio.unlink()
             make_tone(audio, 180)
             proj_f = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤",
             )
@@ -481,8 +484,8 @@ def run() -> int:
             fatal_msg = ""
             try:
                 pipeline.run_segment_pipeline(
-                    audio_path=audio, output_dir=tmp, api_key="dummy",
-                    model="gemini-2.5-flash", chunk_minutes=1,
+                    audio_path=audio, output_dir=tmp, engine=CLOUD,
+                    chunk_minutes=1,
                     on_log=lambda m: None, on_progress=lambda c, t: None,
                     is_cancelled=lambda: False, roster="佐藤",
                 )
@@ -501,8 +504,8 @@ def run() -> int:
             err = ""
             try:
                 pipeline.run_segment_pipeline(
-                    audio_path=audio, output_dir=tmp, api_key="dummy",
-                    model="gemini-2.5-flash", chunk_minutes=1,
+                    audio_path=audio, output_dir=tmp, engine=CLOUD,
+                    chunk_minutes=1,
                     on_log=lambda m: None, on_progress=lambda c, t: None,
                     is_cancelled=lambda: False, roster="佐藤",
                 )
@@ -523,8 +526,8 @@ def run() -> int:
             pipeline.transcribe_audio = fail_first
             logs4: list[str] = []
             proj_g = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=logs4.append, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤",
             )
@@ -536,8 +539,8 @@ def run() -> int:
             calls["n"] = 0
             pipeline.transcribe_audio = fake_transcribe
             proj_h = pipeline.run_segment_pipeline(
-                audio_path=audio, output_dir=tmp, api_key="dummy",
-                model="gemini-2.5-flash", chunk_minutes=1,
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1,
                 on_log=lambda m: None, on_progress=lambda c, t: None,
                 is_cancelled=lambda: False, roster="佐藤",
             )
@@ -555,5 +558,183 @@ def run() -> int:
     return 1 if failures else 0
 
 
+# ======================================================================
+# ローカル経路(faster-whisper)。モデルは使わず、偽の転写器を差し込む。
+# ======================================================================
+
+LOCAL = pipeline.EngineSpec(mode=ENGINE_LOCAL, model="small")
+
+
+def run_local() -> int:
+    if not shutil.which("ffmpeg"):
+        print("SKIPPED: ffmpeg が無いのでローカル経路の検査は実行されていません。")
+        return 0
+
+    failures = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    calls = {"transcribe": 0, "client": 0}
+
+    class FakeLocal:
+        """LocalTranscriber の代わり。モデルもライブラリも要らない。"""
+
+        def __init__(self, model="small", model_dir=None):
+            self.model, self.model_dir = model, model_dir
+
+        def transcribe(self, audio_path, *, on_log=None, on_progress=None,
+                       is_cancelled=None):
+            calls["transcribe"] += 1
+            # whisper は句点で区間を切る。長さは 1 分チャンクに収まる範囲。
+            return pipeline.local_asr.ChunkResult(
+                utterances=[
+                    pipeline.local_asr.Utterance(0.0, 3.5, "議事を始めます。"),
+                    pipeline.local_asr.Utterance(4.0, 9.0, "資料の確認をお願いします。"),
+                    pipeline.local_asr.Utterance(20.0, 22.0, "はい。"),
+                ],
+                words=[pipeline.local_asr.Word("議事", 0.0, 0.8)],
+                duration=60.0,
+            )
+
+    class FakeClient:
+        def __init__(self, api_key=None, http_options=None):
+            calls["client"] += 1
+
+    class FakeGenai:
+        Client = FakeClient
+
+    real_local = pipeline.local_asr.LocalTranscriber
+    real_genai = pipeline.genai
+    pipeline.local_asr.LocalTranscriber = FakeLocal        # type: ignore[misc]
+    pipeline.genai = FakeGenai                             # type: ignore[assignment]
+
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 150)          # 2分30秒 → 1分チャンクで 3 個
+
+            print("\n[ローカル経路]")
+            proj = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n鈴木",
+                verbatim=True,      # ローカルでは効かないはず
+            )
+            assert proj is not None
+
+            # 鍵を渡していないのに動くこと自体が要件。クラウドの
+            # クライアントを作ってしまうと、ローカルなのに鍵を求める形になる
+            check("API キーを要求しない(クライアントを作らない)", calls["client"] == 0)
+            check("チャンクの数だけ転写する", calls["transcribe"] == 3)
+            check("区間が取り込まれる", len(proj.segments) == 9)
+            check("処理経路が local で記録される",
+                  proj.engine.get("mode") == ENGINE_LOCAL)
+            check("モデルと量子化が記録される",
+                  proj.engine.get("model") == "small"
+                  and proj.engine.get("compute_type") == "int8")
+            check("全区間が未判別",
+                  all(s.is_pseudo_cluster for s in proj.segments))
+            check("逐語モードは記録しない", proj.verbatim is False)
+            # 2 チャンク目の先頭は 60 秒付近から始まる(オフセットが乗る)
+            check("チャンクのオフセットが乗る", proj.segments[3].start >= 59.0)
+            check("時刻が按分で作り直されていない",
+                  proj.segments[0].end == 3.5 and proj.segments[1].start == 4.0)
+
+            # --- キャッシュ ---------------------------------------------
+            calls["transcribe"] = 0
+            pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            check("二度目はキャッシュから復元する", calls["transcribe"] == 0)
+
+            calls["transcribe"] = 0
+            pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=2,        # チャンク長を変えたら別物
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            check("チャンク長を変えると取り直す", calls["transcribe"] > 0)
+
+            calls["transcribe"] = 0
+            pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp,
+                engine=pipeline.EngineSpec(mode=ENGINE_LOCAL, model="base"),
+                chunk_minutes=1,        # モデルを変えたら別物
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            check("モデルを変えると取り直す", calls["transcribe"] > 0)
+
+        # --- 経路が変わったときの引き継ぎ(設計書 §8.1) ------------------
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 150)
+
+            print("\n[経路が変わったとき]")
+            # まずクラウドで作って、人が 1 件確定した状態を作る
+            def fake_cloud(client, audio_path, model, **kwargs):
+                return FAKE_CHUNK_OUTPUT
+
+            real_transcribe = pipeline.transcribe_audio
+            pipeline.transcribe_audio = fake_cloud
+            try:
+                proj_c = pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, engine=CLOUD,
+                    chunk_minutes=1,
+                    on_log=lambda m: None, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤",
+                )
+                assert proj_c is not None
+                proj_c.segments[0].speaker_id = proj_c.speakers[0].id
+                proj_c.segments[0].reviewed = True      # 聴いて確定した ✓
+                proj_c.segments[1].text = "人が直した本文"
+                proj_c.segments[1].text_edited = True
+                proj_c.doc_revision = 3
+                proj_c.save(proj_c.json_path)
+            finally:
+                pipeline.transcribe_audio = real_transcribe
+
+            logs: list[str] = []
+            proj_l = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1,
+                on_log=logs.append, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤",
+            )
+            assert proj_l is not None
+            # ✓ が別の区間へ移らないこと。ここが崩れると、人が一度も見ていない
+            # 区間に「聴いて確定した」印が付く(製品価値そのものが壊れる)
+            check("確定済みを引き継がない",
+                  all(s.speaker_id is None for s in proj_l.segments))
+            check("✓ が残らない", not any(s.reviewed for s in proj_l.segments))
+            check("本文の手直しも引き継がない",
+                  not any(s.text_edited for s in proj_l.segments))
+            check("名簿は引き継ぐ",
+                  [sp.name for sp in proj_l.speakers] == ["佐藤"])
+            check("旧ファイルを退避する", bool(list(tmp.glob("*.bak.json"))))
+            check("理由を知らせる",
+                  any("引き継ぎません" in m for m in logs))
+            check("版番号も引き継がない", proj_l.doc_revision == 0)
+    finally:
+        pipeline.local_asr.LocalTranscriber = real_local    # type: ignore[misc]
+        pipeline.genai = real_genai
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
+    rc_cloud = run()
+    rc_local = run_local()
+    sys.exit(rc_cloud or rc_local)

@@ -18,6 +18,7 @@ faster_whisper は関数の中で import する(align.py と同じ理由)。
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,7 @@ from .align import (
     DEVICE,
     LANGUAGE,
     Word,
+    model_tag,
     resolve_model,
 )
 from .segments import PSEUDO_UNKNOWN, Utterance
@@ -59,6 +61,83 @@ class ChunkResult:
     utterances: list[Utterance] = field(default_factory=list)
     words: list[Word] = field(default_factory=list)
     duration: float = 0.0
+
+
+def chunk_cache_path(
+    cache_dir: Path | str,
+    chunk_stem: str,
+    *,
+    fingerprint: str,
+    chunk_seconds: float,
+    model: str,
+    model_dir: Optional[Path | str] = None,
+) -> Optional[Path]:
+    """ローカル転写のチャンクキャッシュの置き場(設計書 §7)。
+
+    キーは「音声の指紋 + チャンク長 + モデルの素性 + 実装バージョン」。
+    クラウド側(.cluster.<指紋>.c<秒>[.vb].txt)にモデルを足した形で、
+    どれが欠けても別物の転写を使い回す事故になる。指紋が取れなかった音声は
+    そもそもキャッシュしない(毎回取り直すほうが安全)。
+
+    逐語フラグ(.vb)は付けない。ローカルに逐語モードは無いので、付けると
+    同じ転写が 2 つできるだけになる(§5.4)。
+
+    中身はテキストではなく JSON。行形式に落とすと時刻が秒に丸められる。
+    """
+    if not fingerprint:
+        return None
+    tag = model_tag(model, model_dir)
+    return Path(cache_dir) / (
+        f"{chunk_stem}.local.{fingerprint}.c{int(chunk_seconds)}"
+        f".{tag}.v{LOCAL_ASR_VER}.json"
+    )
+
+
+def load_chunk(path: Optional[Path]) -> Optional[ChunkResult]:
+    """キャッシュを読む。無い・壊れている・別バージョンなら None。"""
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if int(data.get("local_asr_ver", -1)) != LOCAL_ASR_VER:
+            return None
+        return ChunkResult(
+            utterances=[
+                Utterance(rel_start=float(u["rel_start"]),
+                          rel_end=float(u["rel_end"]),
+                          text=str(u.get("text", "")),
+                          cluster=str(u.get("cluster", PSEUDO_UNKNOWN)))
+                for u in data.get("utterances", [])
+            ],
+            words=[Word.from_dict(w) for w in data.get("words", [])],
+            duration=float(data.get("duration", 0.0)),
+        )
+    except Exception:
+        return None         # 壊れたキャッシュは無かったことにして取り直す
+
+
+def save_chunk(path: Optional[Path], result: ChunkResult, *, model: str) -> None:
+    """キャッシュを書く。書けなくても転写自体は続けられるので握りつぶす。"""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "local_asr_ver": LOCAL_ASR_VER,
+            "model": model,
+            "duration": result.duration,
+            "utterances": [{
+                "rel_start": u.rel_start,
+                "rel_end": u.rel_end,
+                "text": u.text,
+                "cluster": u.cluster,
+            } for u in result.utterances],
+            # 単語時刻も残す。同じ 1 回の転写から取れているので、あとで
+            # 自動点検が使い回せる(§5.3)。捨てると測り直しになる。
+            "words": [w.to_dict() for w in result.words],
+        }, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 class LocalTranscriber:

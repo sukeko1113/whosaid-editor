@@ -14,9 +14,9 @@ from tkinter import filedialog, messagebox, ttk
 from .assign_gui import open_assign_window
 from .audio import audio_fingerprint
 from .config import load_config, save_config
-from .pipeline import run_pipeline, run_segment_pipeline
+from .pipeline import EngineSpec, run_pipeline, run_segment_pipeline
 from .transcribe import FatalTranscriptionError
-from .segments import Project
+from .segments import ENGINE_CLOUD, Project
 
 
 APP_TITLE = "Gemini 文字起こし"
@@ -512,8 +512,8 @@ class App(tk.Tk):
                 result = run_segment_pipeline(
                     audio_path=in_path,
                     output_dir=out_dir,
-                    api_key=api_key,
-                    model=model,
+                    engine=EngineSpec(
+                        mode=ENGINE_CLOUD, model=model, api_key=api_key),
                     chunk_minutes=chunk_minutes,
                     on_log=lambda m: self._post("log", m),
                     on_progress=lambda c, t: self._post("progress", (c, t)),

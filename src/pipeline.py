@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -14,15 +15,29 @@ from typing import Callable, Optional
 from google import genai
 from google.genai import types as genai_types
 
+from . import local_asr
+from .align import DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
 from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
 from .config import APP_VERSION
-from .segments import Project, Segment, Speaker, fmt_hms, parse_roster
+from .segments import (
+    ENGINE_CLOUD,
+    ENGINE_LABELS,
+    ENGINE_LOCAL,
+    Project,
+    Segment,
+    Speaker,
+    Utterance,
+    fmt_hms,
+    parse_roster,
+    utterances_to_segments,
+)
 from .transcribe import (
     DIARIZATION_NOTE,
     ROSTER_NOTE,
     CancelledError,
     FatalTranscriptionError,
     parse_segments,
+    parse_utterances,
     shift_timestamps,
     transcribe_audio,
     write_docx,
@@ -39,6 +54,57 @@ CancelFn = Callable[[], bool]
 # 処理が「止まったように見える」問題が起きる(2026-07 実戦投入で確認)。
 # タイムアウトすると例外になり、transcribe_audio 側の再試行に乗る。
 REQUEST_TIMEOUT_MS = 8 * 60 * 1000  # 8分
+
+# クラウド経路の既定モデル(gui.MODELS の先頭と揃える)
+DEFAULT_CLOUD_MODEL = "gemini-2.5-flash"
+
+
+@dataclass(frozen=True)
+class EngineSpec:
+    """どのエンジンで転写するか。
+
+    既定はローカル。クラウドは利用者が明示的に選んだときだけ使う
+    (録音を外へ出す判断を既定にしない。事業計画 4.3)。
+
+    api_key はクラウドのときだけ要る。ローカルは端末内で完結するので、
+    キーの入力を求めない(求めると「ローカルなのに鍵が要る」ことになる)。
+    """
+
+    mode: str = ENGINE_LOCAL
+    model: str = ""
+    api_key: str = ""
+    model_dir: Optional[str] = None
+
+    @property
+    def is_local(self) -> bool:
+        return self.mode == ENGINE_LOCAL
+
+    @property
+    def label(self) -> str:
+        return ENGINE_LABELS.get(self.mode, self.mode)
+
+    def resolved_model(self) -> str:
+        """モデル名。指定が無ければ経路ごとの既定。"""
+        if self.model:
+            return self.model
+        return DEFAULT_LOCAL_MODEL if self.is_local else DEFAULT_CLOUD_MODEL
+
+    def record(self) -> dict:
+        """作業ファイルに残す engine の中身(Word の検証要約に出る処理経路)。
+
+        第三者が「どの経路のどのモデルで作られた記録か」を読めるようにする。
+        """
+        rec = {
+            "mode": self.mode,
+            "model": self.resolved_model(),
+            "app_version": APP_VERSION,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        if self.is_local:
+            rec["compute_type"] = local_asr.COMPUTE_TYPE
+            if self.model_dir:
+                rec["model_dir"] = str(self.model_dir)
+        return rec
 
 
 def _make_client(api_key: str) -> genai.Client:
@@ -405,8 +471,7 @@ def _carry_over_assignments(
 def run_segment_pipeline(
     audio_path: Path,
     output_dir: Path,
-    api_key: str,
-    model: str,
+    engine: EngineSpec,
     chunk_minutes: int,
     on_log: LogFn,
     on_progress: ProgressFn,
@@ -416,6 +481,9 @@ def run_segment_pipeline(
     force_retranscribe: bool = False,
 ) -> Optional[Project]:
     """音声 → セグメント JSON(話者未確定)を生成して Project を返す。
+
+    engine で経路を選ぶ。既定はローカル(端末内で完結し、録音も本文も
+    外へ出さない)。クラウドは利用者が明示的に選んだときだけ。
 
     force_retranscribe=True なら、キャッシュを無視して必ず転写し直す。
     """
@@ -429,11 +497,24 @@ def run_segment_pipeline(
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     json_path = Project.default_json_path(output_dir, audio_path)
+    model = engine.resolved_model()
 
     on_log(f"作業ファイル: {json_path}")
-    on_log("方式: 話者は A/B/C… に分けるだけで、実名は後の割当画面で確定します。")
-    if verbatim:
-        on_log("逐語モード: 有効(フィラー・言い直しを保持し、整文しません)")
+    on_log(f"処理経路: {engine.label}(モデル {model})")
+    if engine.is_local:
+        # 期待値をここで正しておく。ローカルには声のまとまりを作る者がいない。
+        on_log("ローカル転写は端末内で完結します。録音も本文も外へ出しません。")
+        on_log("※ 声のまとまり(A/B/C…)は作られません。全区間が未判別として"
+               "取り込まれ、割当画面で 1 件ずつ確定することになります。")
+        if verbatim:
+            # 逐語は書式の指定ではなくプロンプトの指示。whisper に対応する
+            # 指示は無いので、選べるように見せない(設計書 §5.4)。
+            on_log("※ 逐語モードはローカルでは指定できません(書式を指示する"
+                   "仕組みがありません)。相づち・言い淀みは脱落することがあります。")
+    else:
+        on_log("方式: 話者は A/B/C… に分けるだけで、実名は後の割当画面で確定します。")
+        if verbatim:
+            on_log("逐語モード: 有効(フィラー・言い直しを保持し、整文しません)")
     if force_retranscribe:
         on_log("キャッシュを使わず、最初から転写し直します。")
 
@@ -472,7 +553,9 @@ def run_segment_pipeline(
         chunk_lengths.append(d)
         acc += d
 
-    client = _make_client(api_key)
+    client = None if engine.is_local else _make_client(engine.api_key)
+    transcriber = local_asr.LocalTranscriber(
+        model=model, model_dir=engine.model_dir) if engine.is_local else None
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
@@ -492,54 +575,76 @@ def run_segment_pipeline(
             on_log("キャンセルされました。")
             return None
 
-        cache_path = cache_dir / f"{chunk.stem}{cache_suffix}"
         label = f"[{i + 1}/{len(chunks)}] {chunk.name}"
         offset = chunk_starts[i]
-
-        if cache_path.exists() and not force_retranscribe:
-            on_log(f"{label} (キャッシュから復元)")
-            raw_text = cache_path.read_text(encoding="utf-8")
-        else:
-            on_log(f"{label} 文字起こし中...")
-            try:
-                raw_text = transcribe_audio(
-                    client, chunk, model,
-                    with_timestamps=True,
-                    with_diarization=True,
-                    roster="",
-                    verbatim=verbatim,
-                    on_log=on_log,
-                    cluster_only=True,
-                    is_cancelled=is_cancelled,
-                )
-                cache_path.write_text(raw_text, encoding="utf-8")
-            except CancelledError:
-                on_log("キャンセルされました。(完了済みチャンクはキャッシュに保存されています)")
-                return None
-            except FatalTranscriptionError:
-                # 残高切れ・キー不正。続けても全チャンク同じ結果になるので、
-                # 中途半端な結果を作らずにここで止める。
-                raise
-            except Exception as e:
-                on_log(f"  失敗: {e}")
-                failed_chunks += 1
-                last_failure = str(e)
-                raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name}】"
 
         # このチャンクの実際の長さ(最終チャンクは短い)
         this_len = chunk_lengths[i]
         if duration:
             this_len = max(1.0, min(this_len, duration - offset))
 
-        parsed = parse_segments(
-            raw_text,
+        if engine.is_local:
+            cache_path = local_asr.chunk_cache_path(
+                cache_dir, chunk.stem, fingerprint=fingerprint,
+                chunk_seconds=chunk_seconds, model=model,
+                model_dir=engine.model_dir)
+            cached = None if force_retranscribe else local_asr.load_chunk(cache_path)
+            if cached is not None:
+                on_log(f"{label} (キャッシュから復元)")
+                utterances = cached.utterances
+            else:
+                on_log(f"{label} 文字起こし中...")
+                result = transcriber.transcribe(
+                    chunk, on_log=on_log, is_cancelled=is_cancelled)
+                if result is None:      # 中断(途中結果は残さない)
+                    on_log("キャンセルされました。"
+                           "(完了済みチャンクはキャッシュに保存されています)")
+                    return None
+                local_asr.save_chunk(cache_path, result, model=model)
+                utterances = result.utterances
+        else:
+            cache_path = cache_dir / f"{chunk.stem}{cache_suffix}"
+            if cache_path.exists() and not force_retranscribe:
+                on_log(f"{label} (キャッシュから復元)")
+                raw_text = cache_path.read_text(encoding="utf-8")
+            else:
+                on_log(f"{label} 文字起こし中...")
+                try:
+                    raw_text = transcribe_audio(
+                        client, chunk, model,
+                        with_timestamps=True,
+                        with_diarization=True,
+                        roster="",
+                        verbatim=verbatim,
+                        on_log=on_log,
+                        cluster_only=True,
+                        is_cancelled=is_cancelled,
+                    )
+                    cache_path.write_text(raw_text, encoding="utf-8")
+                except CancelledError:
+                    on_log("キャンセルされました。"
+                           "(完了済みチャンクはキャッシュに保存されています)")
+                    return None
+                except FatalTranscriptionError:
+                    # 残高切れ・キー不正。続けても全チャンク同じ結果になるので、
+                    # 中途半端な結果を作らずにここで止める。
+                    raise
+                except Exception as e:
+                    on_log(f"  失敗: {e}")
+                    failed_chunks += 1
+                    last_failure = str(e)
+                    raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name}】"
+
+            utterances = parse_utterances(raw_text, this_len)
+
+        segs = utterances_to_segments(
+            utterances,
             chunk_index=i,
             offset_seconds=offset,
-            chunk_seconds=this_len,
             start_index=len(all_segments),
         )
-        all_segments.extend(Segment(**p) for p in parsed)
-        on_log(f"  → {len(parsed)} 区間")
+        all_segments.extend(segs)
+        on_log(f"  → {len(segs)} 区間")
         on_progress(i + 1, len(chunks))
 
     if not all_segments:
@@ -571,6 +676,9 @@ def run_segment_pipeline(
     if json_path.exists():
         try:
             old = Project.load(json_path)
+            # 経路の記録が無い作業ファイル(schema 4 以前)はクラウド製。
+            # ローカル転写はまだ存在しなかったので、そう読んで間違いない。
+            old_mode = str((old.engine or {}).get("mode") or ENGINE_CLOUD)
             if not _is_same_audio(old, fingerprint, duration):
                 # 同じファイル名でも中身が違う。前回の割当を引き継ぐと
                 # 別の音声の話者が乗ってしまうので、作り直す。
@@ -582,6 +690,20 @@ def run_segment_pipeline(
                 # 出席者(候補者リスト)だけは引き継ぐ。録り直しでも顔ぶれは
                 # 同じことが多く、入力し直す手間だけが増えるため。
                 # 区間の割当は引き継がない。
+                speakers = _merge_speakers(old.speakers, roster)
+            elif old_mode != engine.mode:
+                # 経路が変われば区間の切れ目も本文も別物になる。それでも
+                # _carry_over_assignments は orig_start が 2 秒以内なら
+                # 対応づけてしまい、人が聴いて確定した ✓ を、その人が一度も
+                # 見ていない区間へ移してしまう(設計書 §8.1)。
+                # engine は作業ファイルに 1 つしか持てないので、本文が
+                # 混ざると検証要約の処理経路も実態と食い違う。
+                on_log(
+                    f"前回は{ENGINE_LABELS.get(old_mode, old_mode)}転写の"
+                    f"作業ファイルです。{engine.label}では区間の切れ目が"
+                    "変わるため、前回の割当・本文修正・時刻修正は引き継ぎません。"
+                )
+                _backup_stale_project(json_path, on_log)
                 speakers = _merge_speakers(old.speakers, roster)
             else:
                 # 話者リストを先に統合してから割当を移す(ID を保存するのが要点)
@@ -599,20 +721,20 @@ def run_segment_pipeline(
         duration=duration or (len(chunks) * chunk_seconds),
         chunk_seconds=chunk_seconds,
         model=model,
-        verbatim=verbatim,
+        # ローカルに逐語モードは無いので、選ばれていても記録しない(§5.4)。
+        # 記録すると「逐語で作った」という誤った履歴になる。
+        verbatim=verbatim and not engine.is_local,
         audio_fingerprint=fingerprint,
         source_sha256=source_sha,
-        engine={
-            "mode": "cloud",
-            "model": model,
-            "app_version": APP_VERSION,
-            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        },
+        engine=engine.record(),
         doc_revision=carried_revision,
         edit_log=carried_log,
         speakers=speakers,
         segments=all_segments,
     )
     proj.save(json_path)
-    on_log(f"完了: {len(all_segments)} 区間 / 声のまとまり {len(proj.clusters())} 種類")
+    if engine.is_local:
+        on_log(f"完了: {len(all_segments)} 区間(話者は全て未判別)")
+    else:
+        on_log(f"完了: {len(all_segments)} 区間 / 声のまとまり {len(proj.clusters())} 種類")
     return proj

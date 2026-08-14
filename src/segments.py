@@ -37,6 +37,12 @@ SPECIAL_SPEAKERS: dict[str, str] = {
 PSEUDO_UNKNOWN = "?"
 PSEUDO_MULTI = "*"
 
+# 処理経路(Project.engine["mode"])。作業ファイルにそのまま入る値なので、
+# 画面・Word の検証要約・パイプラインで同じ文字列を使う。
+ENGINE_CLOUD = "cloud"
+ENGINE_LOCAL = "local"
+ENGINE_LABELS = {ENGINE_CLOUD: "クラウド", ENGINE_LOCAL: "ローカル"}
+
 # 人が時刻を直したり区間を分けたりするときに許す最短の長さ。
 # 0 にすると start == end の区間ができて、再生も出力も意味を失う。
 MIN_SEGMENT_SECONDS = 0.1
@@ -650,7 +656,7 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
     if proj.source_sha256:
         rows.append(("SHA-256", proj.source_sha256))
     if proj.engine:
-        mode = {"cloud": "クラウド", "local": "ローカル"}.get(
+        mode = ENGINE_LABELS.get(
             str(proj.engine.get("mode", "")), str(proj.engine.get("mode", "")))
         model = str(proj.engine.get("model", ""))
         at = str(proj.engine.get("at", ""))
