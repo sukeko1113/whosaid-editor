@@ -61,13 +61,38 @@ def audio_fingerprint(input_path: Path, on_progress=None) -> str:
     1GB の WAV でも数秒で終わる。取得できない場合は空文字を返す
     (指紋なしとして扱い、再利用の判断は継続時間の比較にフォールバックする)。
     """
+    fingerprint, _ = _hash_audio(input_path, on_progress, with_sha256=False)
+    return fingerprint
+
+
+def audio_hashes(input_path: Path, on_progress=None) -> tuple[str, str]:
+    """キャッシュ用の指紋と、証跡用の SHA-256 を 1 回の読みで同時に計算する。
+
+    役割が違うので 2 つ要る(スキーマ v5):
+      - 指紋(BLAKE2b 64bit): キャッシュと作業ファイルの同一性判定。
+        アルゴリズムは変更禁止(既存キャッシュと旧ファイルの互換が壊れる)
+      - SHA-256: 「この書面はこの録音から作った」を第三者が検算するための値。
+        Get-FileHash / certutil / sha256sum の結果とそのまま突き合わせられる
+
+    どちらも全量を読むので、別々に計算すると 1GB を二度読むことになる。
+    同じループで両方を回すためにここにまとめてある。
+    取得できない場合は ("", "") を返す。
+    """
+    return _hash_audio(input_path, on_progress, with_sha256=True)
+
+
+def _hash_audio(input_path: Path, on_progress, with_sha256: bool) -> tuple[str, str]:
     try:
         size = input_path.stat().st_size
     except OSError:
-        return ""
+        return "", ""
 
+    # 指紋はサイズをシードに含む既存アルゴリズム(変更禁止)。
+    # SHA-256 は素のファイル内容だけを対象にする。シードを混ぜると
+    # 外部ツールの計算結果と一致しなくなり、検算に使えない。
     h = hashlib.blake2b(digest_size=8)
     h.update(str(size).encode("ascii"))
+    sha = hashlib.sha256() if with_sha256 else None
     read = 0
     try:
         with open(input_path, "rb") as f:
@@ -76,12 +101,14 @@ def audio_fingerprint(input_path: Path, on_progress=None) -> str:
                 if not block:
                     break
                 h.update(block)
+                if sha is not None:
+                    sha.update(block)
                 read += len(block)
                 if on_progress and size:
                     on_progress(read, size)
     except OSError:
-        return ""
-    return h.hexdigest()
+        return "", ""
+    return h.hexdigest(), sha.hexdigest() if sha is not None else ""
 
 
 _DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d+))?")

@@ -46,6 +46,54 @@ from src.transcribe import (  # noqa: E402
 
 
 # ======================================================================
+# 音声のハッシュ(指紋と SHA-256)
+# ======================================================================
+
+def test_audio_hashes_computes_both_in_one_pass():
+    """指紋と SHA-256 を同時に返し、SHA-256 は外部ツールの計算と一致する。"""
+    import hashlib
+
+    from src.audio import audio_fingerprint, audio_hashes
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.wav"
+        payload = b"RIFF" + bytes(range(256)) * 512
+        p.write_bytes(payload)
+
+        fp, sha = audio_hashes(p)
+        # SHA-256 は素のファイル内容のハッシュ(certutil 等で検算できる値)
+        assert sha == hashlib.sha256(payload).hexdigest()
+        assert len(sha) == 64
+        # 指紋は既存アルゴリズム(サイズをシードに含む BLAKE2b 64bit)と同一
+        assert fp == audio_fingerprint(p)
+        h = hashlib.blake2b(digest_size=8)
+        h.update(str(len(payload)).encode("ascii"))
+        h.update(payload)
+        assert fp == h.hexdigest()
+
+
+def test_audio_hashes_missing_file():
+    from src.audio import audio_fingerprint, audio_hashes
+
+    missing = Path("C:/no/such/dir/none.wav")
+    assert audio_hashes(missing) == ("", "")
+    assert audio_fingerprint(missing) == ""
+
+
+def test_audio_hashes_change_with_content():
+    """1 バイト変われば両方とも別の値になる(同一性判定の前提)。"""
+    from src.audio import audio_hashes
+
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "a.wav"
+        p.write_bytes(b"abcdefg")
+        before = audio_hashes(p)
+        p.write_bytes(b"abcdefh")
+        after = audio_hashes(p)
+    assert before[0] != after[0] and before[1] != after[1]
+
+
+# ======================================================================
 # 名簿パース
 # ======================================================================
 
