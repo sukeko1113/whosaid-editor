@@ -869,5 +869,89 @@ def run() -> int:
     return 1 if failures else 0
 
 
+# ======================================================================
+# メイン画面(処理経路の選択)
+#
+# 設定ファイルには触らない。load_config / save_config を差し替えて、
+# 利用者の config.json を書き換えないようにする。
+# ======================================================================
+
+def run_main_window() -> int:
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    import src.gui as main_gui
+    from src.segments import ENGINE_CLOUD, ENGINE_LOCAL
+
+    saved: dict = {}
+    real_load, real_save = main_gui.load_config, main_gui.save_config
+    main_gui.load_config = lambda: {}
+    main_gui.save_config = lambda d: saved.update(d)
+
+    print("\n[メイン画面 / 処理経路]")
+    try:
+        app = main_gui.App()
+        app.withdraw()
+        try:
+            # 既定はローカル。録音を外へ出す判断を既定に紛れ込ませない
+            check("既定はローカル", app.var_engine.get() == ENGINE_LOCAL)
+            check("ローカルでは API キー欄を触れない",
+                  str(app.entry_api.cget("state")) == "disabled")
+            check("ローカルでは逐語モードを触れない",
+                  str(app.chk_verbatim.cget("state")) == "disabled")
+            check("ローカルでは従来方式を選べない",
+                  str(app.rdo_mode_auto.cget("state")) == "disabled")
+            check("ローカルのモデル候補が出る",
+                  app.var_model.get() in main_gui.LOCAL_MODELS)
+
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("クラウドにすると API キー欄が使える",
+                  str(app.entry_api.cget("state")) == "normal")
+            check("クラウドにすると逐語モードが使える",
+                  str(app.chk_verbatim.cget("state")) == "normal")
+            check("クラウドにすると従来方式が選べる",
+                  str(app.rdo_mode_auto.cget("state")) == "normal")
+            check("クラウドのモデル候補に入れ替わる",
+                  app.var_model.get() in main_gui.MODELS)
+
+            # 選び直させないために、経路ごとのモデルを覚えている
+            app.var_model.set("gemini-2.5-pro")
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("経路を戻すとモデルの選択も戻る",
+                  app.var_model.get() == "gemini-2.5-pro")
+
+            # ローカルなら鍵が無くても開始できる(入力が無いことだけ言われる)
+            warned: list[str] = []
+            real_warn = main_gui.messagebox.showwarning
+            main_gui.messagebox.showwarning = lambda t, *a, **k: warned.append(t)
+            try:
+                app.var_engine.set(ENGINE_LOCAL)
+                app._update_engine_state()
+                app.var_input.set("")
+                app._start()
+                check("ローカルでは API キーを求めない",
+                      warned and warned[-1] == "入力")
+            finally:
+                main_gui.messagebox.showwarning = real_warn
+        finally:
+            app.destroy()
+    finally:
+        main_gui.load_config, main_gui.save_config = real_load, real_save
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
+    rc_assign = run()
+    rc_main = run_main_window()
+    sys.exit(rc_assign or rc_main)

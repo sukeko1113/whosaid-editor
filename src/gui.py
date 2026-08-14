@@ -14,16 +14,35 @@ from tkinter import filedialog, messagebox, ttk
 from .assign_gui import open_assign_window
 from .audio import audio_fingerprint
 from .config import load_config, save_config
-from .pipeline import EngineSpec, run_pipeline, run_segment_pipeline
+from .align import AVAILABLE_MODELS as LOCAL_MODELS, DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
+from .pipeline import DEFAULT_CLOUD_MODEL, EngineSpec, run_pipeline, run_segment_pipeline
 from .transcribe import FatalTranscriptionError
-from .segments import ENGINE_CLOUD, Project
+from .segments import ENGINE_CLOUD, ENGINE_LOCAL, Project
 
 
 APP_TITLE = "Gemini 文字起こし"
-MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+MODELS = [DEFAULT_CLOUD_MODEL, "gemini-2.5-pro"]
 
 MODE_MANUAL = "manual"
 MODE_AUTO = "auto"
+
+ENGINE_LOCAL_DESC = (
+    "録音も本文も、この PC から出ません(ネットワークを遮断したままでも動きます)。"
+    "API キーは要りません。ただし声のまとまり(A/B/C…)は作られないため、"
+    "話者は割当画面で 1 件ずつ確定することになります。"
+)
+ENGINE_CLOUD_DESC = (
+    "音声を Gemini へ送ります。声のまとまりが付くぶん割当は速く済みますが、"
+    "録音が外部のサービスへ出ます。API キーが要ります。"
+)
+ENGINE_LOCAL_NOTE_AUTO = (
+    "※「AI にすべて任せる(従来方式)」はクラウドでのみ使えます"
+    "(ローカルには名簿から実名を推定する仕組みがありません)。"
+)
+ENGINE_LOCAL_NOTE_VERBATIM = (
+    "※ ローカルでは逐語モードを指定できません(書式を指示する仕組みが"
+    "ありません)。相づち・言い淀みは脱落することがあります。"
+)
 
 MODE_MANUAL_DESC = (
     "AI は声質で発言者を A/B/C… に分けるだけ。実名は、区間ごとに音声を聴いて"
@@ -90,9 +109,31 @@ class App(tk.Tk):
             command=self._on_toggle_use_input_dir,
         ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 
+        # === 処理経路(どこで転写するか) ===
+        # 既定はローカル。クラウドは明示的に選んだときだけ使う。
+        # 録音を外へ出す判断を、既定に紛れ込ませない。
+        frm_engine = ttk.LabelFrame(self, text="処理経路")
+        frm_engine.grid(row=2, column=0, sticky="ew", **pad)
+        frm_engine.columnconfigure(0, weight=1)
+        self.var_engine = tk.StringVar(value=ENGINE_LOCAL)
+        ttk.Radiobutton(
+            frm_engine, text="この PC で処理する(ローカル)",
+            value=ENGINE_LOCAL, variable=self.var_engine,
+            command=self._update_engine_state,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
+        ttk.Label(frm_engine, text=ENGINE_LOCAL_DESC, foreground="#666", wraplength=700)\
+            .grid(row=1, column=0, sticky="w", padx=28, pady=(0, 4))
+        ttk.Radiobutton(
+            frm_engine, text="クラウド(Gemini)へ送って処理する",
+            value=ENGINE_CLOUD, variable=self.var_engine,
+            command=self._update_engine_state,
+        ).grid(row=2, column=0, sticky="w", padx=6)
+        ttk.Label(frm_engine, text=ENGINE_CLOUD_DESC, foreground="#666", wraplength=700)\
+            .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
+
         # === 話者の決め方(v2.0.0) ===
         frm_mode = ttk.LabelFrame(self, text="話者の決め方")
-        frm_mode.grid(row=2, column=0, sticky="ew", **pad)
+        frm_mode.grid(row=3, column=0, sticky="ew", **pad)
         frm_mode.columnconfigure(0, weight=1)
         self.var_mode = tk.StringVar(value=MODE_MANUAL)
         ttk.Radiobutton(
@@ -101,10 +142,11 @@ class App(tk.Tk):
         ).grid(row=0, column=0, sticky="w", padx=6, pady=(6, 0))
         ttk.Label(frm_mode, text=MODE_MANUAL_DESC, foreground="#666", wraplength=700)\
             .grid(row=1, column=0, sticky="w", padx=28, pady=(0, 4))
-        ttk.Radiobutton(
+        self.rdo_mode_auto = ttk.Radiobutton(
             frm_mode, text="AI にすべて任せる(従来方式)",
             value=MODE_AUTO, variable=self.var_mode, command=self._update_mode_state,
-        ).grid(row=2, column=0, sticky="w", padx=6)
+        )
+        self.rdo_mode_auto.grid(row=2, column=0, sticky="w", padx=6)
         ttk.Label(frm_mode, text=MODE_AUTO_DESC, foreground="#666", wraplength=700)\
             .grid(row=3, column=0, sticky="w", padx=28, pady=(0, 6))
         ttk.Button(
@@ -113,20 +155,31 @@ class App(tk.Tk):
 
         # === 詳細設定 ===
         frm_adv = ttk.LabelFrame(self, text="詳細設定")
-        frm_adv.grid(row=3, column=0, sticky="ew", **pad)
+        frm_adv.grid(row=4, column=0, sticky="ew", **pad)
         frm_adv.columnconfigure(1, weight=1)
 
-        ttk.Label(frm_adv, text="API キー:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.lbl_api = ttk.Label(frm_adv, text="API キー:")
+        self.lbl_api.grid(row=0, column=0, sticky="w", padx=6, pady=4)
         self.var_api = tk.StringVar()
         self.entry_api = ttk.Entry(frm_adv, textvariable=self.var_api, show="●")
         self.entry_api.grid(row=0, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Button(frm_adv, text="表示", command=self._toggle_api_visibility).grid(row=0, column=2, padx=(0, 4), pady=4)
-        ttk.Button(frm_adv, text="保存", command=self._save_api_key).grid(row=0, column=3, padx=(0, 6), pady=4)
+        self.btn_api_show = ttk.Button(frm_adv, text="表示", command=self._toggle_api_visibility)
+        self.btn_api_show.grid(row=0, column=2, padx=(0, 4), pady=4)
+        self.btn_api_save = ttk.Button(frm_adv, text="保存", command=self._save_api_key)
+        self.btn_api_save.grid(row=0, column=3, padx=(0, 6), pady=4)
 
         ttk.Label(frm_adv, text="モデル:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
-        self.var_model = tk.StringVar(value=MODELS[0])
-        ttk.Combobox(frm_adv, values=MODELS, textvariable=self.var_model, state="readonly")\
-            .grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        self.var_model = tk.StringVar(value=DEFAULT_LOCAL_MODEL)
+        # 経路ごとに選んだモデルを覚えておく。切り替えて戻ったときに
+        # 選び直させない(クラウドの gemini とローカルの small は別物)。
+        self._model_by_engine = {
+            ENGINE_CLOUD: MODELS[0],
+            ENGINE_LOCAL: DEFAULT_LOCAL_MODEL,
+        }
+        self.cmb_model = ttk.Combobox(
+            frm_adv, values=list(LOCAL_MODELS), textvariable=self.var_model,
+            state="readonly")
+        self.cmb_model.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
 
         ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
@@ -183,7 +236,7 @@ class App(tk.Tk):
 
         # === 出席者(候補者リスト) ===
         self.frm_roster = ttk.LabelFrame(self, text="出席者(候補者リスト)")
-        self.frm_roster.grid(row=4, column=0, sticky="ew", **pad)
+        self.frm_roster.grid(row=5, column=0, sticky="ew", **pad)
         self.frm_roster.columnconfigure(0, weight=1)
         ttk.Label(self.frm_roster, text=ROSTER_HINT, foreground="#666", wraplength=700)\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
@@ -195,7 +248,7 @@ class App(tk.Tk):
 
         # === 操作ボタン ===
         frm_btn = ttk.Frame(self)
-        frm_btn.grid(row=5, column=0, sticky="ew", **pad)
+        frm_btn.grid(row=6, column=0, sticky="ew", **pad)
         self.btn_start = ttk.Button(frm_btn, text="文字起こし開始", command=self._start)
         self.btn_start.pack(side="left")
         self.btn_cancel = ttk.Button(frm_btn, text="キャンセル", command=self._cancel, state="disabled")
@@ -205,7 +258,7 @@ class App(tk.Tk):
 
         # === 進捗 ===
         frm_prog = ttk.Frame(self)
-        frm_prog.grid(row=6, column=0, sticky="ew", **pad)
+        frm_prog.grid(row=7, column=0, sticky="ew", **pad)
         frm_prog.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(frm_prog, mode="determinate")
         self.progress.grid(row=0, column=0, sticky="ew")
@@ -215,10 +268,10 @@ class App(tk.Tk):
 
         # === ログ ===
         frm_log = ttk.LabelFrame(self, text="ログ")
-        frm_log.grid(row=7, column=0, sticky="nsew", **pad)
+        frm_log.grid(row=8, column=0, sticky="nsew", **pad)
         frm_log.columnconfigure(0, weight=1)
         frm_log.rowconfigure(0, weight=1)
-        self.rowconfigure(7, weight=1)
+        self.rowconfigure(8, weight=1)
         self.txt_log = tk.Text(frm_log, height=10, wrap="word", state="disabled")
         self.txt_log.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
         sb = ttk.Scrollbar(frm_log, orient="vertical", command=self.txt_log.yview)
@@ -228,9 +281,15 @@ class App(tk.Tk):
     def _populate_from_config(self) -> None:
         if api := self.cfg.get("api_key"):
             self.var_api.set(api)
+        # 経路ごとにモデルを覚える。旧来の "model" はクラウドのモデル。
         if model := self.cfg.get("model"):
             if model in MODELS:
-                self.var_model.set(model)
+                self._model_by_engine[ENGINE_CLOUD] = str(model)
+        if lmodel := self.cfg.get("local_model"):
+            if lmodel in LOCAL_MODELS:
+                self._model_by_engine[ENGINE_LOCAL] = str(lmodel)
+        if self.cfg.get("engine") in (ENGINE_LOCAL, ENGINE_CLOUD):
+            self.var_engine.set(str(self.cfg["engine"]))
         if chunk := self.cfg.get("chunk_minutes"):
             try:
                 self.var_chunk.set(int(chunk))
@@ -251,6 +310,44 @@ class App(tk.Tk):
             if Path(last_in).exists():
                 self.var_input.set(last_in)
         self._on_toggle_use_input_dir()
+        # 経路を反映してからモデル欄と有効/無効を整える(mode の状態もここで揃う)
+        self._update_engine_state()
+
+    def _update_engine_state(self) -> None:
+        """処理経路の切替に応じて、要らない設定を触れなくする。
+
+        ローカルでは API キーも逐語モードも意味を持たない。触れる状態で
+        残すと「指定したのに効かない」という誤解になる(逐語を書式の
+        選択肢として見せてしまうのは、事業計画 4.4 で撤回した過大表示と
+        同じ形)。
+        """
+        local = self.var_engine.get() == ENGINE_LOCAL
+        other = ENGINE_CLOUD if local else ENGINE_LOCAL
+
+        # いま表示しているモデルを、切り替える前の経路の側に覚えておく
+        if self.var_model.get():
+            self._model_by_engine[other] = self.var_model.get()
+
+        engine = ENGINE_LOCAL if local else ENGINE_CLOUD
+        values = list(LOCAL_MODELS) if local else list(MODELS)
+        self.cmb_model.configure(values=values)
+        remembered = self._model_by_engine.get(engine, values[0])
+        self.var_model.set(remembered if remembered in values else values[0])
+
+        state = "disabled" if local else "normal"
+        for w in (self.lbl_api, self.entry_api, self.btn_api_show, self.btn_api_save):
+            w.configure(state=state)
+        self.chk_verbatim.configure(state=state)
+
+        if local:
+            # 従来方式(名簿から実名を推定させる)はクラウド専用。
+            # 選べるまま残すと、開始してから使えないと知ることになる。
+            if self.var_mode.get() == MODE_AUTO:
+                self.var_mode.set(MODE_MANUAL)
+            self.rdo_mode_auto.configure(state="disabled")
+        else:
+            self.rdo_mode_auto.configure(state="normal")
+        self._update_mode_state()
 
     def _update_mode_state(self) -> None:
         """モード切替に応じてチェックボックスと名簿欄の有効/無効を整える。
@@ -263,10 +360,18 @@ class App(tk.Tk):
             self.var_diarization.set(True)
             self.chk_timestamps.configure(state="disabled")
             self.chk_diarization.configure(state="disabled")
-            self.lbl_diar_note.configure(
-                text="※ この方式では名簿を AI に渡しません。声質だけで区切った区間を、"
-                     "あとの割当画面で 1 区間ずつ確定します。"
-            )
+            if self.var_engine.get() == ENGINE_LOCAL:
+                self.lbl_diar_note.configure(
+                    text="※ ローカルでは声のまとまりを作りません。全区間が未判別に"
+                         "なり、割当画面で 1 件ずつ確定します。\n"
+                         + ENGINE_LOCAL_NOTE_VERBATIM + "\n"
+                         + ENGINE_LOCAL_NOTE_AUTO
+                )
+            else:
+                self.lbl_diar_note.configure(
+                    text="※ この方式では名簿を AI に渡しません。声質だけで区切った区間を、"
+                         "あとの割当画面で 1 区間ずつ確定します。"
+                )
             self.txt_roster.configure(state="normal", background="white")
             self.btn_start.configure(text="文字起こし → 割当画面へ")
         else:
@@ -423,8 +528,10 @@ class App(tk.Tk):
             return
 
         out_dir = self.var_output.get().strip() or str(Path(in_path).parent)
+        engine_mode = self.var_engine.get()
         api = self.var_api.get().strip()
-        if not api:
+        # 鍵が要るのはクラウドのときだけ。ローカルは端末内で完結する。
+        if engine_mode == ENGINE_CLOUD and not api:
             messagebox.showwarning("API キー", "Gemini の API キーを入力してください。")
             return
 
@@ -445,9 +552,13 @@ class App(tk.Tk):
             ):
                 return
 
+        # 経路ごとのモデルを両方覚えておく(切り替えて戻したときのため)
+        self._model_by_engine[engine_mode] = self.var_model.get()
         self.cfg.update({
             "api_key": api,
-            "model": self.var_model.get(),
+            "engine": engine_mode,
+            "model": self._model_by_engine[ENGINE_CLOUD],
+            "local_model": self._model_by_engine[ENGINE_LOCAL],
             "chunk_minutes": int(self.var_chunk.get()),
             "mode": mode,
             "with_timestamps": with_ts,
@@ -473,8 +584,8 @@ class App(tk.Tk):
             args=(
                 Path(in_path),
                 Path(out_dir),
-                api,
-                self.var_model.get(),
+                EngineSpec(mode=engine_mode, model=self.var_model.get(),
+                           api_key=api),
                 int(self.var_chunk.get()),
                 with_ts,
                 with_diar,
@@ -497,8 +608,7 @@ class App(tk.Tk):
         self,
         in_path: Path,
         out_dir: Path,
-        api_key: str,
-        model: str,
+        engine: EngineSpec,
         chunk_minutes: int,
         with_timestamps: bool,
         with_diarization: bool,
@@ -512,8 +622,7 @@ class App(tk.Tk):
                 result = run_segment_pipeline(
                     audio_path=in_path,
                     output_dir=out_dir,
-                    engine=EngineSpec(
-                        mode=ENGINE_CLOUD, model=model, api_key=api_key),
+                    engine=engine,
                     chunk_minutes=chunk_minutes,
                     on_log=lambda m: self._post("log", m),
                     on_progress=lambda c, t: self._post("progress", (c, t)),
@@ -523,11 +632,13 @@ class App(tk.Tk):
                     force_retranscribe=force_retranscribe,
                 )
             else:
+                # 従来方式(AI に実名まで任せる)はクラウド専用。
+                # 画面側でもローカル選択時は選べないようにしてある。
                 result = run_pipeline(
                     audio_path=in_path,
                     output_dir=out_dir,
-                    api_key=api_key,
-                    model=model,
+                    api_key=engine.api_key,
+                    model=engine.resolved_model(),
                     chunk_minutes=chunk_minutes,
                     on_log=lambda m: self._post("log", m),
                     on_progress=lambda c, t: self._post("progress", (c, t)),
