@@ -43,6 +43,9 @@ from src.transcribe import (  # noqa: E402
     normalize_cluster_label,
     parse_segments,
 )
+from src.align import AlignUnavailable  # noqa: E402
+from src.local_asr import LocalTranscriber  # noqa: E402
+from src.segments import PSEUDO_UNKNOWN  # noqa: E402
 
 
 # ======================================================================
@@ -1212,6 +1215,147 @@ def test_carry_over_absorbs_only_matched_families():
     ]
     result, _ = _carry(old, new)
     assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
+# ローカル転写(local_asr.py)
+#
+# faster-whisper の代わりに偽のモデルを差し込む。実モデルを使う確認は
+# tests/test_align_integration.py が担う(CI 対象外)。
+# ======================================================================
+
+class _FakeWord:
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+
+
+class _FakeSegment:
+    def __init__(self, start, end, text, words=None):
+        self.start, self.end, self.text = start, end, text
+        self.words = words or []
+
+
+class _FakeInfo:
+    def __init__(self, duration):
+        self.duration = duration
+
+
+class _FakeWhisper:
+    """WhisperModel の代わり。モデルもライブラリも要らない。"""
+
+    def __init__(self, segments, duration):
+        self._segments, self._duration = segments, duration
+        self.calls = []
+
+    def transcribe(self, path, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._segments), _FakeInfo(self._duration)
+
+
+def _local(segments, duration=60.0):
+    """偽モデルを差し込んだ LocalTranscriber を作る。"""
+    t = LocalTranscriber(model="small")
+    fake = _FakeWhisper(segments, duration)
+    t._whisper = fake            # _load を通さずに差し替える
+    return t, fake
+
+
+def test_local_asr_keeps_short_backchannel():
+    """短い相づちは残す。中身が空の区間だけ落とす。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 3.2, " 本日はお忙しい中ありがとうございます。"),
+        _FakeSegment(3.4, 3.9, " はい"),          # 0.5 秒の相づち
+        _FakeSegment(4.0, 4.2, "   "),            # 中身が無い
+        _FakeSegment(4.5, 6.0, " そうですね。"),
+    ])
+    result = t.transcribe(__file__)
+    assert [u.text for u in result.utterances] == [
+        "本日はお忙しい中ありがとうございます。", "はい", "そうですね。"
+    ]
+
+
+def test_local_asr_marks_every_cluster_unknown():
+    """話者分離が入るまでは全区間が判別不能。誰の声かを決める者がいない。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.0, "あ"),
+        _FakeSegment(1.0, 2.0, "い"),
+    ])
+    result = t.transcribe(__file__)
+    assert {u.cluster for u in result.utterances} == {PSEUDO_UNKNOWN}
+
+
+def test_local_asr_returns_words_from_the_same_pass():
+    """本文と単語時刻が 1 回の転写から取れる(別々に転写しない)。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.5, " はい、そうです。", words=[
+            _FakeWord(" はい", 0.0, 0.4),
+            _FakeWord("、", 0.4, 0.5),
+            _FakeWord("  ", 0.5, 0.5),        # 空白だけの語は捨てる
+            _FakeWord("そうです", 0.6, 1.5),
+        ]),
+    ])
+    result = t.transcribe(__file__)
+    assert [w.text for w in result.words] == ["はい", "、", "そうです"]
+    assert result.words[0].start == 0.0 and result.words[-1].end == 1.5
+    # 時刻はチャンク先頭からの相対秒のまま(絶対秒にするのは後段の仕事)
+    assert result.utterances[0].rel_start == 0.0
+
+
+def test_local_asr_never_makes_negative_duration():
+    """まれに終わりが始まりを下回る。負の長さは作らない。"""
+    t, _ = _local([_FakeSegment(10.0, 9.5, "逆転している")])
+    result = t.transcribe(__file__)
+    u = result.utterances[0]
+    assert u.rel_start == 10.0 and u.rel_end == 10.0
+
+
+def test_local_asr_does_not_use_vad():
+    """VAD は使わない。本文を作る経路なので、落ちた発言は記録から消える。"""
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["vad_filter"] is False
+    assert fake.calls[0]["word_timestamps"] is True
+    assert fake.calls[0]["language"] == "ja"
+
+
+def test_local_asr_cancel_leaves_nothing_behind():
+    """中断したら None。途中までの区間を返さない。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.0, "一つめ"),
+        _FakeSegment(1.0, 2.0, "二つめ"),
+    ])
+    seen = {"n": 0}
+
+    def cancelled():
+        seen["n"] += 1
+        return seen["n"] > 1          # 2 区間目に入ったところで中断
+
+    assert t.transcribe(__file__, is_cancelled=cancelled) is None
+
+
+def test_local_asr_progress_ends_at_total():
+    """進捗は (処理済み秒, 全体秒) で、最後は必ず全体に届く。"""
+    t, _ = _local([_FakeSegment(0.0, 30.0, "あ")], duration=90.0)
+    seen = []
+    t.transcribe(__file__, on_progress=lambda done, total: seen.append((done, total)))
+    assert seen[0] == (30.0, 90.0)
+    assert seen[-1] == (90.0, 90.0)
+
+
+def test_local_asr_bad_model_dir_is_reported_before_transcribing():
+    """置き場の間違いは、音声を分割し終わる前に分かる。
+
+    例外は align.py と同じ AlignUnavailable 系(LocalAsrUnavailable はその
+    サブクラス)。呼び出し側は 1 つ catch すれば両方の経路を拾える。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "no-such-model"
+        try:
+            LocalTranscriber(model="small", model_dir=missing)
+        except AlignUnavailable as e:
+            assert "モデルフォルダが見つかりません" in str(e)
+        else:
+            raise AssertionError("存在しないモデルフォルダが通ってしまった")
 
 
 # ======================================================================

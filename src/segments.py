@@ -187,6 +187,26 @@ def roster_to_text(speakers: Iterable[Speaker]) -> str:
 # セグメント
 # ----------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Utterance:
+    """転写エンジンが返す 1 発言。Segment を組み立てる前の中間の形。
+
+    クラウド(Gemini)とローカル(faster-whisper)で、ここまでは同じ形に揃える。
+    どちらの経路も「チャンク → Utterance の並び」を返し、オフセットの足し込みと
+    通し番号の付与から先は共通の後段が引き受ける
+    (claude/claude_ローカル転写_設計書.md §4.2)。
+
+    時刻はチャンクの先頭からの相対秒。絶対秒にするのは後段の仕事。
+    """
+
+    rel_start: float
+    rel_end: float
+    text: str
+    # 声のまとまりの記号。"A"/"B"… のほか、判別不能は "?"、複数人同時は "*"。
+    # チャンク番号を頭に付けた "0:A" の形にするのは後段(Segment を作るとき)。
+    cluster: str = PSEUDO_UNKNOWN
+
+
 @dataclass
 class Segment:
     """1 つの発言区間"""

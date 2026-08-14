@@ -95,13 +95,8 @@ def resolve_model(model: str = DEFAULT_MODEL,
     return model
 
 
-def words_cache_path(work_dir: Path | str, fingerprint: str, model: str,
-                     model_dir: Optional[Path | str] = None) -> Optional[Path]:
-    """words キャッシュの置き場(§7)。指紋が無いときは None。
-
-    キーは「音声の指紋 + モデルの素性 + 実装バージョン」。どれが欠けても
-    別物の転写を使い回す事故になるので、指紋が取れなかった音声は
-    そもそもキャッシュしない(毎回取り直すほうが安全)。
+def model_tag(model: str, model_dir: Optional[Path | str] = None) -> str:
+    """キャッシュのファイル名に入れる「モデルの素性」。
 
     モデルの素性には model_dir も含める。手動配置のフォルダを差し替えると
     モデル名が同じでも中身は別物で、名前だけをキーにすると差し替え前の
@@ -110,15 +105,30 @@ def words_cache_path(work_dir: Path | str, fingerprint: str, model: str,
 
     モデル名の区切り文字(HF のリポ ID に含まれる「/」等)は「-」に無害化する。
     そのままだとキャッシュのファイル名が下位フォルダに割れてしまう。
+
+    ローカル転写のキャッシュ(local_asr.py)も同じ規則を使う。二重に実装すると
+    片方だけ直したときに、別物の転写が同じキーを共有する事故になる。
     """
-    if not fingerprint:
-        return None
     tag = re.sub(r"[\\/:]+", "-", model)
     if model_dir:
         digest = hashlib.blake2b(
             str(Path(model_dir).resolve()).encode("utf-8"),
             digest_size=4).hexdigest()
         tag += f".d{digest}"
+    return tag
+
+
+def words_cache_path(work_dir: Path | str, fingerprint: str, model: str,
+                     model_dir: Optional[Path | str] = None) -> Optional[Path]:
+    """words キャッシュの置き場(§7)。指紋が無いときは None。
+
+    キーは「音声の指紋 + モデルの素性 + 実装バージョン」。どれが欠けても
+    別物の転写を使い回す事故になるので、指紋が取れなかった音声は
+    そもそもキャッシュしない(毎回取り直すほうが安全)。
+    """
+    if not fingerprint:
+        return None
+    tag = model_tag(model, model_dir)
     return Path(work_dir) / "align" / f"words.{fingerprint}.{tag}.a{ALIGN_VER}.json"
 
 

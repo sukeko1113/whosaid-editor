@@ -1,4 +1,8 @@
-"""align.py の動作確認(ローカル専用・CI 対象外)。
+"""実モデルを使う動作確認(ローカル専用・CI 対象外)。
+
+align.py(時刻の物差し)と local_asr.py(本文を作るローカル転写)の両方を、
+同じ合成音声で確かめる。同じ faster-whisper を使うので、実行環境の確認も
+音声の合成も 1 回で済む。
 
 実際に faster-whisper を回すので、初回はモデルの取得(数百 MB)と CPU での
 転写に時間がかかる。テスト音声は Windows の日本語 TTS で合成する(設計書 §12)。
@@ -39,6 +43,8 @@ from src.align import (  # noqa: E402
     transcribe_words,
     words_cache_path,
 )
+from src.local_asr import LocalTranscriber  # noqa: E402
+from src.segments import PSEUDO_UNKNOWN  # noqa: E402
 
 # 合成する既知のテキスト。会議の言い回しに寄せてある。
 KNOWN_TEXT = (
@@ -231,6 +237,41 @@ def run() -> int:
             "words": [w.to_dict() for w in words],
         }, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"  フィクスチャを書きました: {FIXTURE}")
+
+        # --------------------------------------------------------------
+        # ローカル転写(local_asr.py)。align.py と同じエンジンだが、
+        # こちらは本文そのものを作る。偽のモデルでは確かめられない
+        # ——「実物の segment が text を持っているか」——をここで見る。
+        # --------------------------------------------------------------
+        print("\n[ローカル転写] 同じ音声を本文として起こします...")
+        t0 = time.time()
+        local = LocalTranscriber(model=DEFAULT_MODEL)
+        result = local.transcribe(wav)
+        print(f"  {time.time() - t0:.1f} 秒かかりました。")
+
+        check("区間が返る", result is not None and bool(result.utterances))
+        if result and result.utterances:
+            for u in result.utterances:
+                print(f"    {u.rel_start:6.2f} → {u.rel_end:6.2f}  [{u.cluster}] {u.text}")
+            body = _STRIP.sub("", "".join(u.text for u in result.utterances))
+            ratio_l = difflib.SequenceMatcher(
+                None, body, _STRIP.sub("", KNOWN_TEXT), autojunk=False).ratio()
+            print(f"  (喋らせた文との一致率 {ratio_l:.2f})")
+            check("喋らせた内容とだいたい一致する", ratio_l > 0.5)
+            check("時刻が前から後ろへ並ぶ",
+                  all(a.rel_start <= b.rel_start
+                      for a, b in zip(result.utterances, result.utterances[1:])))
+            check("負の長さの区間が無い",
+                  all(u.rel_end >= u.rel_start for u in result.utterances))
+            check("本文が空の区間が無い",
+                  all(u.text.strip() for u in result.utterances))
+            check("話者分離が入るまでは全区間が判別不能",
+                  {u.cluster for u in result.utterances} == {PSEUDO_UNKNOWN})
+            # 設計の要（§5.3）: 本文と単語時刻が同じ 1 回の転写から取れる。
+            # ここが崩れると words キャッシュを兼ねる前提が成り立たない。
+            check("単語時刻も同時に取れる", bool(result.words))
+            check("単語時刻が align.py の実測と一致する",
+                  flatten(result.words) == flatten(words))
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
     return 1 if failures else 0
