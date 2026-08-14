@@ -207,12 +207,15 @@ class App(tk.Tk):
             frm_adv, values=list(LOCAL_MODELS), textvariable=self.var_model,
             state="readonly")
         self.cmb_model.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        self.cmb_model.bind("<MouseWheel>", self._on_wheel_over_value)
 
         ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
         self.var_chunk = tk.IntVar(value=15)
-        ttk.Spinbox(frm_adv, from_=1, to=30, textvariable=self.var_chunk, width=6)\
-            .grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        self.spin_chunk = ttk.Spinbox(
+            frm_adv, from_=1, to=30, textvariable=self.var_chunk, width=6)
+        self.spin_chunk.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        self.spin_chunk.bind("<MouseWheel>", self._on_wheel_over_value)
         ttk.Label(frm_adv, text="(長いほど割当の手数が減りますが、転写の失敗率は上がります)",
                   foreground="#666").grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
 
@@ -340,8 +343,25 @@ class App(tk.Tk):
         # 経路を反映してからモデル欄と有効/無効を整える(mode の状態もここで揃う)
         self._update_engine_state()
 
+    # 自分でスクロールする欄。この上ではホイールを窓に回さない
+    # (両方動くと、行を 1 つ送るつもりが画面ごと飛ぶ)。
+    _WHEEL_OWN_SCROLL = (tk.Text, tk.Listbox)
+
     def _on_wheel(self, event) -> None:
+        if isinstance(event.widget, self._WHEEL_OWN_SCROLL):
+            return
         self._canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _on_wheel_over_value(self, event) -> str:
+        """値の欄(モデル・チャンク長)の上では、値を変えずに画面を送る。
+
+        Spinbox と Combobox は既定でホイールに反応して値が変わる。窓が
+        スクロールするようになると設定欄の上でホイールを回す機会が増え、
+        気づかないうちに値が変わる。チャンク長はキャッシュキーに入るので、
+        変わると転写がまるごとやり直しになる。
+        """
+        self._canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"      # 既定の「値を変える」動作へ渡さない
 
     def _scroll_to_log(self) -> None:
         """ログが見えるところまで送る(処理中に見たいのはそこだけ)。"""

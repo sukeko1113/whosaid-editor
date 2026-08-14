@@ -912,6 +912,42 @@ def run_main_window() -> int:
             log_y = app.txt_log.winfo_rooty() - app._canvas.winfo_rooty()
             check("送ればログ欄まで届く",
                   0 <= log_y < app._canvas.winfo_height())
+
+            # --- ホイールの行き先 ---------------------------------------
+            # 窓がスクロールするようになると、設定欄の上でホイールを回す
+            # 機会が増える。中身と窓が同時に動いたり、値が黙って変わったり
+            # しないことを見る(チャンク長はキャッシュキーに入るので、
+            # 変わると転写がまるごとやり直しになる)。
+            app.txt_log.configure(state="normal")
+            app.txt_log.insert("end", "".join(f"行 {i}\n" for i in range(200)))
+            app.txt_log.configure(state="disabled")
+            app._canvas.bind_all("<MouseWheel>", app._on_wheel)   # 乗った状態を作る
+            app.txt_log.yview_moveto(0.5)
+            app.update()
+
+            before_c, before_t = app._canvas.yview()[0], app.txt_log.yview()[0]
+            app.txt_log.event_generate("<MouseWheel>", delta=120, x=10, y=10)
+            app.update()
+            check("ログ欄の上では中身だけ動く",
+                  app.txt_log.yview()[0] != before_t
+                  and app._canvas.yview()[0] == before_c)
+
+            before_chunk = app.var_chunk.get()
+            before_c = app._canvas.yview()[0]
+            app.spin_chunk.event_generate("<MouseWheel>", delta=120, x=5, y=5)
+            app.update()
+            check("チャンク長はホイールで変わらない",
+                  app.var_chunk.get() == before_chunk)
+            check("チャンク長の上でも画面は送れる",
+                  app._canvas.yview()[0] != before_c)
+
+            before_model = app.var_model.get()
+            app.cmb_model.event_generate("<MouseWheel>", delta=120, x=5, y=5)
+            app.update()
+            check("モデルはホイールで変わらない",
+                  app.var_model.get() == before_model)
+
+            app._canvas.unbind_all("<MouseWheel>")
             app.withdraw()
             # 既定はローカル。録音を外へ出す判断を既定に紛れ込ませない
             check("既定はローカル", app.var_engine.get() == ENGINE_LOCAL)
