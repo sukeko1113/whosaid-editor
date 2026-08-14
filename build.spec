@@ -9,7 +9,16 @@
 """
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+
 ROOT = Path(SPECPATH)
+
+# ローカル転写(faster-whisper)の同梱物。
+#   - ctranslate2 / av は DLL を持つ。静的解析では拾われないので明示的に集める
+#   - faster_whisper は assets/ に VAD の onnx を同梱している。いまは
+#     vad_filter=False で使っていないが、入れておかないと有効にした瞬間に落ちる
+whisper_binaries = collect_dynamic_libs("ctranslate2") + collect_dynamic_libs("av")
+whisper_datas = collect_data_files("faster_whisper")
 
 # ffmpeg / ffplay の同梱(Windows のみ)
 binaries = []
@@ -30,12 +39,18 @@ icon_arg = str(icon_path) if icon_path.exists() else None
 a = Analysis(
     [str(ROOT / "src" / "main.py")],
     pathex=[str(ROOT)],
-    binaries=binaries,
-    datas=[],
+    binaries=binaries + whisper_binaries,
+    datas=whisper_datas,
     hiddenimports=[
         "google.genai",
         "google.auth",
         "docx",
+        # align.py / local_asr.py は関数の中で import している(素の Python でも
+        # 起動できるようにするため)。静的解析に頼らず明示する。
+        "faster_whisper",
+        "ctranslate2",
+        "av",
+        "tokenizers",
     ],
     hookspath=[],
     hooksconfig={},
