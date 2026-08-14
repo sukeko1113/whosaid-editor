@@ -1017,6 +1017,46 @@ def test_v4_file_reads_with_empty_history_fields():
     assert data["doc_revision"] == 0
 
 
+def test_write_docx_verification_summary():
+    """Word の末尾に検証要約(SHA-256・処理経路・版・確認状態)が付く。"""
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    proj.segments[0].speaker_id = sid
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = sid          # まとめて適用(未確認)扱い
+    proj.segments[0].time_edited = True
+    proj.segments[0].time_reviewed = True
+    proj.source_sha256 = "cd" * 32
+    proj.engine = {"mode": "cloud", "model": "gemini-2.5-flash",
+                   "at": "2026-08-14T05:00:00Z"}
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, revision=3)
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs)
+    assert "検証要約" in text
+    assert "cd" * 32 in text
+    assert "クラウド / gemini-2.5-flash" in text
+    assert "revision 3" in text
+    assert "聴いて確定 1" in text and "まとめて適用 1" in text
+    assert "聴いて確認 1" in text                  # 時刻の ✎
+    assert "保証するものではありません" in text
+
+
+def test_write_docx_verification_can_be_omitted():
+    from docx import Document
+    from src.segments import write_docx
+
+    proj = _make_project()
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "out.docx"
+        write_docx(proj, out, include_verification=False)
+        text = "\n".join(p.text for p in Document(str(out)).paragraphs)
+    assert "検証要約" not in text
+
+
 def test_history_fields_round_trip():
     """v5 の 4 フィールドが保存・読込で欠けない。"""
     proj = Project(audio_path="a.m4a", duration=10.0)

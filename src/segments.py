@@ -579,6 +579,38 @@ def _merge_runs(
     return [(start, sid, "".join(parts)) for start, sid, parts in runs]
 
 
+def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
+    """docx 末尾の「検証要約」の (項目, 値) を作る。
+
+    書くのは確認の履歴であって、正しさの保証ではない。何をどの経路で処理し、
+    人がどこまで確認したかを、第三者が検算できる形で残す(スキーマ v5)。
+    """
+    rows: list[tuple[str, str]] = [
+        ("元音声", f"{Path(proj.audio_path).name} ({fmt_hms(proj.duration)})"),
+    ]
+    if proj.source_sha256:
+        rows.append(("SHA-256", proj.source_sha256))
+    if proj.engine:
+        mode = {"cloud": "クラウド", "local": "ローカル"}.get(
+            str(proj.engine.get("mode", "")), str(proj.engine.get("mode", "")))
+        model = str(proj.engine.get("model", ""))
+        at = str(proj.engine.get("at", ""))
+        rows.append(("処理経路", " / ".join(x for x in (mode, model, at) if x)))
+    rows.append(("版", f"revision {revision} (schema {SCHEMA_VERSION})"))
+
+    heard = proj.reviewed_count
+    bulk = proj.unreviewed_count
+    unassigned = proj.total_count - proj.assigned_count
+    rows.append(("話者の確認", f"聴いて確定 {heard} / まとめて適用 {bulk} / "
+                              f"未確定 {unassigned}"))
+    t_heard = sum(1 for s in proj.segments if s.time_edited and s.time_reviewed)
+    t_bulk = sum(1 for s in proj.segments if s.time_edited and not s.time_reviewed)
+    rows.append(("時刻の修正", f"聴いて確認 {t_heard} / 適用のみ {t_bulk}"))
+    rows.append(("注意", "本書の記載は確認の履歴であり、内容の正しさや"
+                        "法的効力を保証するものではありません。"))
+    return rows
+
+
 def build_note(proj: Project) -> str:
     """docx 冒頭に入れる但し書き。何がどこまで人手で確認されたかを明示する。"""
     parts = [
@@ -603,8 +635,14 @@ def write_docx(
     include_note: bool = True,
     include_attendees: bool = True,
     drop_noise: bool = True,
+    include_verification: bool = True,
+    revision: Optional[int] = None,
 ) -> Path:
-    """割当結果を Word ファイルに書き出す。"""
+    """割当結果を Word ファイルに書き出す。
+
+    include_verification: 末尾に検証要約(元音声・SHA-256・処理経路・版・
+    確認状態)を付ける。revision はこの出力の版番号(省略時は記録済みの値)。
+    """
     from docx import Document
     from docx.shared import Pt, RGBColor
     from docx.oxml.ns import qn
@@ -654,6 +692,21 @@ def write_docx(
             # ユーザーが意図的に「不明」等と判断した区間はグレー
             name_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
         p.add_run(text)
+
+    if include_verification:
+        doc.add_paragraph()
+        head = doc.add_paragraph()
+        run = head.add_run("―― 検証要約 ――")
+        run.bold = True
+        for label, value in build_verification(
+                proj, revision if revision is not None else proj.doc_revision):
+            p = doc.add_paragraph()
+            r = p.add_run(f"{label}: ")
+            r.bold = True
+            r.font.size = Pt(9)
+            v = p.add_run(value)
+            v.font.size = Pt(9)
+            v.font.color.rgb = RGBColor(0x40, 0x40, 0x40)
 
     doc.save(str(output_path))
     return output_path

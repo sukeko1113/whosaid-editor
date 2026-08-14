@@ -10,6 +10,10 @@ from typing import Any
 
 APP_NAME = "GeminiTranscriber"
 
+# アプリの版。installer.iss の MyAppVersion と揃えること(現状は手動同期。
+# Day 60 のインストーラ作業で一元化を検討)。Word の検証要約に併記される。
+APP_VERSION = "2.1.0"
+
 
 def config_dir() -> Path:
     if sys.platform == "win32":

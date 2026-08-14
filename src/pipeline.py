@@ -7,13 +7,15 @@ from __future__ import annotations
 
 import hashlib
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from google import genai
 from google.genai import types as genai_types
 
-from .audio import audio_fingerprint, probe_duration, split_audio
+from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
+from .config import APP_VERSION
 from .segments import Project, Segment, Speaker, fmt_hms, parse_roster
 from .transcribe import (
     DIARIZATION_NOTE,
@@ -439,12 +441,15 @@ def run_segment_pipeline(
     if duration:
         on_log(f"音声長: {int(duration // 60)}分{int(duration % 60)}秒")
 
-    # 音声の中身から指紋を取る。ファイル名が同じでも中身が変わっていれば
+    # 音声の中身から指紋(キャッシュ同一性)と SHA-256(第三者の検算用)を、
+    # 1 回の読みで同時に取る。ファイル名が同じでも中身が変わっていれば
     # 別物として扱い、古い転写や割当を引き継がない。
     on_log("音声の内容を確認しています...")
-    fingerprint = audio_fingerprint(audio_path)
+    fingerprint, source_sha = audio_hashes(audio_path)
     if fingerprint:
         on_log(f"音声の指紋: {fingerprint}")
+    if source_sha:
+        on_log(f"元音声の SHA-256: {source_sha}")
 
     on_log(f"音声を {chunk_minutes} 分単位で分割します...")
     chunks = split_audio(audio_path, chunks_dir, chunk_minutes * 60)
@@ -559,6 +564,10 @@ def run_segment_pipeline(
         seg.index = n
 
     speakers = parse_roster(roster)
+    # 再実行しても文書の履歴(版・編集履歴)は消さない。ただし音声の中身が
+    # 変わっていた場合は別の文書の系譜なので引き継がない。
+    carried_revision = 0
+    carried_log: list[dict] = []
     if json_path.exists():
         try:
             old = Project.load(json_path)
@@ -579,6 +588,8 @@ def run_segment_pipeline(
                 speakers = _merge_speakers(old.speakers, roster)
                 # 分割・結合を復元するぶん区間が増減するので、戻り値で置き換える
                 all_segments = _carry_over_assignments(old, all_segments, on_log)
+                carried_revision = old.doc_revision
+                carried_log = old.edit_log
         except Exception as e:  # 壊れた JSON は無視して作り直す
             on_log(f"既存の作業ファイルを読めませんでした({e})。新規作成します。")
             speakers = parse_roster(roster)
@@ -590,6 +601,15 @@ def run_segment_pipeline(
         model=model,
         verbatim=verbatim,
         audio_fingerprint=fingerprint,
+        source_sha256=source_sha,
+        engine={
+            "mode": "cloud",
+            "model": model,
+            "app_version": APP_VERSION,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+        doc_revision=carried_revision,
+        edit_log=carried_log,
         speakers=speakers,
         segments=all_segments,
     )
