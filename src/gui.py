@@ -768,8 +768,16 @@ class App(tk.Tk):
         # 手動割当モード: そのまま割当画面を開く
         if isinstance(result, Project):
             n = result.total_count
-            clusters = len(result.clusters())
-            self._append_log(f"{n} 区間 / 声のまとまり {clusters} 種類。割当画面を開きます。")
+            # 擬似クラスタ(? / *)は「声のまとまり」ではない。数に入れると、
+            # ローカル転写のように全部が未判別のときでも
+            # 「まとまり 10 種類」と出て、使える手がかりがあるように見える。
+            real = {s.cluster for s in result.segments if not s.is_pseudo_cluster}
+            if real:
+                self._append_log(
+                    f"{n} 区間 / 声のまとまり {len(real)} 種類。割当画面を開きます。")
+            else:
+                self._append_log(
+                    f"{n} 区間(声のまとまりなし・全区間が未判別)。割当画面を開きます。")
             self._open_assign(result)
             return
 
