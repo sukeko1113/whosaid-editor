@@ -1,6 +1,6 @@
 # whosaid-editor — ローカル化 技術方針書
 
-- 版: v1.0（2026-08-14）
+- 版: v1.0（2026-08-14）/ **v1.1（2026-08-15）: §2 に Whisper 上位モデルを追加（候補の漏れ）**
 - 位置づけ: 外部評価資料（sherpa-onnx導入評価 v04）と、当プロジェクトの実測・調査
   （2026-08-13〜14）を統合した**技術選定の確定判断**。
   次に書く `claude_ローカル転写_設計書.md` と話者分離 PoC の前提資料。
@@ -34,6 +34,30 @@
 | whisper.cpp | **FALLBACK** | 同じ重みで品質利得なし。CTranslate2 配布が破綻した場合の代替のみ |
 | reverb-diarization-v1 / NVIDIA Sortformer v1 | **NO-GO** | 非商用ライセンス（CC-BY-NC 等）。商用製品に同梱不可 |
 | WeSpeaker（VoxCeleb 系） | **避ける** | 「データセットのライセンスに従う」とされ商用同梱はグレー。TitaNet で代替 |
+| **large-v3-turbo（CT2）** | **BENCH（A0+ レーン・v1.1 で追加）** | **v1.0 の候補一覧から漏れていた。**「Whisper のまま質を上げる」という最も素直な道を検討していなかった。配布 1,543MB（実測）。固有名詞・役職名が多い議事録では small との差が効く可能性 |
+| **distil-large-v3（CT2）** | **BENCH（A0+ レーン・v1.1 で追加）** | 同上。配布 1,443MB（実測）。turbo との比較対象 |
+
+**v1.1 の追記理由（2026-08-15）**: 無料のローカル転写ツール **aTrain**
+（グラーツ大学・AGPL-3.0・github.com/aTrainTranscription/aTrain）が
+large-v3 / large-v3-turbo / distil-large-v3 を採用しているのを見て、
+本書の候補一覧に**上位 Whisper が 1 つも入っていない**ことに気づいた。
+v1.0 は「small を基準線に、別系統（Kotoba・ReazonSpeech・SenseVoice）と比べる」
+構成になっていたが、**同じ Whisper のまま質を上げる道**を検討していない。
+
+- 参考になる外部実測（aTrain の README）: 22 分の音声を large-v3 で
+  **CPU 26 分 12 秒**（Ryzen 6850U）/ M1 33 分 15 秒 / RTX 2080 Ti 1 分 44 秒。
+  RTF 約 1.19。本プロジェクトの small は RTF 0.36（実測）
+- **配布サイズと正面から衝突する**。int8 でも 800MB 前後の見込みで、
+  同梱の決定（small int8 約 230MB・インストーラ 500〜600MB）を崩す。
+  「精度の差が配布サイズに見合うか」を Gate A で測ってから判断する
+- **コードは使えない。**aTrain は AGPL-3.0 で、取り込むと製品全体に
+  同ライセンスの公開義務が生じる。ただし土台の部品（faster-whisper=MIT、
+  pyannote segmentation-3.0=MIT、sherpa-onnx=Apache-2.0）は本プロジェクトが
+  既に直接使っており、経由する必要がない
+- aTrain は**競合としても事業計画へ追加すべき**（noScribe と同区画。
+  無料・ローカル完結・質的研究向け・MAXQDA/ATLAS.ti/nVivo 出力・論文あり）。
+  ただし日本語の提出用書式・確認状態の三値・検証履歴・**フィラー脱落の検出**は
+  持たない。同じ Whisper を使う以上、逐語性の問題は向こうも抱えている
 
 ## 3. 実測で確定した事実（このプロジェクトの一次データ）
 
