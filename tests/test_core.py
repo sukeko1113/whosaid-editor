@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -45,6 +46,7 @@ from src.transcribe import (  # noqa: E402
     parse_utterances,
 )
 from src.align import AlignUnavailable  # noqa: E402
+from src import evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1220,6 +1222,105 @@ def test_carry_over_absorbs_only_matched_families():
     ]
     result, _ = _carry(old, new)
     assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
+# 正解ラベルの評価(evaluate.py)
+#
+# 測る前に手順を固定するための道具。標本の選び方が実行のたびに変わると、
+# 「作りやすい区間を選んだ」という疑いを自分で否定できなくなる。
+# ======================================================================
+
+def _eval_segs(n=300):
+    """長さがばらばらの区間を作る(半分が 2 秒未満になるように)。"""
+    out = []
+    for i in range(n):
+        dur = 0.5 + (i % 5) * 0.9      # 0.5 / 1.4 / 2.3 / 3.2 / 4.1 秒
+        out.append(Segment(index=i, start=i * 10.0, end=i * 10.0 + dur,
+                           text=f"発言 {i}", cluster="0:?"))
+    return out
+
+
+def test_sample_is_the_same_every_time():
+    """同じ種なら必ず同じ標本になる(測定前に固定できる)。"""
+    segs = _eval_segs()
+    a = evaluate.select_sample(segs, per_stratum=20)
+    b = evaluate.select_sample(segs, per_stratum=20)
+    assert [x.index for x in a] == [x.index for x in b]
+    c = evaluate.select_sample(segs, per_stratum=20, seed=999)
+    assert [x.index for x in a] != [x.index for x in c]
+
+
+def test_sample_takes_the_asked_number_from_each_stratum():
+    segs = _eval_segs()
+    picked = evaluate.select_sample(segs, per_stratum=20)
+    per = Counter(x.stratum for x in picked)
+    assert per[evaluate.STRATUM_SHORT] == 20
+    assert per[evaluate.STRATUM_LONG] == 20
+    assert len({x.index for x in picked}) == 40      # 重複しない
+    # 人が会話を追えるよう時間順に並ぶ
+    assert [x.start for x in picked] == sorted(x.start for x in picked)
+
+
+def test_sample_does_not_pad_a_small_stratum():
+    """層の件数が足りないときは全件。水増ししない。"""
+    segs = [Segment(index=i, start=i * 10.0, end=i * 10.0 + 5.0,
+                    text="長い", cluster="0:?") for i in range(4)]
+    segs.append(Segment(index=99, start=999.0, end=999.5, text="短い",
+                        cluster="0:?"))
+    picked = evaluate.select_sample(segs, per_stratum=10)
+    per = Counter(x.stratum for x in picked)
+    assert per[evaluate.STRATUM_LONG] == 4
+    assert per[evaluate.STRATUM_SHORT] == 1
+
+
+def test_stratum_boundary_is_two_seconds():
+    assert evaluate.stratum_of(1.99) == evaluate.STRATUM_SHORT
+    assert evaluate.stratum_of(2.0) == evaluate.STRATUM_LONG
+
+
+def test_cluster_purity_uses_the_majority_of_each_group():
+    """まとまりごとに最も多い話者へ対応づけ、一致した割合を返す。"""
+    pairs = [
+        ("g1", "sp01"), ("g1", "sp01"), ("g1", "sp02"),   # 2/3
+        ("g2", "sp03"), ("g2", "sp03"),                    # 2/2
+    ]
+    purity, detail = evaluate.cluster_purity(pairs)
+    assert abs(purity - 4 / 5) < 1e-9
+    assert detail["g1"] == ("sp01", 2, 3)
+    assert detail["g2"] == ("sp03", 2, 2)
+
+
+def test_cluster_purity_skips_unknown_truth():
+    """正解が「分からない」区間は分母に入れない。"""
+    purity, _ = evaluate.cluster_purity(
+        [("g1", "sp01"), ("g1", None), ("g1", "sp01")])
+    assert abs(purity - 1.0) < 1e-9
+
+
+def test_weighted_rate_follows_the_population():
+    """層ごとに同じ件数を採るので、全体値は母集団の構成で重み付けする。"""
+    rates = {evaluate.STRATUM_SHORT: 0.50, evaluate.STRATUM_LONG: 0.90}
+    sizes = {evaluate.STRATUM_SHORT: 670, evaluate.STRATUM_LONG: 549}
+    got = evaluate.weighted_rate(rates, sizes)
+    assert abs(got - (0.50 * 670 + 0.90 * 549) / 1219) < 1e-9
+    # 単純平均(0.70)とは違う
+    assert abs(got - 0.70) > 0.01
+
+
+def test_verdict_says_undecidable_near_the_threshold():
+    """70% の近くでは「判定不能」と言う。出た数字を見てから基準を動かさない。"""
+    assert evaluate.verdict(0.85, 200, population=1219) == "達成"
+    assert evaluate.verdict(0.50, 200, population=1219) == "未達"
+    assert evaluate.verdict(0.72, 200, population=1219) == "判定不能"
+
+
+def test_halfwidth_shrinks_with_more_samples():
+    wide = evaluate.proportion_halfwidth(0.7, 200, population=1219)
+    narrow = evaluate.proportion_halfwidth(0.7, 400, population=1219)
+    assert narrow < wide
+    # 設計書 §2.3 が言う「およそ ±6 ポイント」に合っていること
+    assert 0.05 < wide < 0.07
 
 
 # ======================================================================
