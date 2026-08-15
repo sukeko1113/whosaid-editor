@@ -19,6 +19,7 @@ faster_whisper は関数の中で import する(align.py と同じ理由)。
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -157,18 +158,31 @@ class LocalTranscriber:
         self.target = resolve_model(model, model_dir)
         self._whisper = None
 
+    def ensure_available(self) -> None:
+        """部品が揃っているかだけを先に確かめる(モデルは読まない)。
+
+        音声を分割し終えてから「部品がありません」と言われるのでは遅い。
+        2 時間の音声だと分割だけで数分かかる。
+        """
+        try:
+            import faster_whisper       # noqa: F401
+        except ImportError as e:
+            raise LocalAsrUnavailable(
+                "ローカル転写には faster-whisper が必要です。\n"
+                f"いま動いている Python: {sys.executable}\n"
+                "この Python に対して\n"
+                "    pip install faster-whisper\n"
+                "で導入するか、faster-whisper を入れてある環境から起動して"
+                "ください。\n"
+                f"--- 詳細 ---\n{e}"
+            ) from e
+
     def _load(self, on_log=None):
         """初回の転写のときにモデルを読む(生成そのものは軽くしておく)。"""
         if self._whisper is not None:
             return self._whisper
-        try:
-            from faster_whisper import WhisperModel      # 重いのでここで読む
-        except ImportError as e:
-            raise LocalAsrUnavailable(
-                "ローカル転写には faster-whisper が必要です。\n"
-                "    pip install faster-whisper\n"
-                "で導入してから、もう一度お試しください。"
-            ) from e
+        self.ensure_available()
+        from faster_whisper import WhisperModel      # 重いのでここで読む
 
         if on_log:
             on_log(f"ローカル転写の準備をしています(モデル {self.model} / CPU)。")

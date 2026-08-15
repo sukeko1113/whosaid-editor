@@ -518,6 +518,15 @@ def run_segment_pipeline(
     if force_retranscribe:
         on_log("キャッシュを使わず、最初から転写し直します。")
 
+    # エンジンが使える状態かを、重い処理に入る前に確かめる。
+    # 370MB の音声だと、ハッシュと分割だけで数分かかる。それを終えてから
+    # 「部品がありません」と言われるのでは、待った時間がまるごと無駄になる。
+    transcriber = None
+    if engine.is_local:
+        transcriber = local_asr.LocalTranscriber(
+            model=model, model_dir=engine.model_dir)
+        transcriber.ensure_available()
+
     duration = probe_duration(audio_path)
     if duration:
         on_log(f"音声長: {int(duration // 60)}分{int(duration % 60)}秒")
@@ -554,8 +563,6 @@ def run_segment_pipeline(
         acc += d
 
     client = None if engine.is_local else _make_client(engine.api_key)
-    transcriber = local_asr.LocalTranscriber(
-        model=model, model_dir=engine.model_dir) if engine.is_local else None
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60

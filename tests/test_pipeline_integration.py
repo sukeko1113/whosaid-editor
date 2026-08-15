@@ -585,6 +585,9 @@ def run_local() -> int:
         def __init__(self, model="small", model_dir=None):
             self.model, self.model_dir = model, model_dir
 
+        def ensure_available(self):
+            pass
+
         def transcribe(self, audio_path, *, on_log=None, on_progress=None,
                        is_cancelled=None):
             calls["transcribe"] += 1
@@ -673,6 +676,47 @@ def run_local() -> int:
                 is_cancelled=lambda: False, roster="佐藤",
             )
             check("モデルを変えると取り直す", calls["transcribe"] > 0)
+
+        # --- 部品が無いときは、重い処理に入る前に止まる -----------------
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 150)
+
+            print("\n[部品が無いとき]")
+
+            class Missing(FakeLocal):
+                def ensure_available(self):
+                    raise pipeline.local_asr.LocalAsrUnavailable(
+                        "ローカル転写には faster-whisper が必要です。")
+
+            split_calls = {"n": 0}
+            real_split = pipeline.split_audio
+
+            def counting_split(*a, **k):
+                split_calls["n"] += 1
+                return real_split(*a, **k)
+
+            pipeline.local_asr.LocalTranscriber = Missing    # type: ignore[misc]
+            pipeline.split_audio = counting_split            # type: ignore[assignment]
+            try:
+                raised = ""
+                try:
+                    pipeline.run_segment_pipeline(
+                        audio_path=audio, output_dir=tmp, engine=LOCAL,
+                        chunk_minutes=1,
+                        on_log=lambda m: None, on_progress=lambda c, t: None,
+                        is_cancelled=lambda: False, roster="佐藤",
+                    )
+                except pipeline.local_asr.LocalAsrUnavailable as e:
+                    raised = str(e)
+                check("部品が無ければ知らせる", "faster-whisper" in raised)
+                # 370MB の音声だと分割だけで数分かかる。待たせてから
+                # 「部品がありません」では、待った時間がまるごと無駄になる
+                check("分割を始める前に止まる", split_calls["n"] == 0)
+            finally:
+                pipeline.local_asr.LocalTranscriber = FakeLocal  # type: ignore[misc]
+                pipeline.split_audio = real_split                # type: ignore[assignment]
 
         # --- 経路が変わったときの引き継ぎ(設計書 §8.1) ------------------
         with tempfile.TemporaryDirectory() as d:
