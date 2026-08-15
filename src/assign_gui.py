@@ -339,6 +339,14 @@ class AssignWindow(tk.Toplevel):
 
         self._build_ui()
         self._bind_keys()
+        # 声のまとまりが 1 つも無い作業ファイル(ローカル転写)では、一括適用は
+        # 成り立たない。ON のまま残すと確定のたびに「一括適用できません」の
+        # 警告が出る——1219 区間なら 1219 回になる。最初から外しておく。
+        if not self.has_real_clusters():
+            self.var_apply_cluster.set(False)
+            self.chk_apply_cluster.configure(
+                state="disabled",
+                text="同じ声のまとまり全体に適用 (このファイルには声のまとまりがありません)")
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(4000, self._autosave_tick)
@@ -536,8 +544,10 @@ class AssignWindow(tk.Toplevel):
 
         opts = ttk.Frame(frm_cand)
         opts.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
-        ttk.Checkbutton(opts, text="同じ声のまとまり全体に適用 (A)",
-                        variable=self.var_apply_cluster, takefocus=False).pack(side="left")
+        self.chk_apply_cluster = ttk.Checkbutton(
+            opts, text="同じ声のまとまり全体に適用 (A)",
+            variable=self.var_apply_cluster, takefocus=False)
+        self.chk_apply_cluster.pack(side="left")
         ttk.Checkbutton(opts, text="確定したら次へ", variable=self.var_advance,
                         takefocus=False).pack(side="left", padx=12)
         ttk.Button(opts, text="不明 (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))\
@@ -675,7 +685,20 @@ class AssignWindow(tk.Toplevel):
             self.assign(self._candidates[i].speaker.id)
         return "break"
 
+    def has_real_clusters(self) -> bool:
+        """一括適用の対象になる「声のまとまり」が 1 つでもあるか。
+
+        ローカル転写には声を聞き分ける者がいないので、全区間が擬似クラスタ
+        (?)になる。そのときは一括適用という機能自体が成り立たない。
+        """
+        return any(not s.is_pseudo_cluster for s in self.proj.segments)
+
     def _toggle_cluster_mode(self) -> None:
+        if not self.has_real_clusters():
+            self._set_action(
+                "この作業ファイルには声のまとまりがありません"
+                "(ローカル転写では作られません)。一括適用は使えません。")
+            return
         self.var_apply_cluster.set(not self.var_apply_cluster.get())
 
     def _first_run_hint(self) -> None:

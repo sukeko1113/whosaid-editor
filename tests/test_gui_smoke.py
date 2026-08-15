@@ -863,6 +863,52 @@ def run() -> int:
 
         win.player.close()
         win.destroy()
+
+        # --- 声のまとまりが無い作業ファイル(ローカル転写) -----------------
+        # 全区間が擬似クラスタなので、一括適用は成り立たない。ON のまま
+        # 残すと確定のたびに警告が出る(1219 区間なら 1219 回)。
+        local_proj = Project(audio_path=str(tmp / "meeting.m4a"),
+                             duration=600.0, chunk_seconds=420)
+        local_proj.speakers = parse_roster("佐藤\n田中")
+        local_proj.segments = [
+            Segment(index=i, start=i * 10.0, end=i * 10.0 + 8,
+                    text=f"発言 {i}。", cluster=f"{i // 5}:?", chunk=i // 5)
+            for i in range(10)
+        ]
+        local_proj.json_path = str(tmp / "local.speakers.json")
+        local_proj.save()
+
+        lwin = AssignWindow(root, local_proj)
+        lwin.var_autoplay.set(False)
+        lwin.update()
+        check("まとまりが無いことを見分ける", lwin.has_real_clusters() is False)
+        check("一括適用は最初から外れている",
+              lwin.var_apply_cluster.get() is False)
+        check("一括適用のチェックは押せない",
+              str(lwin.chk_apply_cluster.cget("state")) == "disabled")
+
+        # A キーを押しても ON にならない(ON になると警告が出る状態に戻る)
+        lwin._toggle_cluster_mode()
+        check("A キーでも一括適用は入らない",
+              lwin.var_apply_cluster.get() is False)
+
+        # 確定しても警告ダイアログが出ないこと
+        warned: list[str] = []
+        real_warn = assign_gui.messagebox.showwarning
+        assign_gui.messagebox.showwarning = lambda t, *a, **k: warned.append(t)
+        try:
+            lwin.current = 0
+            lwin.assign(local_proj.speakers[0].id)
+            check("確定しても警告が出ない", warned == [])
+            check("その区間だけが確定する",
+                  local_proj.segments[0].speaker_id == local_proj.speakers[0].id
+                  and all(s.speaker_id is None for s in local_proj.segments[1:]))
+            check("自分で聴いた 1 件は ✓ になる",
+                  local_proj.segments[0].reviewed is True)
+        finally:
+            assign_gui.messagebox.showwarning = real_warn
+        lwin.player.close()
+        lwin.destroy()
         root.destroy()
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
