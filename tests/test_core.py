@@ -1231,11 +1231,11 @@ def test_carry_over_absorbs_only_matched_families():
 # 「作りやすい区間を選んだ」という疑いを自分で否定できなくなる。
 # ======================================================================
 
-def _eval_segs(n=300):
-    """長さがばらばらの区間を作る(半分が 2 秒未満になるように)。"""
+def _eval_segs(n=600):
+    """長さがばらばらの区間を作る(3 層に散らばるように)。"""
     out = []
     for i in range(n):
-        dur = 0.5 + (i % 5) * 0.9      # 0.5 / 1.4 / 2.3 / 3.2 / 4.1 秒
+        dur = 0.4 + (i % 6) * 0.4      # 0.4/0.8/1.2/1.6/2.0/2.4 秒
         out.append(Segment(index=i, start=i * 10.0, end=i * 10.0 + dur,
                            text=f"発言 {i}", cluster="0:?"))
     return out
@@ -1246,35 +1246,62 @@ def test_sample_is_the_same_every_time():
     segs = _eval_segs()
     a = evaluate.select_sample(segs, per_stratum=20)
     b = evaluate.select_sample(segs, per_stratum=20)
-    assert [x.index for x in a] == [x.index for x in b]
+    assert [(x.index, x.round) for x in a] == [(x.index, x.round) for x in b]
     c = evaluate.select_sample(segs, per_stratum=20, seed=999)
     assert [x.index for x in a] != [x.index for x in c]
 
 
-def test_sample_takes_the_asked_number_from_each_stratum():
+def test_sample_takes_the_asked_number_from_each_stratum_and_round():
     segs = _eval_segs()
-    picked = evaluate.select_sample(segs, per_stratum=20)
-    per = Counter(x.stratum for x in picked)
-    assert per[evaluate.STRATUM_SHORT] == 20
-    assert per[evaluate.STRATUM_LONG] == 20
-    assert len({x.index for x in picked}) == 40      # 重複しない
-    # 人が会話を追えるよう時間順に並ぶ
-    assert [x.start for x in picked] == sorted(x.start for x in picked)
+    picked = evaluate.select_sample(segs, per_stratum=20, rounds=2)
+    per = Counter((x.stratum, x.round) for x in picked)
+    for stratum in evaluate.STRATA:
+        assert per[(stratum, 1)] == 20
+        assert per[(stratum, 2)] == 20
+    assert len({x.index for x in picked}) == 120     # 重複しない
+    # 巡ごとに時間順(人が会話を追えるように)
+    for r in (1, 2):
+        starts = [x.start for x in picked if x.round == r]
+        assert starts == sorted(starts)
+
+
+def test_adding_a_round_does_not_change_the_earlier_one():
+    """巡を増やしても 1 巡目の中身は動かない(固定したまま足せる)。"""
+    segs = _eval_segs()
+    one = evaluate.select_sample(segs, per_stratum=20, rounds=1)
+    two = evaluate.select_sample(segs, per_stratum=20, rounds=2)
+    first_of_two = [x for x in two if x.round == 1]
+    assert [x.index for x in one] == [x.index for x in first_of_two]
+
+
+def test_each_round_spreads_over_the_whole_recording():
+    """1 巡だけでも全長に散らばる(途中でやめても前半に偏らない)。"""
+    segs = _eval_segs()
+    picked = [x for x in evaluate.select_sample(segs, per_stratum=20, rounds=2)
+              if x.round == 1]
+    last_start = segs[-1].start
+    halves = Counter("前半" if x.start < last_start / 2 else "後半" for x in picked)
+    # 母集団が一様なので、どちらの半分にも 3 割以上は入るはず
+    assert halves["前半"] > len(picked) * 0.3
+    assert halves["後半"] > len(picked) * 0.3
 
 
 def test_sample_does_not_pad_a_small_stratum():
     """層の件数が足りないときは全件。水増ししない。"""
     segs = [Segment(index=i, start=i * 10.0, end=i * 10.0 + 5.0,
                     text="長い", cluster="0:?") for i in range(4)]
-    segs.append(Segment(index=99, start=999.0, end=999.5, text="短い",
+    segs.append(Segment(index=99, start=999.0, end=999.5, text="ごく短い",
                         cluster="0:?"))
-    picked = evaluate.select_sample(segs, per_stratum=10)
+    picked = evaluate.select_sample(segs, per_stratum=10, rounds=1)
     per = Counter(x.stratum for x in picked)
     assert per[evaluate.STRATUM_LONG] == 4
-    assert per[evaluate.STRATUM_SHORT] == 1
+    assert per[evaluate.STRATUM_VERY_SHORT] == 1
+    assert per[evaluate.STRATUM_SHORT] == 0
 
 
-def test_stratum_boundary_is_two_seconds():
+def test_strata_boundaries():
+    assert evaluate.stratum_of(0.99) == evaluate.STRATUM_VERY_SHORT
+    assert evaluate.stratum_of(1.0) == evaluate.STRATUM_SHORT
     assert evaluate.stratum_of(1.99) == evaluate.STRATUM_SHORT
     assert evaluate.stratum_of(2.0) == evaluate.STRATUM_LONG
 
@@ -1310,17 +1337,38 @@ def test_weighted_rate_follows_the_population():
 
 def test_verdict_says_undecidable_near_the_threshold():
     """70% の近くでは「判定不能」と言う。出た数字を見てから基準を動かさない。"""
-    assert evaluate.verdict(0.85, 200, population=1219) == "達成"
-    assert evaluate.verdict(0.50, 200, population=1219) == "未達"
-    assert evaluate.verdict(0.72, 200, population=1219) == "判定不能"
+    half = 0.03
+    assert evaluate.verdict(0.85, half) == "達成"
+    assert evaluate.verdict(0.50, half) == "未達"
+    assert evaluate.verdict(0.72, half) == "判定不能"
 
 
 def test_halfwidth_shrinks_with_more_samples():
     wide = evaluate.proportion_halfwidth(0.7, 200, population=1219)
     narrow = evaluate.proportion_halfwidth(0.7, 400, population=1219)
     assert narrow < wide
-    # 設計書 §2.3 が言う「およそ ±6 ポイント」に合っていること
-    assert 0.05 < wide < 0.07
+
+
+def test_stratified_halfwidth_uses_the_population_weights():
+    """層別の精度は、層の重みの二乗で効く(単純な n では決まらない)。"""
+    sizes = {evaluate.STRATUM_VERY_SHORT: 285,
+             evaluate.STRATUM_SHORT: 385,
+             evaluate.STRATUM_LONG: 549}
+    rates = {k: 0.7 for k in sizes}
+    one = evaluate.stratified_halfwidth(rates, sizes, {k: 100 for k in sizes})
+    two = evaluate.stratified_halfwidth(rates, sizes, {k: 200 for k in sizes})
+    assert two < one
+    # 設計書 §2.3 の見込み(1 巡 ±4〜5 / 2 巡 ±3 ポイント前後)に合うこと
+    assert 0.035 < one < 0.055
+    assert 0.020 < two < 0.035
+
+
+def test_stratified_halfwidth_is_zero_when_everything_is_measured():
+    """全件を測れば標本誤差は無い(有限母集団の補正が効く)。"""
+    sizes = {evaluate.STRATUM_LONG: 50}
+    half = evaluate.stratified_halfwidth(
+        {evaluate.STRATUM_LONG: 0.7}, sizes, {evaluate.STRATUM_LONG: 50})
+    assert half == 0.0
 
 
 # ======================================================================

@@ -47,35 +47,45 @@ def main() -> int:
     sizes = evaluate.stratum_sizes(segs)
     picked = evaluate.select_sample(segs)
 
-    per = Counter(x.stratum for x in picked)
-    print(f"母集団: {len(segs)} 区間 "
-          f"(2 秒未満 {sizes.get(evaluate.STRATUM_SHORT, 0)} / "
-          f"2 秒以上 {sizes.get(evaluate.STRATUM_LONG, 0)})")
-    print(f"標本  : {len(picked)} 区間 "
-          f"(2 秒未満 {per[evaluate.STRATUM_SHORT]} / "
-          f"2 秒以上 {per[evaluate.STRATUM_LONG]})")
-    print(f"種    : {evaluate.DEFAULT_SEED}")
-    half = evaluate.proportion_halfwidth(0.7, len(picked), len(segs))
-    print(f"見込みの精度: 95% 信頼区間 ±{half*100:.1f} ポイント "
-          f"(70% の付近で {(0.70-half)*100:.0f}〜{(0.70+half)*100:.0f}% は判定不能)")
+    label = {evaluate.STRATUM_VERY_SHORT: "1 秒未満",
+             evaluate.STRATUM_SHORT: "1〜2 秒",
+             evaluate.STRATUM_LONG: "2 秒以上"}
+    per = Counter((x.stratum, x.round) for x in picked)
+    rounds = max(x.round for x in picked)
+
+    print(f"母集団: {len(segs)} 区間")
+    for k in evaluate.STRATA:
+        print(f"  {label[k]:<8}: {sizes.get(k, 0):>5} 件")
+    print(f"\n標本  : {len(picked)} 区間 / {rounds} 巡 (種 {evaluate.DEFAULT_SEED})")
+    for r in range(1, rounds + 1):
+        n = sum(per[(k, r)] for k in evaluate.STRATA)
+        counts = {k: per[(k, r)] * r for k in evaluate.STRATA}   # r 巡までの累計
+        half = evaluate.stratified_halfwidth(
+            {k: 0.7 for k in evaluate.STRATA}, sizes, counts)
+        cum = sum(counts.values())
+        print(f"  {r} 巡目: +{n} 件 → 累計 {cum} 件 / "
+              f"95% 信頼区間 ±{half*100:.1f} ポイント "
+              f"({(0.70-half)*100:.0f}〜{(0.70+half)*100:.0f}% は判定不能)")
 
     out.write_text(json.dumps({
         "project": proj_path.name,
         "audio_sha256": proj.source_sha256,
         "seed": evaluate.DEFAULT_SEED,
-        "short_seconds": evaluate.SHORT_SECONDS,
+        "boundaries": {"very_short": evaluate.VERY_SHORT_SECONDS,
+                       "short": evaluate.SHORT_SECONDS},
         "population": {"total": len(segs), **sizes},
         "samples": [
-            {"index": x.index, "stratum": x.stratum,
+            {"index": x.index, "stratum": x.stratum, "round": x.round,
              "start": round(x.start, 2), "duration": round(x.duration, 2)}
             for x in picked
         ],
     }, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"\n書き出し: {out}")
 
-    print("\n先頭 5 件:")
-    for x in picked[:5]:
-        print(f"  #{x.index:>4}  {fmt_hms(x.start)}  {x.duration:>5.2f} 秒  {x.stratum}")
+    print("\n1 巡目の先頭 5 件:")
+    for x in [y for y in picked if y.round == 1][:5]:
+        print(f"  #{x.index:>4}  {fmt_hms(x.start)}  {x.duration:>5.2f} 秒  "
+              f"{label[x.stratum]}")
     return 0
 
 

@@ -17,14 +17,21 @@ from math import sqrt
 from typing import Any, Iterable, Optional, Sequence
 
 
-# 層の境目。設計書 §2.2 で「2 秒未満 / 2 秒以上」と決めた。
+# 層の境目(秒)。設計書 §2.2。1 秒未満を独立させているのは、声の手がかりが
+# 最も乏しく話者分離が苦しい帯だから。実データで 285 件(23%)ある。
+VERY_SHORT_SECONDS = 1.0
 SHORT_SECONDS = 2.0
 
-STRATUM_SHORT = "short"
-STRATUM_LONG = "long"
+STRATUM_VERY_SHORT = "vshort"     # 1 秒未満
+STRATUM_SHORT = "short"           # 1〜2 秒
+STRATUM_LONG = "long"             # 2 秒以上
+STRATA = (STRATUM_VERY_SHORT, STRATUM_SHORT, STRATUM_LONG)
 
-# 標本の既定(層ごと)。合計 200 件で全体の 95% 信頼区間はおよそ ±6 ポイント。
+# 1 巡ぶん(層ごと)。3 層 × 100 = 300 件を 1 巡とする。
 DEFAULT_PER_STRATUM = 100
+
+# 巡の数。1 巡ごとに集計でき、途中で止めても全長に散らばった標本になる。
+DEFAULT_ROUNDS = 2
 
 # 種。固定しないと標本が実行のたびに変わり、測定前に固定したことにならない。
 DEFAULT_SEED = 20260815
@@ -38,11 +45,16 @@ class Sampled:
     stratum: str
     start: float
     duration: float
+    round: int = 1
 
 
 def stratum_of(duration: float) -> str:
     """区間の長さから層を決める。"""
-    return STRATUM_SHORT if duration < SHORT_SECONDS else STRATUM_LONG
+    if duration < VERY_SHORT_SECONDS:
+        return STRATUM_VERY_SHORT
+    if duration < SHORT_SECONDS:
+        return STRATUM_SHORT
+    return STRATUM_LONG
 
 
 def stratum_sizes(segments: Iterable[Any]) -> dict[str, int]:
@@ -57,27 +69,36 @@ def select_sample(
     segments: Sequence[Any],
     per_stratum: int = DEFAULT_PER_STRATUM,
     seed: int = DEFAULT_SEED,
+    rounds: int = DEFAULT_ROUNDS,
 ) -> list[Sampled]:
-    """層ごとに単純無作為抽出する。同じ種なら必ず同じ結果になる。
+    """層ごとに無作為抽出し、巡(round)に割り振る。同じ種なら必ず同じ結果。
 
-    層の中の件数が要求に満たないときは、その層は全件を採る(母数が小さい層で
-    水増しをしない)。並びは時間順に整える——人が会話を追いながら付けるため。
+    **巡に分けるのが要点。**時間順に付ける以上、途中でやめると会議の前半だけの
+    標本になってしまう。1 巡を「全長に散らばった層別標本」にしておけば、
+    どこで止めても偏らず、巡ごとに集計できる。
+
+    層の中は一度だけ混ぜてから前から切り出すので、巡を増やしても
+    前の巡の中身は変わらない(1 巡目を固定したまま 2 巡目を足せる)。
+
+    層の件数が足りないときは、その層は全件を使う(水増ししない)。
+    並びは時間順——人が会話を追いながら付けるため。
     """
     by_stratum: dict[str, list[Any]] = defaultdict(list)
     for s in segments:
         by_stratum[stratum_of(s.duration)].append(s)
 
     picked: list[Sampled] = []
-    for name in sorted(by_stratum):                 # 層の順序も固定する
-        pool = sorted(by_stratum[name], key=lambda s: (s.start, s.index))
-        rng = random.Random(f"{seed}:{name}")       # 層ごとに独立した流れ
-        take = pool if len(pool) <= per_stratum else rng.sample(pool, per_stratum)
-        picked.extend(
-            Sampled(index=s.index, stratum=name, start=s.start,
-                    duration=s.duration)
-            for s in take
-        )
-    picked.sort(key=lambda x: (x.start, x.index))
+    for name in STRATA:
+        pool = sorted(by_stratum.get(name, []), key=lambda s: (s.start, s.index))
+        random.Random(f"{seed}:{name}").shuffle(pool)   # 層ごとに独立した流れ
+        for r in range(rounds):
+            chunk = pool[r * per_stratum:(r + 1) * per_stratum]
+            picked.extend(
+                Sampled(index=s.index, stratum=name, start=s.start,
+                        duration=s.duration, round=r + 1)
+                for s in chunk
+            )
+    picked.sort(key=lambda x: (x.round, x.start, x.index))
     return picked
 
 
@@ -137,16 +158,37 @@ def proportion_halfwidth(p: float, n: int, population: Optional[int] = None) -> 
     return half
 
 
-def verdict(p: float, n: int, threshold: float = 0.70,
-            population: Optional[int] = None) -> str:
+def stratified_halfwidth(rates: dict[str, float], sizes: dict[str, int],
+                         counts: dict[str, int]) -> float:
+    """層別標本での全体値の 95% 信頼区間の半幅。
+
+    層ごとに同じ件数を採るので、全体の精度は単純な n だけでは決まらない。
+    層の重み(母集団に占める割合)の二乗で効く。
+
+    rates: 層ごとの実測値 / sizes: 母集団の層の大きさ / counts: 標本の層の件数
+    """
+    total = sum(sizes.get(k, 0) for k in rates)
+    if not total:
+        return 1.0
+    var = 0.0
+    for k, p in rates.items():
+        big, n = sizes.get(k, 0), counts.get(k, 0)
+        if not big or n <= 0:
+            continue
+        w = big / total
+        fpc = (big - n) / (big - 1) if big > 1 else 0.0
+        var += (w ** 2) * (max(0.0, p * (1 - p)) / n) * max(0.0, fpc)
+    return 1.96 * sqrt(var)
+
+
+def verdict(p: float, halfwidth: float, threshold: float = 0.70) -> str:
     """合否を言えるかどうか。言えないときは「判定不能」と返す。
 
     測る前にこの規則を決めておかないと、出た数字を見てから
-    「もう少し測れば届きそう」と動かしてしまう。
+    「もう少し測れば届きそう」と基準のほうを動かしてしまう。
     """
-    half = proportion_halfwidth(p, n, population)
-    if p - half >= threshold:
+    if p - halfwidth >= threshold:
         return "達成"
-    if p + half < threshold:
+    if p + halfwidth < threshold:
         return "未達"
     return "判定不能"
