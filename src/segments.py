@@ -663,14 +663,32 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
         rows.append(("処理経路", " / ".join(x for x in (mode, model, at) if x)))
     rows.append(("版", f"revision {revision} (schema {SCHEMA_VERSION})"))
 
+    # 数え方は「区間の数」で統一する。分母は必ず全区間数を書き、内訳は
+    # 読点で区切る。区切りに「/」を使うと分数に見え、「聴いて確認 41 /
+    # 適用のみ 40」が「41 分の 40」と読まれる(実出力で発生した)。
+    # 検証要約は確認の履歴そのものなので、読み違えられる表示は信用を損なう。
+    total = proj.total_count
     heard = proj.reviewed_count
     bulk = proj.unreviewed_count
-    unassigned = proj.total_count - proj.assigned_count
-    rows.append(("話者の確認", f"聴いて確定 {heard} / まとめて適用 {bulk} / "
-                              f"未確定 {unassigned}"))
+    unassigned = total - proj.assigned_count
+    rows.append((
+        "話者の確認",
+        f"全 {total} 区間 — 聴いて確定 {heard} 区間、"
+        f"まとめて適用 {bulk} 区間、未確定 {unassigned} 区間",
+    ))
     t_heard = sum(1 for s in proj.segments if s.time_edited and s.time_reviewed)
     t_bulk = sum(1 for s in proj.segments if s.time_edited and not s.time_reviewed)
-    rows.append(("時刻の修正", f"聴いて確認 {t_heard} / 適用のみ {t_bulk}"))
+    rows.append((
+        "時刻の修正",
+        f"全 {total} 区間中 {t_heard + t_bulk} 区間 — "
+        f"聴いて確認 {t_heard} 区間、適用のみ {t_bulk} 区間",
+    ))
+    rows.append((
+        "凡例",
+        "「聴いて確定」「聴いて確認」＝その区間の音声を人が聴いて決めたもの。"
+        "「まとめて適用」「適用のみ」＝機械の結果をまとめて当てただけで、"
+        "その区間を個別には聴いていないもの。数はいずれも区間の数です。",
+    ))
     rows.append(("注意", "本書の記載は確認の履歴であり、内容の正しさや"
                         "法的効力を保証するものではありません。"))
     return rows

@@ -8,6 +8,7 @@ GUI・Gemini API・ffmpeg には依存しない。
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 from collections import Counter
@@ -1050,9 +1051,55 @@ def test_write_docx_verification_summary():
     assert "cd" * 32 in text
     assert "クラウド / gemini-2.5-flash" in text
     assert "revision 3" in text
-    assert "聴いて確定 1" in text and "まとめて適用 1" in text
-    assert "聴いて確認 1" in text                  # 時刻の ✎
+    assert "聴いて確定 1 区間" in text and "まとめて適用 1 区間" in text
+    assert "聴いて確認 1 区間" in text              # 時刻の ✎
+    assert "凡例" in text and "区間の数です" in text
     assert "保証するものではありません" in text
+
+
+def test_verification_never_reads_as_a_fraction():
+    """内訳を「/」で区切らない。分数に見えて読み違えられる。
+
+    実出力で「時刻の修正: 聴いて確認 41 / 適用のみ 40」となり、41 が 40 を
+    超える分数に見えた(事業計画 v29 §5)。検証要約は確認の履歴そのものなので、
+    読み違えられる表示はそれ自体が信用を損なう。分母(全区間数)を明示する。
+    """
+    from src.segments import build_verification
+
+    proj = _make_project()
+    for i, s in enumerate(proj.segments):
+        s.time_edited = True
+        s.time_reviewed = i % 2 == 0          # 半々にして両方 0 でなくする
+    rows = dict(build_verification(proj, 1))
+
+    total = proj.total_count
+    for key in ("話者の確認", "時刻の修正"):
+        value = rows[key]
+        # 数と数の間に「/」が来ないこと(処理経路の「/」は別の行なので無関係)
+        assert " / " not in value, f"{key} が分数に見える: {value}"
+        assert f"全 {total} 区間" in value, f"{key} に分母がない: {value}"
+
+
+def test_verification_counts_add_up():
+    """内訳の合計が分母を超えない(超えたら数え方が壊れている)。"""
+    from src.segments import build_verification
+
+    proj = _make_project()
+    proj.segments[0].speaker_id = proj.speakers[0].id
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = proj.speakers[0].id
+    for s in proj.segments[:2]:
+        s.time_edited = True
+    proj.segments[0].time_reviewed = True
+
+    rows = dict(build_verification(proj, 1))
+    nums = [int(x) for x in re.findall(r"(\d+) 区間", rows["話者の確認"])]
+    total, breakdown = nums[0], nums[1:]
+    assert sum(breakdown) == total
+    t_nums = [int(x) for x in re.findall(r"(\d+) 区間", rows["時刻の修正"])]
+    assert t_nums[0] == proj.total_count          # 分母は全区間
+    assert t_nums[1] == t_nums[2] + t_nums[3]     # 直した数 = 確認 + 適用のみ
+    assert t_nums[1] <= t_nums[0]                 # 分子は分母を超えない
 
 
 def test_write_docx_verification_can_be_omitted():
