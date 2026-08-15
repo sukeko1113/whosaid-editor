@@ -1318,6 +1318,20 @@ def test_cluster_purity_uses_the_majority_of_each_group():
     assert detail["g2"] == ("sp03", 2, 2)
 
 
+def test_purity_has_a_floor_above_chance():
+    """でたらめな正解でも純度は 1/話者数 より高く出る(下駄)。
+
+    まとまりごとに多数派を採る性質による。併記しないと実力を読み違える。
+    """
+    pairs = []
+    for c in range(5):                       # 5 つのまとまり × 各 20 件
+        for i in range(20):
+            pairs.append((f"g{c}", f"sp{i % 4:02d}"))   # 話者は 4 名
+    chance = evaluate.purity_chance_level(pairs, trials=30)
+    assert chance > 1 / 4          # 当てずっぽう(25%)より高い
+    assert chance < 0.60           # かといって当たっているわけでもない
+
+
 def test_cluster_purity_skips_unknown_truth():
     """正解が「分からない」区間は分母に入れない。"""
     purity, _ = evaluate.cluster_purity(

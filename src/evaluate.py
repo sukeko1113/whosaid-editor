@@ -133,6 +133,32 @@ def cluster_purity(
     return (hit / total if total else 0.0), detail
 
 
+def purity_chance_level(
+    pairs: Sequence[tuple[Any, Optional[str]]],
+    trials: int = 200,
+    seed: int = DEFAULT_SEED,
+) -> float:
+    """でたらめな正解でもクラスタ純度がどれだけ出るか（下駄）。
+
+    純度は「まとまりごとに多数派を採る」ので、正解と何の関係もなくても
+    1/話者数 より高い値が出る。実測 200 件で 21.7% 出た（話者 9 名）。
+    この下駄を併記しないと、純度 60% を実力と読み違える。
+
+    正解ラベルの並びだけを混ぜ、まとまりの分け方はそのままにして測り直す。
+    """
+    truths = [t for _, t in pairs if t is not None]
+    clusters = [c for c, t in pairs if t is not None]
+    if not truths:
+        return 0.0
+    rng = random.Random(seed)
+    total = 0.0
+    for _ in range(trials):
+        rng.shuffle(truths)
+        p, _detail = cluster_purity(zip(clusters, truths))
+        total += p
+    return total / trials
+
+
 def weighted_rate(rates: dict[str, float], sizes: dict[str, int]) -> float:
     """層ごとの値を、母集団の層の大きさで重み付けして全体値にする(§2.3)。
 
