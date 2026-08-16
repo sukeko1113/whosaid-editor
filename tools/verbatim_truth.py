@@ -142,9 +142,12 @@ class VerbatimWindow(tk.Tk):
                 "ここに直接書き足す**\n"
                 "     ・**直すところが無ければ、何もしないで次へ。**"
                 "それも「この区間は正しかった」という記録になります\n"
-                "③ **別の人の声**が聞こえるのに本文に無いときは［＋ 聞こえた発話を足す］\n"
-                "     （同じ人の言い足りない分は②で書き足す。"
-                "③は「誰かの発話ごと落ちている」場合）\n"
+                "③ **別の人の声**が聞こえるのに本文に無いときだけ"
+                "［＋ 別の人の発話を足す］\n"
+                "     ・**同じ人の言い淀み・言い足りない分は、③ではなく②**"
+                "（「あのー」等もここでは足さない）\n"
+                "     ・③は「その人の発話がまるごと落ちて、割り当てる先が"
+                "無い」場合だけ\n"
                 "④［確定して次へ］を押す（Ctrl+Enter でも同じ）"
             ),
         ).grid(row=0, column=0, sticky="w", padx=10, pady=8)
@@ -205,7 +208,9 @@ class VerbatimWindow(tk.Tk):
                    command=lambda: self._play_neighbour(-1)).pack(side="left", padx=6)
         ttk.Button(btns, text="次を聴く ▶ (F3)",
                    command=lambda: self._play_neighbour(+1)).pack(side="left")
-        ttk.Button(btns, text="＋ 聞こえた発話を足す (F4)",
+        # 「聞こえた発話を足す」だと「聞こえたものは何でも」と読めて、
+        # 同じ人の言い淀みまでここへ入れてしまう(実際にそうなった)。
+        ttk.Button(btns, text="＋ 別の人の発話を足す (F4)",
                    command=self._add_missing).pack(side="left", padx=16)
         ttk.Button(btns, text="1 つ戻る (F5)",
                    command=self._back).pack(side="left")
