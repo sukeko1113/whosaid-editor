@@ -1458,6 +1458,41 @@ def _eval_segs(n=600):
     return out
 
 
+def test_cer_normalizes_punctuation_but_keeps_fillers():
+    """句読点の違いは誤りに数えない。フィラーは数える(測りたい対象)。"""
+    assert evaluate.cer("はい、そうです。", "はいそうです") == 0.0
+    # フィラーが落ちれば誤りになる
+    got = evaluate.cer("あの、そうですね", "そうですね")
+    assert got > 0.0
+
+
+def test_cer_is_not_capped_at_one():
+    """ひどく間違えた場合と、まあまあ間違えた場合を区別できること。"""
+    mild = evaluate.cer("あいうえお", "あいうえか")
+    awful = evaluate.cer("あい", "まったくちがうながいぶんしょう")
+    assert mild < 1.0 < awful
+
+
+def test_edit_distance_basics():
+    assert evaluate.edit_distance("", "") == 0
+    assert evaluate.edit_distance("あい", "あい") == 0
+    assert evaluate.edit_distance("あい", "あいう") == 1
+    assert evaluate.edit_distance("あい", "") == 2
+
+
+def test_retention_rate_reports_both_counts():
+    """保持率は 1.0 を超えうる。頭打ちにせず、実数も返す。"""
+    rate, got, want = evaluate.retention_rate(
+        "あの、あの、えー", "あの", evaluate.FILLER_TERMS)
+    assert (got, want) == (1, 3)
+    assert abs(rate - 1 / 3) < 1e-9
+    rate2, got2, want2 = evaluate.retention_rate(
+        "あの", "あの、あの", evaluate.FILLER_TERMS)
+    assert rate2 > 1.0 and (got2, want2) == (2, 1)
+    # 正解に 1 つも無ければ 0(割れない)
+    assert evaluate.retention_rate("こんにちは", "あの", evaluate.FILLER_TERMS)[0] == 0.0
+
+
 def test_sample_is_the_same_every_time():
     """同じ種なら必ず同じ標本になる(測定前に固定できる)。"""
     segs = _eval_segs()

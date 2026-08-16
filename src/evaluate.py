@@ -184,6 +184,86 @@ def proportion_halfwidth(p: float, n: int, population: Optional[int] = None) -> 
     return half
 
 
+# ----------------------------------------------------------------------
+# 逐語の正解に対する指標(段階 2)
+#
+# **定義は測る前に固定する。**出た数字を見てから正規化の仕方や語のリストを
+# 変えれば、都合の良い値を選べてしまう。
+# ----------------------------------------------------------------------
+
+# CER を測る前に落とすもの。句読点と空白だけ。
+# **フィラーは落とさない** —— 測りたい対象そのものだから。
+_CER_STRIP = "、。，．・「」『』（）()　 \t\n!！?？…ー"
+
+# 言い淀み(フィラー)と相づちは別物として数える。
+# 相づちは「同意の意思表示」で、記録から消してはいけないもの(CLAUDE.md)。
+FILLER_TERMS = ("えー", "えっと", "ええと", "あのー", "あの", "まあ", "うーん",
+                "んー", "そのー", "なんか", "ちょっと")
+BACKCHANNEL_TERMS = ("はい", "ええ", "うん", "なるほど", "そうですね",
+                     "わかりました")
+
+SHORT_UTTERANCE_SECONDS = 2.0
+
+
+def normalize_for_cer(text: str) -> str:
+    """CER を測る前の正規化。句読点と空白だけ落とす。"""
+    return "".join(c for c in (text or "") if c not in _CER_STRIP)
+
+
+def edit_distance(a: str, b: str) -> int:
+    """挿入・削除・置換の最小回数(レーベンシュタイン距離)。"""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def cer(truth: str, hyp: str) -> float:
+    """文字誤り率。正規化してから、正解の長さで割る。
+
+    1.0 を超えることがある(候補が正解より長く、全部違う場合)。頭打ちにしない
+    ——頭打ちにすると「ひどく間違えた」と「まあまあ間違えた」が同じに見える。
+    """
+    t, h = normalize_for_cer(truth), normalize_for_cer(hyp)
+    if not t:
+        return 0.0 if not h else 1.0
+    return edit_distance(t, h) / len(t)
+
+
+def count_terms(text: str, terms: Iterable[str]) -> int:
+    """語の出現回数を数える(単純な部分一致)。
+
+    形態素解析は使わない。「あの」が「あのー」にも数えられる等の粗さは残るが、
+    **3 つのエンジンに同じ物差しを当てる**ことが目的なので、粗さは共通に効く。
+    この限界は報告に併記する。
+    """
+    body = text or ""
+    return sum(body.count(t) for t in terms)
+
+
+def retention_rate(truth_text: str, hyp_text: str,
+                   terms: Iterable[str]) -> tuple[float, int, int]:
+    """正解に含まれる語のうち、候補にも現れる割合。
+
+    戻り値は (保持率, 候補の出現数, 正解の出現数)。**1.0 を超えうる**
+    ——候補が正解より多く出していれば超える(幻覚か、語のリストの粗さ)。
+    頭打ちにせず、そのまま報告する。
+    """
+    want = count_terms(truth_text, terms)
+    got = count_terms(hyp_text, terms)
+    return (got / want if want else 0.0), got, want
+
+
 def stratified_halfwidth(rates: dict[str, float], sizes: dict[str, int],
                          counts: dict[str, int]) -> float:
     """層別標本での全体値の 95% 信頼区間の半幅。
