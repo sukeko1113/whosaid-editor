@@ -50,6 +50,13 @@ from src.segments import Project, fmt_hms  # noqa: E402
 
 _SRT_TS = re.compile(r"(\d+):(\d+):(\d+)[,.](\d+) --> (\d+):(\d+):(\d+)[,.](\d+)")
 
+# 話者ラベルだけの行。Notta は時刻の次の行に "Speaker_1" を単独で置く。
+# **本文として繋ぐと CER が不当に悪くなる**(発話していない語を数えるため)。
+# 単独行だけを落とす。本文の中に出てくる語には触らない。
+_SRT_SPEAKER = re.compile(
+    r"^\s*(?:speaker[ _-]?\d+|話者\s*\d+|【[^】]{1,12}】)\s*[:：]?\s*$",
+    re.IGNORECASE)
+
 
 def load_engine(path: Path) -> list[tuple[float, float, str]]:
     """出力を (開始, 終了, 本文) の並びにする。"""
@@ -72,8 +79,9 @@ def load_engine(path: Path) -> list[tuple[float, float, str]]:
                     g = [int(x) for x in m.groups()]
                     start = g[0] * 3600 + g[1] * 60 + g[2] + g[3] / 1000
                     end = g[4] * 3600 + g[5] * 60 + g[6] + g[7] / 1000
-                    segs.append((start, end,
-                                 " ".join(x.strip() for x in b[i + 1:]).strip()))
+                    body = [x.strip() for x in b[i + 1:]
+                            if not _SRT_SPEAKER.match(x)]
+                    segs.append((start, end, " ".join(body).strip()))
                     break
         # **必ず時間順に並べ直す。**ファイルの並びが時間順とは限らず、
         # 順序が狂うと本文を繋いだときに位置がずれ、CER が誤って悪化する
