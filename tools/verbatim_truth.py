@@ -130,6 +130,16 @@ class VerbatimWindow(tk.Tk):
                                    maximum=max(1, len(self.targets)))
         self.bar.grid(row=0, column=1, sticky="ew", padx=(12, 0))
 
+        # 直した区間へ戻りたいことがある(聴き直し・直し忘れ)。1 つずつ戻ると
+        # 帯の端から端で 90 回近く押すことになる。
+        jump = ttk.Frame(head)
+        jump.grid(row=0, column=2, sticky="e", padx=(12, 0))
+        ttk.Label(jump, text="区間へ飛ぶ:").pack(side="left")
+        self.cmb_jump = ttk.Combobox(jump, width=10, state="readonly",
+                                     values=[f"#{s.index}" for s in self.targets])
+        self.cmb_jump.pack(side="left", padx=4)
+        self.cmb_jump.bind("<<ComboboxSelected>>", self._jump)
+
         guide = ttk.LabelFrame(self, text="やること")
         guide.grid(row=1, column=0, sticky="ew", **pad)
         ttk.Label(
@@ -403,16 +413,38 @@ class VerbatimWindow(tk.Tk):
         self._show()
         return "break"
 
+    def _keep(self) -> None:
+        """編集中の本文を落とさない。ただし**触っていない区間を「見た」ことに
+        はしない**——確定していない区間は、本文を変えたときだけ残す。
+        通り過ぎただけで「確認済み」が増えると、進捗の数字が嘘になる。"""
+        seg = self._target()
+        if seg is None:
+            return
+        text = self.txt.get("1.0", "end").strip()
+        if seg.index in self.fixed or text != (seg.text or "").strip():
+            self.fixed[seg.index] = text
+
     def _back(self) -> str:
         if self.cur > 0:
+            self._keep()
             self.cur -= 1
             self._show()
         return "break"
 
+    def _jump(self, _event=None) -> None:
+        want = self.cmb_jump.get().lstrip("#")
+        self.cmb_jump.set("")
+        if not want.isdigit():
+            return
+        for i, s in enumerate(self.targets):
+            if s.index == int(want):
+                self._keep()
+                self.cur = i
+                self._show()
+                return
+
     def _on_close(self) -> None:
-        seg = self._target()
-        if seg is not None:                   # 編集中の内容を捨てない
-            self.fixed[seg.index] = self.txt.get("1.0", "end").strip()
+        self._keep()
         self._save()
         self.player.close()
         self.destroy()
