@@ -251,12 +251,15 @@ class VerbatimWindow(tk.Tk):
         self.cur = max(0, min(self.cur, len(self.targets) - 1))
         return self.targets[self.cur]
 
-    def _show(self) -> None:
-        seg = self._target()
+    def _refresh_progress(self) -> None:
         self.var_progress.set(
             f"{len(self.fixed)} / {len(self.targets)} 件 "
             f"（いま {self.cur + 1} 件目）／ 足した発話 {len(self.missing)} 件")
         self.bar.configure(value=len(self.fixed))
+
+    def _show(self) -> None:
+        seg = self._target()
+        self._refresh_progress()
         if seg is None:
             return
         self.var_when.set(f"#{seg.index}  {fmt_hms(seg.start)} 〜 "
@@ -280,6 +283,9 @@ class VerbatimWindow(tk.Tk):
         return sorted(here, key=lambda m: m.get("order", 0))
 
     def _refresh_missing(self) -> None:
+        # 見出しの「足した発話 N 件」もここで書き直す。一覧だけ書き直して
+        # いたので、足した直後は見出しが 0 件のままだった(実機で見つかった)。
+        self._refresh_progress()
         self.lst_missing.delete(0, "end")
         here = self._here()
         if not here:
