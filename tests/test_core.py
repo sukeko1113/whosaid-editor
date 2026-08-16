@@ -52,6 +52,8 @@ from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
     Utterance,
+    assign_speaker_clusters,
+    merge_same_speaker,
     utterances_to_segments,
 )
 
@@ -1331,6 +1333,112 @@ def test_missing_models_say_where_they_were_looked_for():
 def test_default_speaker_count_is_not_automatic():
     """自動(-1)は選ばない。実測で 246 人・148 まとまりに割れた(設計書 §7)。"""
     assert diarize.DEFAULT_NUM_SPEAKERS > 0
+
+
+# ======================================================================
+# 話者分離の結果を区間へ落とす(segments.py の純粋関数)
+# ======================================================================
+
+def _turns(*rows):
+    return [diarize.SpeakerTurn(s, e, spk) for s, e, spk in rows]
+
+
+def _segs(*rows):
+    return [Segment(index=i, start=s, end=e, text=t, cluster="0:?", chunk=0)
+            for i, (s, e, t) in enumerate(rows)]
+
+
+def test_speaker_letters_follow_the_order_of_appearance():
+    """話者番号は連番とは限らない。先に話した人から A/B/C を振る。"""
+    segs = _segs((0.0, 2.0, "あ"), (3.0, 5.0, "い"), (6.0, 8.0, "う"))
+    turns = _turns((0.0, 2.0, 22), (3.0, 5.0, 4), (6.0, 8.0, 22))
+    got = assign_speaker_clusters(segs, turns)
+    assert got == ["g:A", "g:B", "g:A"]      # 22 が A、4 が B
+
+
+def test_assign_takes_the_most_overlapping_speaker():
+    """重なりが最も大きい話者を採る(話者区間は重なりうる)。"""
+    segs = _segs((10.0, 20.0, "あ"))
+    turns = _turns((0.0, 12.0, 0), (11.0, 25.0, 1))   # 2 秒 対 9 秒
+    assert assign_speaker_clusters(segs, turns) == ["g:B"]
+
+
+def test_assign_marks_unknown_when_overlap_is_thin():
+    """重なりが足りなければ判別不能。幽霊話者はここで消える。"""
+    segs = _segs((10.0, 20.0, "あ"))
+    turns = _turns((19.0, 21.0, 0))          # 10 秒の区間に 1 秒しか重ならない
+    assert assign_speaker_clusters(segs, turns) == ["g:?"]
+    assert assign_speaker_clusters(segs, []) == ["g:?"]
+
+
+def test_cluster_label_shows_global_clusters_without_chunk_numbers():
+    seg = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="g:A")
+    assert seg.cluster_label == "声A"
+    assert seg.is_pseudo_cluster is False
+    ghost = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="g:?")
+    assert ghost.is_pseudo_cluster is True
+    old = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="0:A")
+    assert old.cluster_label == "C1-A"        # クラウドは従来どおり
+
+
+def test_merge_joins_a_sentence_split_across_segments():
+    """同じ話者・文の途中・間隔が短い、の 3 つが揃ったときだけ連結する。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます。"),
+                 (2.05, 3.0, "よろしく"))
+    for s in segs:
+        s.cluster = "g:A"
+    out = merge_same_speaker(segs)
+    assert [s.text for s in out] == ["それでは始めます。", "よろしく"]
+    assert out[0].start == 0.0 and out[0].end == 2.0
+    assert [s.index for s in out] == [0, 1]        # 通し番号を振り直す
+
+
+def test_merge_keeps_the_original_times():
+    """orig_start / orig_end は再実行時の突き合わせの鍵。連結で失わない。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます。"))
+    for s in segs:
+        s.cluster = "g:A"
+    out = merge_same_speaker(segs)
+    assert out[0].orig_start == 0.0 and out[0].orig_end == 2.0
+
+
+def test_merge_refuses_when_the_conditions_are_not_met():
+    def joined(rows, cluster="g:A", gap_ok=True):
+        segs = _segs(*rows)
+        for s in segs:
+            s.cluster = cluster
+        return [s.text for s in merge_same_speaker(segs)]
+
+    # 文が終わっている
+    assert joined([(0.0, 1.0, "終わりです。"), (1.1, 2.0, "次です")]) == \
+        ["終わりです。", "次です"]
+    # 間隔が空いている
+    assert joined([(0.0, 1.0, "それでは"), (1.5, 2.0, "始めます")]) == \
+        ["それでは", "始めます"]
+    # 擬似クラスタ(判別不能)はまとめない。中身がばらばらのため
+    assert joined([(0.0, 1.0, "それでは"), (1.1, 2.0, "始めます")],
+                  cluster="g:?") == ["それでは", "始めます"]
+
+
+def test_merge_does_not_touch_what_a_person_edited():
+    """人が手を付けた区間は連結しない。その作業が消えるため。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    for s in segs:
+        s.cluster = "g:A"
+    segs[0].speaker_id = "sp01"
+    assert len(merge_same_speaker(segs)) == 2
+
+    segs2 = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    for s in segs2:
+        s.cluster = "g:A"
+    segs2[1].text_edited = True
+    assert len(merge_same_speaker(segs2)) == 2
+
+
+def test_merge_joins_different_speakers_never():
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    segs[0].cluster, segs[1].cluster = "g:A", "g:B"
+    assert len(merge_same_speaker(segs)) == 2
 
 
 # ======================================================================

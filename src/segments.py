@@ -14,7 +14,7 @@ import json
 import re
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 
 SCHEMA_VERSION = 5
@@ -263,8 +263,15 @@ class Segment:
 
     @property
     def cluster_label(self) -> str:
-        """UI 表示用の短いクラスタ名 → 'C1-A'"""
+        """UI 表示用の短いクラスタ名。
+
+        チャンク内で閉じたクラスタ(Gemini)は 'C1-A'。
+        全長で分けたクラスタ(話者分離)は '声A' —— チャンク番号を出しても
+        意味が無く、むしろ「C1-A と C2-A は別」という誤解を招く。
+        """
         chunk, _, tail = self.cluster.partition(":")
+        if chunk == "g":
+            return f"声{tail}"
         try:
             return f"C{int(chunk) + 1}-{tail}"
         except ValueError:
@@ -341,6 +348,122 @@ def utterances_to_segments(
             cluster=f"{chunk_index}:{u.cluster}",
             chunk=chunk_index,
         ))
+    return out
+
+
+# ----------------------------------------------------------------------
+# 話者分離の結果を区間へ落とす
+# (claude/claude_話者分離_設計書.md §4・§5・§8)
+# ----------------------------------------------------------------------
+
+# 区間の何割が話者区間と重なれば、その話者とみなすか。
+# 自動クラスタリングが作る「1 区間だけの幽霊話者」は、この閾値でどの区間も
+# 取れずに自然に消える(PoC で確認)。
+MIN_SPEAKER_OVERLAP = 0.5
+
+# 連結してよい間隔。これ以上空いていれば別の発言とみなす。
+SPEAKER_MERGE_MAX_GAP = 0.3
+
+# 全長の名前空間。チャンク内で閉じる "0:A" と区別する(設計書 §5)。
+GLOBAL_NAMESPACE = "g"
+
+_SENTENCE_ENDS = "。．！？!?」』…"
+
+
+def _speaker_letters(turns: Iterable[Any]) -> dict[int, str]:
+    """話者番号を A/B/C… に写す。**先に話した人から順**に振る。
+
+    分離器が返す番号は連番とは限らない(実測で 0/1/3/4/7/22/33… のように飛ぶ)。
+    番号をそのまま見せると意味の無い数字が並ぶので、出てきた順に文字を当てる。
+    """
+    order: list[int] = []
+    for t in sorted(turns, key=lambda x: (x.start, x.end)):
+        if t.speaker not in order:
+            order.append(t.speaker)
+    letters: dict[int, str] = {}
+    for i, spk in enumerate(order):
+        letters[spk] = chr(ord("A") + i) if i < 26 else f"S{i + 1}"
+    return letters
+
+
+def assign_speaker_clusters(
+    segments: Sequence[Segment],
+    turns: Sequence[Any],
+    min_overlap: float = MIN_SPEAKER_OVERLAP,
+) -> list[str]:
+    """区間ごとの `cluster` 文字列を作る(設計書 §4・§5)。
+
+    区間の時間範囲と**最も重なる話者区間**の話者を採る。重なりが区間の長さの
+    `min_overlap` に満たなければ `?`(判別不能)にする。
+
+    返すのは文字列の並びだけで、区間には書き込まない。書き込む場所を 1 つに
+    保つため(呼び出し側で `seg.cluster = ...` する)。
+
+    話者区間は重なりうるので、「最も重なる 1 つ」を選ぶ。同時に話している
+    区間には、より長く重なっていたほうが入る。**それを `*` に直すのは人**
+    ——重なりから機械的に判定しようとすると適合率 50% にしかならないことを
+    実測した(設計書 §6)。
+    """
+    letters = _speaker_letters(turns)
+    out: list[str] = []
+    for seg in segments:
+        best_spk, best_ov = None, 0.0
+        for t in turns:
+            ov = min(seg.end, t.end) - max(seg.start, t.start)
+            if ov > best_ov:
+                best_spk, best_ov = t.speaker, ov
+        span = max(0.01, seg.end - seg.start)
+        if best_spk is None or best_ov / span < min_overlap:
+            out.append(f"{GLOBAL_NAMESPACE}:{PSEUDO_UNKNOWN}")
+        else:
+            out.append(f"{GLOBAL_NAMESPACE}:{letters[best_spk]}")
+    return out
+
+
+def merge_same_speaker(
+    segments: Sequence[Segment],
+    max_gap: float = SPEAKER_MERGE_MAX_GAP,
+) -> list[Segment]:
+    """同じ話者の、文の途中で切れた区間を連結する(設計書 §8)。
+
+    ローカル転写は 74% の区間が文の途中で終わる(実測)。話者ラベルが付けば
+    安全に連結できる。条件は 3 つとも満たすこと:
+
+      1. 同じ話者(擬似クラスタ `?` `*` は連結しない)
+      2. 前の区間が句点等で終わっていない(文が続いている)
+      3. 間隔が max_gap 未満
+
+    **人が手を付けた区間は連結しない。**割当・本文の手直し・時刻の修正が
+    入っているものを勝手にまとめると、その作業が消える。
+
+    `orig_start` / `orig_end` は前後の端を保つ。再実行時に新旧の区間を
+    突き合わせる鍵なので、連結で失うと引き継ぎが壊れる。
+    """
+    out: list[Segment] = []
+    for seg in segments:
+        if out:
+            prev = out[-1]
+            touched = any((
+                prev.speaker_id, seg.speaker_id,
+                prev.text_edited, seg.text_edited,
+                prev.time_edited, seg.time_edited,
+            ))
+            joinable = (
+                not touched
+                and prev.cluster == seg.cluster
+                and not prev.is_pseudo_cluster
+                and prev.text
+                and prev.text[-1] not in _SENTENCE_ENDS
+                and seg.start - prev.end < max_gap
+            )
+            if joinable:
+                prev.text = prev.text + seg.text
+                prev.end = seg.end
+                prev.orig_end = seg.orig_end
+                continue
+        out.append(seg)
+    for i, seg in enumerate(out):
+        seg.index = i
     return out
 
 
