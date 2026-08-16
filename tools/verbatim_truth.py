@@ -409,11 +409,18 @@ class VerbatimWindow(tk.Tk):
         var_ov = tk.BooleanVar(value=overlap)
         ttk.Checkbutton(
             dlg, variable=var_ov,
-            text="他の声と重なっている（ほぼ同時に別の人が話している）")\
+            text="言われた瞬間、別の人の声も鳴っていた（2 つの声が同時に聞こえる）")\
             .grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
         ttk.Label(dlg, foreground="#888", wraplength=460, justify="left",
-                  text="※ 重なったものは、どのエンジンも拾えない見込みです。"
-                       "件数だけ別に数え、エンジンの優劣には使いません。")\
+                  text="※ 誰かがしゃべっている最中に差し込まれたなら、"
+                       "ここに印を付けます。一瞬でもその声だけになるなら"
+                       "付けません。\n"
+                       "※ 重なったものは、1 本の音声から 1 本の本文を書く"
+                       "仕組みである以上どのエンジンも拾えません。件数だけ"
+                       "別に数え、優劣には使いません。\n"
+                       "※ **迷ったら付けてください。**脇へ置くだけなので"
+                       "結論は歪みません。付けないほうに間違えると、"
+                       "誰にもできないことをエンジンの落ち度として数えます。")\
             .grid(row=3, column=0, columnspan=2, sticky="w", padx=32, pady=(0, 10))
         result: dict[str, Optional[tuple[str, bool]]] = {"value": None}
 
