@@ -138,10 +138,13 @@ class VerbatimWindow(tk.Tk):
                 "① 音を聴く（区間を開くと自動で鳴ります。もう一度なら F1）\n"
                 "② 下の「正解の本文」を、聞こえたとおりに直す\n"
                 "     ・「あの」「えー」などの言い淀みも、言ったとおりに残す\n"
-                "     ・言い直し、言いかけ、相づちもそのまま\n"
+                "     ・**この人が言ったのに本文から落ちている言葉は、"
+                "ここに直接書き足す**\n"
                 "     ・**直すところが無ければ、何もしないで次へ。**"
                 "それも「この区間は正しかった」という記録になります\n"
-                "③ 本文に出ていない声が聞こえたら［＋ 聞こえた発話を足す］\n"
+                "③ **別の人の声**が聞こえるのに本文に無いときは［＋ 聞こえた発話を足す］\n"
+                "     （同じ人の言い足りない分は②で書き足す。"
+                "③は「誰かの発話ごと落ちている」場合）\n"
                 "④［確定して次へ］を押す（Ctrl+Enter でも同じ）"
             ),
         ).grid(row=0, column=0, sticky="w", padx=10, pady=8)
@@ -170,13 +173,22 @@ class VerbatimWindow(tk.Tk):
         self.txt = tk.Text(fix, height=5, wrap="word", font=("", 12))
         self.txt.grid(row=0, column=0, sticky="nsew", padx=8, pady=6)
 
-        miss = ttk.LabelFrame(self, text="拾われていない発話（この区間の範囲）")
+        miss = ttk.LabelFrame(
+            self,
+            text="この区間で足した「別の人の発話」（正解の一部として数えます）")
         miss.grid(row=5, column=0, sticky="ew", **pad)
         miss.columnconfigure(0, weight=1)
         self.var_missing = tk.StringVar()
         ttk.Label(miss, textvariable=self.var_missing, wraplength=920,
                   foreground="#B26500").grid(row=0, column=0, sticky="w",
-                                             padx=8, pady=6)
+                                             padx=8, pady=(6, 0))
+        ttk.Label(
+            miss, foreground="#888", wraplength=920, justify="left",
+            text="※ 本文とは別に持ちます。集計では時刻の順に本文へ差し込んで"
+                 "「正解の全文」にすると同時に、"
+                 "**この分だけを取り出して「各エンジンが拾えているか」を測ります**。"
+                 "本文に溶かし込むと、その測定ができなくなります。",
+        ).grid(row=1, column=0, sticky="w", padx=8, pady=(2, 6))
 
         # ボタンを出す。キーだけにすると「何をすればよいか」が画面から
         # 読み取れない(実際に分からないと報告を受けた)。
@@ -247,7 +259,7 @@ class VerbatimWindow(tk.Tk):
                 if seg.start <= m["at"] <= seg.end]
         self.var_missing.set(
             "／".join(f"{fmt_hms(m['at'])} 「{m['text']}」" for m in here)
-            or "（なし）")
+            or "（なし。別の人の声が落ちていなければ、これで正しいです）")
 
     def _play_current(self) -> None:
         seg = self._target()
@@ -271,10 +283,12 @@ class VerbatimWindow(tk.Tk):
         dlg = tk.Toplevel(self)
         dlg.title("拾われていない発話を足す")
         dlg.transient(self)
-        ttk.Label(dlg, wraplength=420, justify="left",
+        ttk.Label(dlg, wraplength=440, justify="left",
                   text=f"{fmt_hms(seg.start)}〜{fmt_hms(seg.end)} の範囲で、"
-                       "本文に出ていない発話が聞こえましたか。\n"
-                       "聞こえたとおりに書いてください（「うん」「あー」等）。")\
+                       "本文に出ていない**別の人の発話**が聞こえましたか。\n"
+                       "聞こえたとおりに書いてください（「うん」「あー」等）。\n\n"
+                       "※ 同じ人が言ったのに落ちている言葉なら、ここではなく"
+                       "「正解の本文」に直接書き足してください。")\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 6))
         var = tk.StringVar()
         ent = ttk.Entry(dlg, textvariable=var, width=44)
