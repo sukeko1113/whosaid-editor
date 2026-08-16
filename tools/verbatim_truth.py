@@ -130,13 +130,21 @@ class VerbatimWindow(tk.Tk):
                                    maximum=max(1, len(self.targets)))
         self.bar.grid(row=0, column=1, sticky="ew", padx=(12, 0))
 
+        guide = ttk.LabelFrame(self, text="やること")
+        guide.grid(row=1, column=0, sticky="ew", **pad)
         ttk.Label(
-            self, foreground="#555", wraplength=930, justify="left",
-            text="音を聴いて、本文を実際の発話どおりに直してください。"
-                 "相づち・言い淀み・言い直しもそのまま残します。"
-                 "拾われていない発話が聞こえたら Ctrl+M で足してください"
-                 "——本文を直すだけでは、落ちた発話は永遠に見つかりません。",
-        ).grid(row=1, column=0, sticky="w", **pad)
+            guide, wraplength=930, justify="left",
+            text=(
+                "① 音を聴く（区間を開くと自動で鳴ります。もう一度なら F1）\n"
+                "② 下の「正解の本文」を、聞こえたとおりに直す\n"
+                "     ・「あの」「えー」などの言い淀みも、言ったとおりに残す\n"
+                "     ・言い直し、言いかけ、相づちもそのまま\n"
+                "     ・**直すところが無ければ、何もしないで次へ。**"
+                "それも「この区間は正しかった」という記録になります\n"
+                "③ 本文に出ていない声が聞こえたら［＋ 聞こえた発話を足す］\n"
+                "④［確定して次へ］を押す（Ctrl+Enter でも同じ）"
+            ),
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=8)
 
         info = ttk.Frame(self)
         info.grid(row=2, column=0, sticky="ew", **pad)
@@ -146,7 +154,7 @@ class VerbatimWindow(tk.Tk):
         ttk.Label(info, textvariable=self.var_mark,
                   foreground="#B26500").pack(side="left", padx=16)
 
-        asr = ttk.LabelFrame(self, text="いまの本文（音声認識の出力・参考）")
+        asr = ttk.LabelFrame(self, text="いまの本文（音声認識が出したもの・参考）")
         asr.grid(row=3, column=0, sticky="ew", **pad)
         asr.columnconfigure(0, weight=1)
         self.var_asr = tk.StringVar()
@@ -154,7 +162,8 @@ class VerbatimWindow(tk.Tk):
                   wraplength=920).grid(row=0, column=0, sticky="w",
                                        padx=8, pady=6)
 
-        fix = ttk.LabelFrame(self, text="正解の本文（ここを直す）")
+        fix = ttk.LabelFrame(
+            self, text="正解の本文（ここを直す。直すところが無ければそのまま次へ）")
         fix.grid(row=4, column=0, sticky="nsew", **pad)
         fix.columnconfigure(0, weight=1)
         fix.rowconfigure(0, weight=1)
@@ -169,24 +178,38 @@ class VerbatimWindow(tk.Tk):
                   foreground="#B26500").grid(row=0, column=0, sticky="w",
                                              padx=8, pady=6)
 
-        ttk.Label(
-            self, foreground="#555",
-            text="Ctrl+Space 再生 ／ Ctrl+, 前を再生 ／ Ctrl+. 次を再生 ／ "
-                 "Ctrl+Enter 確定して次へ ／ Ctrl+M 拾われていない発話を足す ／ "
-                 "Ctrl+B 1 つ戻る ／ Esc 終了",
-        ).grid(row=6, column=0, sticky="w", **pad)
+        # ボタンを出す。キーだけにすると「何をすればよいか」が画面から
+        # 読み取れない(実際に分からないと報告を受けた)。
+        btns = ttk.Frame(self)
+        btns.grid(row=6, column=0, sticky="ew", **pad)
+        ttk.Button(btns, text="▶ もう一度聴く (F1)",
+                   command=self._play_current).pack(side="left")
+        ttk.Button(btns, text="◀ 前を聴く (F2)",
+                   command=lambda: self._play_neighbour(-1)).pack(side="left", padx=6)
+        ttk.Button(btns, text="次を聴く ▶ (F3)",
+                   command=lambda: self._play_neighbour(+1)).pack(side="left")
+        ttk.Button(btns, text="＋ 聞こえた発話を足す (F4)",
+                   command=self._add_missing).pack(side="left", padx=16)
+        ttk.Button(btns, text="1 つ戻る (F5)",
+                   command=self._back).pack(side="left")
+        self.btn_next = ttk.Button(btns, text="確定して次へ → (Ctrl+Enter)",
+                                   command=self._commit)
+        self.btn_next.pack(side="right")
+
         self.var_action = tk.StringVar()
         ttk.Label(self, textvariable=self.var_action, foreground="#1B5E20")\
             .grid(row=7, column=0, sticky="w", **pad)
 
     def _bind_keys(self) -> None:
-        # 本文欄に文字を打つので、単独キーは使えない。すべて Ctrl 付き。
-        self.bind("<Control-space>", lambda e: self._play_current())
-        self.bind("<Control-comma>", lambda e: self._play_neighbour(-1))
-        self.bind("<Control-period>", lambda e: self._play_neighbour(+1))
+        # 本文欄に文字を打つので、単独の文字キーは使えない。
+        # **Ctrl+Space は使わない** —— 日本語 IME がオン/オフに使っており、
+        # 押しても画面まで届かない(実機で確認)。F キーなら奪われない。
+        self.bind("<F1>", lambda e: self._play_current())
+        self.bind("<F2>", lambda e: self._play_neighbour(-1))
+        self.bind("<F3>", lambda e: self._play_neighbour(+1))
+        self.bind("<F4>", lambda e: self._add_missing())
+        self.bind("<F5>", lambda e: self._back())
         self.bind("<Control-Return>", lambda e: self._commit())
-        self.bind("<Control-m>", lambda e: self._add_missing())
-        self.bind("<Control-b>", lambda e: self._back())
         self.bind("<Escape>", lambda e: self._on_close())
 
     # ------------------------------------------------------------------
