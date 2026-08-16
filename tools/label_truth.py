@@ -58,6 +58,10 @@ class TruthWindow(tk.Tk):
         self.targets = [x for x in picked if x["index"] in self.by_index]
 
         self.labels: dict[int, dict] = {}
+        # 「本文に無い声が聞こえた」区間の控え。ラベルとは別に持つ——
+        # 話者を決める前に押されても記録でき、かつ「付け終わった区間」の
+        # 判定を濁さないため。聴いている今しか拾えない観察なので捨てない。
+        self.noted: set[int] = set()
         self._load_existing()
         self.cur = self._first_unlabeled()
 
@@ -77,6 +81,8 @@ class TruthWindow(tk.Tk):
             return
         for row in data.get("labels", []):
             self.labels[int(row["index"])] = row
+        for row in data.get("untranscribed_voice", []):
+            self.noted.add(int(row["index"]))
 
     def _first_unlabeled(self) -> int:
         for i, t in enumerate(self.targets):
@@ -93,6 +99,13 @@ class TruthWindow(tk.Tk):
             "made_by": "blind",
             "round": self.round_no,
             "labels": [self.labels[k] for k in sorted(self.labels)],
+            # 本文に現れていない声が聞こえた区間。逐語の脱落そのものであり、
+            # 聴いている最中にしか拾えない(本文を眺めても、そこに無いものは
+            # 見えない)。段階 2 の逐語正解づくりの入口になる。
+            "untranscribed_voice": [
+                {"index": i, "start": round(self.by_index[i].start, 2)}
+                for i in sorted(self.noted) if i in self.by_index
+            ],
         }, ensure_ascii=False, indent=1), encoding="utf-8")
         tmp.replace(self.out)
 
@@ -127,7 +140,10 @@ class TruthWindow(tk.Tk):
         self.var_text = tk.StringVar()
         ttk.Label(box, textvariable=self.var_text, wraplength=840,
                   font=("", 12)).grid(row=1, column=0, sticky="w",
-                                      padx=8, pady=(2, 8))
+                                      padx=8, pady=(2, 2))
+        self.var_note = tk.StringVar()
+        ttk.Label(box, textvariable=self.var_note, foreground="#B26500")\
+            .grid(row=2, column=0, sticky="w", padx=8, pady=(0, 8))
 
         ctx = ttk.LabelFrame(self, text="前後（文脈の確認用）")
         ctx.grid(row=3, column=0, sticky="ew", **pad)
@@ -155,7 +171,8 @@ class TruthWindow(tk.Tk):
         keys = ttk.Label(
             self,
             text="Space 再生 ／ , 前を再生 ／ . 次を再生 ／ "
-                 "1〜9・0・* で確定して次へ ／ Backspace 1 つ戻る ／ Esc 終了",
+                 "1〜9・0・* で確定して次へ ／ M 本文に無い声が聞こえた ／ "
+                 "Backspace 1 つ戻る ／ Esc 終了",
             foreground="#555",
         )
         keys.grid(row=5, column=0, sticky="w", **pad)
@@ -169,6 +186,8 @@ class TruthWindow(tk.Tk):
         self.bind("<period>", lambda e: self._play_neighbour(+1))
         self.bind("<BackSpace>", lambda e: self._back())
         self.bind("<Escape>", lambda e: self._on_close())
+        for key in ("m", "M"):
+            self.bind(key, lambda e: self._toggle_note())
         for d in "0123456789":
             self.bind(d, self._on_digit)
         self.bind("*", lambda e: self._commit(SPECIAL_MULTI))
@@ -200,6 +219,7 @@ class TruthWindow(tk.Tk):
         self.var_prev.set("前: " + (prev_s.preview(70) if prev_s else "（なし）"))
         self.var_next.set("次: " + (next_s.preview(70) if next_s else "（なし）"))
 
+        self._refresh_note_mark()
         already = self.labels.get(seg.index)
         if already:
             name = self.proj.speaker_name(already["speaker_id"]) or already["speaker_id"]
@@ -226,6 +246,27 @@ class TruthWindow(tk.Tk):
         self.player.play(self.audio, other.start, other.end)
         self.var_action.set("前の区間を再生しています"
                             if direction < 0 else "次の区間を再生しています")
+
+    def _toggle_note(self) -> None:
+        """「本文に無い声が聞こえた」印を付け外しする(話者の選択とは独立)。"""
+        seg = self._target()
+        if seg is None:
+            return
+        if seg.index in self.noted:
+            self.noted.discard(seg.index)
+            self.var_action.set("「本文に無い声」の印を外しました")
+        else:
+            self.noted.add(seg.index)
+            self.var_action.set(
+                f"「本文に無い声が聞こえた」と記録しました（この巡で {len(self.noted)} 件）。"
+                "話者はそのまま選んでください")
+        self._save()
+        self._refresh_note_mark()
+
+    def _refresh_note_mark(self) -> None:
+        seg = self._target()
+        marked = seg is not None and seg.index in self.noted
+        self.var_note.set("★ 本文に無い声が聞こえた（M で解除）" if marked else "")
 
     def _on_digit(self, event) -> None:
         d = event.char
