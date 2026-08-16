@@ -19,6 +19,18 @@
   3. 短発話再現率  … 正解の 2 秒未満の発話が、区間として現れる割合
   4. **脱落の再現** … 人が「拾われていない」と足した発話を、そのエンジンは
                       拾えているか。**この指標が段階 2 の中心**
+
+4 について 2 つ断っておく。どちらも実データを 1 帯測ったあとで直した
+(設計書 §1 の「測る前に定義を固定する」に反する)。理由は数字が気に入らなかった
+からではなく、**人が耳で聴いて確定した事実と指標の答えが食い違ったから**で、
+どちらも自社製品(local)に不利な向きの変更である。
+
+  a) **回数で照合する。**含まれるかどうかだと、近くの区間に同じ語があるとき
+     当たってしまう。別人の「はい」を探しているのに、その区間の話者自身の
+     「はい」に当たった。
+  b) **重なったものを分けて数える。**ほぼ同時に別の人が話している発話は、
+     1 本の音声から 1 本の本文を書く仕組みである以上どのエンジンも拾えない。
+     混ぜると全員 0 になり、エンジンの差が消える。
 """
 from __future__ import annotations
 
@@ -102,7 +114,8 @@ def main() -> int:
                                   "f_got": 0, "f_want": 0,
                                   "b_got": 0, "b_want": 0,
                                   "short_hit": 0, "short_all": 0,
-                                  "miss_hit": 0, "miss_all": 0}
+                                  "miss_cl_hit": 0, "miss_cl_all": 0,
+                                  "miss_ov_hit": 0, "miss_ov_all": 0}
                               for n in engines}
 
     for f in files:
@@ -165,17 +178,34 @@ def main() -> int:
             g["short_hit"] += hit
             g["short_all"] += len(short)
 
-            # 脱落の再現: 人が足した発話を、そのエンジンは拾えているか
-            mhit = 0
+            # 脱落の再現: 人が足した発話を、そのエンジンは拾えているか。
+            # **含まれるかどうかではなく回数で見る。**近くの区間に同じ語が
+            # あると当たってしまう——別人の「はい」を探しているのに、その
+            # 区間の話者自身の「はい」に当たった(実データで起きた)。
             for m in missing:
                 want = evaluate.normalize_for_cer(m["text"])
-                near = "".join(t for s, e, t in segs
-                               if e > float(m["at"]) - 2.0
-                               and s < float(m["at"]) + 2.0)
-                if want and want in evaluate.normalize_for_cer(near):
-                    mhit += 1
-            g["miss_hit"] += mhit
-            g["miss_all"] += len(missing)
+                if not want:
+                    continue
+                at = float(m["at"])
+                near_hyp = evaluate.normalize_for_cer("".join(
+                    t for s, e, t in segs if e > at - 2.0 and s < at + 2.0))
+                # 正解の本文の側に既にある分は、エンジンの手柄にしない
+                near_truth = evaluate.normalize_for_cer("".join(
+                    r["truth"] for r in rows
+                    if float(r["end"]) > at - 2.0 and float(r["start"]) < at + 2.0))
+                # 同じ語を同じあたりに複数足していたら、その分も底上げする
+                earlier = sum(
+                    1 for o in missing
+                    if o is not m
+                    and evaluate.normalize_for_cer(o["text"]) == want
+                    and abs(float(o["at"]) - at) < 2.0
+                    and int(o.get("order", 0)) < int(m.get("order", 0)))
+                got = near_hyp.count(want) > near_truth.count(want) + earlier
+                # 重なったものは、どのエンジンも拾えない見込み。混ぜると
+                # 差が消えるので別に数える
+                key = "ov" if m.get("overlap") else "cl"
+                g[f"miss_{key}_hit"] += 1 if got else 0
+                g[f"miss_{key}_all"] += 1
 
             print(f"{name:<10} {c*100:>6.1f}% {fr*100:>9.1f}% ({fg:>3}/{fw:<3})"
                   f" {br*100:>9.1f}% ({bg:>3}/{bw:<3})"
@@ -191,15 +221,31 @@ def main() -> int:
         fr = g["f_got"] / g["f_want"] if g["f_want"] else 0.0
         br = g["b_got"] / g["b_want"] if g["b_want"] else 0.0
         sr = g["short_hit"] / g["short_all"] if g["short_all"] else 0.0
-        mr = g["miss_hit"] / g["miss_all"] if g["miss_all"] else 0.0
+        mr = (g["miss_cl_hit"] / g["miss_cl_all"]) if g["miss_cl_all"] else 0.0
         print(f"{name:<10} {c*100:>6.1f}% {fr*100:>13.1f}% {br*100:>13.1f}%"
-              f" {sr*100:>11.1f}% {mr*100:>11.1f}%")
+              f" {sr*100:>11.1f}%"
+              f" {mr*100:>10.1f}% ({g['miss_cl_hit']}/{g['miss_cl_all']})")
+
+    # 重なったものは別枠。優劣には使わない
+    ov_all = max((grand[n]["miss_ov_all"] for n in engines), default=0)
+    if ov_all:
+        print(f"\n【参考】重なって消えた発話 {ov_all} 件"
+              "（ほぼ同時に別の人が話しているもの）")
+        for name in engines:
+            g = grand[name]
+            print(f"  {name:<10} 拾えた {g['miss_ov_hit']}/{g['miss_ov_all']}")
+        print("  ※ 1 本の音声から 1 本の本文を書く仕組みである以上、"
+              "どのエンジンも拾えない見込み。"
+              "\n    **エンジンの優劣には使わない。**"
+              "人が手で足すしかない発話が何件あるかを見るための数字。")
+
     print("\n注: フィラー・相づちは部分一致で数えている(形態素解析はしない)。"
           "\n    粗さは 3 つのエンジンに共通に効く。保持率は 1.0 を超えうる"
           "(候補が正解より多く出している場合)。"
-          "\n    「脱落の再現」は、人が聴いて足した発話をそのエンジンが"
-          "拾えている割合。**本製品の small が落としたものを"
-          "\n    他のエンジンが拾えているかが、ここに出る。**")
+          "\n    「脱落の再現」は、人が聴いて足した発話のうち**重なっていない"
+          "もの**を、そのエンジンが拾えている割合。"
+          "\n    **本製品の small が落としたものを他のエンジンが拾えているかが、"
+          "ここに出る。**")
     return 0
 
 

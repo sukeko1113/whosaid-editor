@@ -287,7 +287,8 @@ class VerbatimWindow(tk.Tk):
                 "end", "（なし。別の人の声が落ちていなければ、これで正しいです）")
             return
         for i, m in enumerate(here, 1):
-            self.lst_missing.insert("end", f"{i}. 「{m['text']}」")
+            mark = "　［重なり］" if m.get("overlap") else ""
+            self.lst_missing.insert("end", f"{i}. 「{m['text']}」{mark}")
 
     def _selected_missing(self) -> Optional[dict]:
         here = self._here()
@@ -301,11 +302,14 @@ class VerbatimWindow(tk.Tk):
         m = self._selected_missing()
         if m is None:
             return
-        new = self._ask_text("足した発話を直す", m["text"])
-        if new is None:
+        got = self._ask_utterance("足した発話を直す", m["text"],
+                                  bool(m.get("overlap")))
+        if got is None:
             return
+        new, overlap = got
         if new:
             m["text"] = new
+            m["overlap"] = overlap
             self.var_action.set(f"「{new}」に直しました")
         else:                       # 空にしたら消す扱い
             self.missing.remove(m)
@@ -336,8 +340,9 @@ class VerbatimWindow(tk.Tk):
             other = self.all_segments[pos]
             self.player.play(self.audio, other.start, other.end)
 
-    def _ask_text(self, title: str, initial: str = "") -> Optional[str]:
-        """短い文字列を尋ねる。やめたら None、空文字なら ""。"""
+    def _ask_utterance(self, title: str, initial: str = "",
+                       overlap: bool = False) -> Optional[tuple[str, bool]]:
+        """発話と「重なっているか」を尋ねる。やめたら None、空文字なら ""。"""
         seg = self._target()
         dlg = tk.Toplevel(self)
         dlg.title(title)
@@ -345,7 +350,7 @@ class VerbatimWindow(tk.Tk):
         dlg.resizable(False, False)
         where = (f"{fmt_hms(seg.start)}〜{fmt_hms(seg.end)} の範囲で、"
                  if seg is not None else "")
-        ttk.Label(dlg, wraplength=440, justify="left",
+        ttk.Label(dlg, wraplength=460, justify="left",
                   text=f"{where}本文に出ていない"
                        "「別の人の発話」を書いてください（「うん」「あー」等）。\n\n"
                        "※ 同じ人が言ったのに落ちている言葉なら、ここではなく"
@@ -354,16 +359,29 @@ class VerbatimWindow(tk.Tk):
                        "（聞こえた順に並びます）。")\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 6))
         var = tk.StringVar(value=initial)
-        ent = ttk.Entry(dlg, textvariable=var, width=46)
-        ent.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
-        result: dict[str, Optional[str]] = {"value": None}
+        ent = ttk.Entry(dlg, textvariable=var, width=48)
+        ent.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 6))
+
+        # 重なって消えた発話は、1 本の音声から 1 本の本文を書く仕組みである
+        # 以上、どのエンジンも拾えない。混ぜるとエンジンの差が消えるので
+        # 分けて数える(集計の「脱落の再現」を 2 段に割る)。
+        var_ov = tk.BooleanVar(value=overlap)
+        ttk.Checkbutton(
+            dlg, variable=var_ov,
+            text="他の声と重なっている（ほぼ同時に別の人が話している）")\
+            .grid(row=2, column=0, columnspan=2, sticky="w", padx=14)
+        ttk.Label(dlg, foreground="#888", wraplength=460, justify="left",
+                  text="※ 重なったものは、どのエンジンも拾えない見込みです。"
+                       "件数だけ別に数え、エンジンの優劣には使いません。")\
+            .grid(row=3, column=0, columnspan=2, sticky="w", padx=32, pady=(0, 10))
+        result: dict[str, Optional[tuple[str, bool]]] = {"value": None}
 
         def ok() -> None:
-            result["value"] = var.get().strip()
+            result["value"] = (var.get().strip(), bool(var_ov.get()))
             dlg.destroy()
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 14))
+        btns.grid(row=4, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 14))
         ttk.Button(btns, text="決定", command=ok).pack(side="left")
         ttk.Button(btns, text="やめる", command=dlg.destroy).pack(side="left", padx=8)
         dlg.bind("<Return>", lambda e: ok())
@@ -380,9 +398,10 @@ class VerbatimWindow(tk.Tk):
         seg = self._target()
         if seg is None:
             return
-        text = self._ask_text("聞こえた発話を足す")
-        if not text:
+        got = self._ask_utterance("別の人の発話を足す")
+        if not got or not got[0]:
             return
+        text, overlap = got
         # order は足した順。同じ時刻の発話が複数あるとき、集計での並びを
         # これで決める(無いと本文の五十音順で並んでしまう)。
         self.missing.append({
@@ -390,10 +409,13 @@ class VerbatimWindow(tk.Tk):
             "at": round((seg.start + seg.end) / 2, 2),
             "order": len(self.missing),
             "text": text,
+            "overlap": overlap,
         })
         self._save()
         self._refresh_missing()
-        self.var_action.set(f"「{text}」を足しました（一覧から直す・消すもできます）")
+        self.var_action.set(
+            f"「{text}」を足しました{'（重なり）' if overlap else ''}"
+            "（一覧から直す・消すもできます）")
 
     def _commit(self) -> str:
         seg = self._target()
