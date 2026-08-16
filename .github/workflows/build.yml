@@ -93,6 +93,8 @@ jobs:
           python tests/test_inspection.py
           python tests/test_pipeline_integration.py
           python tests/test_gui_smoke.py
+          # 実データを使う 1 件は、音声が無い環境では自動で飛ぶ（CI がここ）
+          python tests/test_listen_order.py
 
       - name: Build with PyInstaller
         run: pyinstaller --clean -y build.spec
