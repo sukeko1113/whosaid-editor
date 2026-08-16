@@ -205,13 +205,25 @@ class VerbatimWindow(tk.Tk):
         ttk.Label(info, textvariable=self.var_mark,
                   foreground="#B26500").pack(side="left", padx=16)
 
-        asr = ttk.LabelFrame(self, text="いまの本文（音声認識が出したもの・参考）")
+        asr = ttk.LabelFrame(
+            self,
+            text="いまの本文と前後（足す前に、ここに既に書かれていないか確かめる）")
         asr.grid(row=3, column=0, sticky="ew", **pad)
         asr.columnconfigure(0, weight=1)
+        # 前後が見えないと「既に本文にあるか」を確かめようがなく、同じ言葉を
+        # 二重に足してしまう(実際に 4 件出た)。F4 を押す前に目に入る位置に置く。
+        self.var_prev = tk.StringVar()
+        ttk.Label(asr, textvariable=self.var_prev, foreground="#999",
+                  wraplength=920).grid(row=0, column=0, sticky="w",
+                                       padx=8, pady=(6, 0))
         self.var_asr = tk.StringVar()
         ttk.Label(asr, textvariable=self.var_asr, foreground="#666",
-                  wraplength=920).grid(row=0, column=0, sticky="w",
+                  wraplength=920).grid(row=1, column=0, sticky="w",
                                        padx=8, pady=6)
+        self.var_next = tk.StringVar()
+        ttk.Label(asr, textvariable=self.var_next, foreground="#999",
+                  wraplength=920).grid(row=2, column=0, sticky="w",
+                                       padx=8, pady=(0, 6))
 
         fix = ttk.LabelFrame(
             self, text="正解の本文（ここを直す。直すところが無ければそのまま次へ）")
@@ -302,12 +314,29 @@ class VerbatimWindow(tk.Tk):
         self.var_mark.set(
             "★ 段階 1 で「本文に無い声が聞こえた」と記録した区間"
             if seg.index in self.noted else "")
-        self.var_asr.set(seg.text or "（本文なし）")
+        self.var_asr.set(f"いま #{seg.index}：{seg.text or '（本文なし）'}")
+        self.var_prev.set(self._neighbour_line(-1, "前"))
+        self.var_next.set(self._neighbour_line(+1, "次"))
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", self.fixed.get(seg.index, seg.text))
         self.txt.focus_set()
         self._refresh_missing()
         self._play_current()
+
+    def _neighbour_line(self, direction: int, label: str) -> str:
+        """前後の区間の本文。**直した本文があればそちらを出す**——足そうと
+        している言葉が既に書かれていないかを確かめるための表示なので、
+        音声認識のままより人が直したものを見せるほうが役に立つ。"""
+        seg = self._target()
+        if seg is None:
+            return ""
+        pos = self.pos_of[seg.index] + direction
+        if not (0 <= pos < len(self.all_segments)):
+            return f"{label}：（ありません）"
+        other = self.all_segments[pos]
+        if other.index in self.fixed:
+            return f"{label} #{other.index}：{self.fixed[other.index]}　←直した本文"
+        return f"{label} #{other.index}：{other.text or '（本文なし）'}"
 
     def _here(self) -> list[dict]:
         """いまの区間に足した発話を、足した順で返す。"""
