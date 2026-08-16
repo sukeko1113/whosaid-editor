@@ -1,0 +1,51 @@
+whosaid-editor — 同梱している第三者の部品と、その利用条件
+===========================================================
+
+このソフトウェアには、次のものを同梱しています。
+
+
+■ 話者分離のモデル
+
+  nemo_en_titanet_small.onnx
+    NVIDIA NeMo TitaNet-Small（話者の声を数値にする部分）
+    ライセンス: CC BY 4.0
+      https://creativecommons.org/licenses/by/4.0/
+    作成者: NVIDIA Corporation
+    ※ このライセンスは表示（クレジット）を条件としています。
+       本ファイルがその表示にあたります。
+
+  sherpa-onnx-pyannote-segmentation-3-0/model.onnx
+    pyannote/segmentation-3.0（声の切れ目を見つける部分）
+    ライセンス: MIT
+    作成者: Hervé Bredin ほか
+    ONNX への変換: k2-fsa / sherpa-onnx
+
+
+■ ライブラリ
+
+  sherpa-onnx           Apache License 2.0    k2-fsa
+  onnxruntime           MIT                   Microsoft
+  faster-whisper        MIT                   SYSTRAN
+  CTranslate2           MIT                   OpenNMT
+  PyAV                  BSD 3-Clause          PyAV 開発者
+  tokenizers            Apache License 2.0    Hugging Face
+  python-docx           MIT                   Steve Canny
+  google-genai          Apache License 2.0    Google LLC
+
+
+■ 音声の変換・再生
+
+  FFmpeg / ffplay       LGPL v2.1 以降        FFmpeg 開発者
+    https://ffmpeg.org/
+    ※ 同梱しているのは LGPL 構成のビルドです。
+
+
+■ 音声認識のモデル
+
+  Whisper（small）      MIT                   OpenAI
+    CTranslate2 形式への変換: SYSTRAN
+
+
+-----------------------------------------------------------
+各ライセンスの全文は、それぞれの配布元を参照してください。
+この表示は、話者分離設計書 §9「クレジット表記」に基づいて置いています。

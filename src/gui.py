@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .assign_gui import open_assign_window
 from .audio import audio_fingerprint
-from .config import load_config, save_config
+from .config import credits_text, load_config, save_config
 from typing import Optional
 
 from .align import AVAILABLE_MODELS as LOCAL_MODELS, DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
@@ -360,6 +360,10 @@ class App(tk.Tk):
         self.btn_cancel.pack(side="left", padx=8)
         self.btn_open_out = ttk.Button(frm_btn, text="出力フォルダを開く", command=self._open_output_dir)
         self.btn_open_out.pack(side="right")
+        # 同梱している TitaNet は CC-BY-4.0 で、表示が配布の条件
+        # (claude/claude_話者分離_設計書.md §9)。画面から辿れないと表示にならない。
+        ttk.Button(frm_btn, text="使っている部品と表示",
+                   command=self._show_credits).pack(side="right", padx=8)
 
         # === 進捗 ===
         frm_prog = ttk.Frame(body)
@@ -651,6 +655,26 @@ class App(tk.Tk):
         self.cfg["api_key"] = api
         save_config(self.cfg)
         messagebox.showinfo("API キー", "API キーを保存しました。")
+
+    def _show_credits(self) -> None:
+        """同梱している部品と、その利用条件を出す。
+
+        **TitaNet が CC-BY-4.0 なので、表示は配布の条件である。**ファイルを
+        同梱しただけでは表示にならないので、画面から辿れるようにしてある。
+        """
+        win = tk.Toplevel(self)
+        win.title("使っている部品と表示")
+        win.geometry("620x520")
+        frm = ttk.Frame(win)
+        frm.pack(fill="both", expand=True, padx=10, pady=10)
+        txt = tk.Text(frm, wrap="word", font=("", 10))
+        bar = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=bar.set)
+        txt.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        txt.insert("1.0", credits_text())
+        txt.configure(state="disabled")
+        ttk.Button(win, text="閉じる", command=win.destroy).pack(pady=(0, 10))
 
     def _open_output_dir(self) -> None:
         path = self.var_output.get().strip()

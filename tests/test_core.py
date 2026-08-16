@@ -1852,6 +1852,54 @@ def test_local_asr_bad_model_dir_is_reported_before_transcribing():
 
 
 # ======================================================================
+# ライセンス表記(話者分離設計書 §9)
+# ======================================================================
+
+def test_credits_file_exists_and_is_reachable():
+    """表記のファイルが実在し、読める。
+
+    **同梱している TitaNet は CC-BY-4.0 で、表示が配布の条件。**
+    ファイルが消えても他のテストは通ってしまうので、ここで固定する。
+    """
+    from src.config import credits_path, credits_text
+    assert credits_path().exists(), f"表記がありません: {credits_path()}"
+    assert len(credits_text()) > 200
+
+
+def test_credits_names_the_cc_by_model():
+    """CC-BY-4.0 のモデルと、その条件が書いてある。
+
+    表記の義務があるのは TitaNet。名前とライセンス名の両方が要る
+    (「第三者の部品を使っています」だけでは表示にならない)。
+    """
+    from src.config import credits_text
+    t = credits_text()
+    for want in ("TitaNet", "CC BY 4.0", "NVIDIA"):
+        assert want in t, f"表記に {want} がありません"
+
+
+def test_credits_names_the_other_bundled_models():
+    """同梱している残りのモデルも挙げる。"""
+    from src.config import credits_text
+    t = credits_text()
+    for want in ("pyannote", "MIT", "Whisper"):
+        assert want in t, f"表記に {want} がありません"
+
+
+def test_credits_survives_a_missing_file():
+    """読めなくても落とさない。表記が出ないのは問題だが、それで転写が
+    止まるのは筋が違う。代わりに要点だけでも出す。"""
+    import src.config as cfg
+    real = cfg.credits_path
+    cfg.credits_path = lambda: Path("存在しない場所") / "CREDITS.txt"
+    try:
+        t = cfg.credits_text()
+    finally:
+        cfg.credits_path = real
+    assert "TitaNet" in t and "CC BY 4.0" in t
+
+
+# ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
 
