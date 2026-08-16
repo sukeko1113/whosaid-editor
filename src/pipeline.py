@@ -144,6 +144,12 @@ def _unique_path(base: Path) -> Path:
         i += 1
 
 
+# 逐語プロンプトの版。**上げるとクラウドの逐語キャッシュを作り直す。**
+# 1: v1.3.0 以来。相づちを前の行に含めてよい／区切りは話者交代のみ
+# 2: 相づちを独立した行にし、同じ話者でも 1 行 20 秒以内に分ける(2026-08-16)
+VERBATIM_PROMPT_VER = 2
+
+
 def _cache_suffix(
     with_timestamps: bool,
     with_diarization: bool,
@@ -172,7 +178,11 @@ def _cache_suffix(
     elif with_timestamps:
         parts.append("ts")
     if verbatim:
-        parts.append("vb")
+        # **プロンプトの版も入れる。**逐語の指示を変えると同じ音声・同じ設定でも
+        # 別物の転写になる。版を入れないと、古い結果を使い回してしまう
+        # (CLAUDE.md「どれかを欠くと古い転写の使い回し事故になる」)。
+        # p2 = 相づちを独立した行にし、1 行 20 秒以内に分ける(2026-08-16)。
+        parts.append(f"vb{VERBATIM_PROMPT_VER}")
     if with_diarization and roster.strip():
         h = hashlib.md5(roster.strip().encode("utf-8")).hexdigest()[:8]
         parts.append(h)
@@ -671,7 +681,9 @@ def run_segment_pipeline(
                     last_failure = str(e)
                     raw_text = f"[00:00] 【?】 【文字起こし失敗: {chunk.name}】"
 
-            utterances = parse_utterances(raw_text, this_len)
+            # 逐語では連結の上限を短くする。**渡さないと、同じ人が話し続ける
+            # 限り連結が進み、割り当てられない長さの区間ができる。**
+            utterances = parse_utterances(raw_text, this_len, verbatim=verbatim)
 
         segs = utterances_to_segments(
             utterances,

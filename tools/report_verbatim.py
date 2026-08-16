@@ -89,6 +89,37 @@ def in_band(segs, lo: float, hi: float):
     return [s for s in segs if s[1] > lo and s[0] < hi]
 
 
+def text_in(segs, lo: float, hi: float) -> str:
+    """[lo, hi] にあたる本文を、**はみ出した分を文字数で按分して**繋ぐ。
+
+    区間ごと丸ごと取ると、**粗く区切るエンジンほど得をする。**Gemini は
+    112 秒の区間を作るので、±2 秒の窓を見ているつもりで 500 字の干し草の山を
+    探すことになり、短い相づちが当たりやすくなっていた（実測: 窓が拾う字数の
+    中央値が turbo 42 字に対し gemini 103 字）。
+
+    按分は「区間の中で話す速さは一定」という近似である。この製品は Gemini の
+    時刻ドリフト対策で `redistribute_times()` が既に同じ仮定を置いている。
+    区間が窓より短ければ、切り取りは起きない（Whisper 系はほぼこちら）。
+
+    segs は (開始, 終わり, 本文) の並び。
+    """
+    out = []
+    for s, e, t in segs:
+        if e <= lo or s >= hi or not t:
+            continue
+        dur = e - s
+        if dur <= 0:
+            out.append(t)
+            continue
+        f0 = max(0.0, (lo - s) / dur)
+        f1 = min(1.0, (hi - s) / dur)
+        if f1 <= f0:
+            continue
+        out.append(t[int(f0 * len(t)):max(int(f0 * len(t)) + 1, int(f1 * len(t)))]
+                   if (f0 > 0.0 or f1 < 1.0) else t)
+    return "".join(out)
+
+
 def main() -> int:
     if len(sys.argv) < 3:
         print(__doc__)
@@ -146,8 +177,7 @@ def main() -> int:
               f" {'短発話':>10}")
 
         for name, segs in engines.items():
-            band_segs = in_band(segs, lo, hi)
-            hyp_text = "".join(t for _, _, t in band_segs)
+            hyp_text = text_in(segs, lo, hi)
             g = grand[name]
 
             c = evaluate.cer(truth_text, hyp_text)
@@ -170,9 +200,8 @@ def main() -> int:
             hit = 0
             for r in short:
                 want = evaluate.normalize_for_cer(r["truth"])
-                near = "".join(t for s, e, t in segs
-                               if e > float(r["start"]) - 1.0
-                               and s < float(r["end"]) + 1.0)
+                near = text_in(segs, float(r["start"]) - 1.0,
+                               float(r["end"]) + 1.0)
                 if want and want in evaluate.normalize_for_cer(near):
                     hit += 1
             g["short_hit"] += hit
@@ -187,12 +216,12 @@ def main() -> int:
                 if not want:
                     continue
                 at = float(m["at"])
-                near_hyp = evaluate.normalize_for_cer("".join(
-                    t for s, e, t in segs if e > at - 2.0 and s < at + 2.0))
+                near_hyp = evaluate.normalize_for_cer(
+                    text_in(segs, at - 2.0, at + 2.0))
                 # 正解の本文の側に既にある分は、エンジンの手柄にしない
-                near_truth = evaluate.normalize_for_cer("".join(
-                    r["truth"] for r in rows
-                    if float(r["end"]) > at - 2.0 and float(r["start"]) < at + 2.0))
+                near_truth = evaluate.normalize_for_cer(text_in(
+                    [(float(r["start"]), float(r["end"]), r["truth"])
+                     for r in rows], at - 2.0, at + 2.0))
                 # 同じ語を同じあたりに複数足していたら、その分も底上げする
                 earlier = sum(
                     1 for o in missing

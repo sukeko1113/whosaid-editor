@@ -466,6 +466,108 @@ def test_build_prompt_cluster_only_has_no_names():
     assert "名前や役職は絶対に書かない" in p
 
 
+def test_verbatim_prompt_does_not_absorb_backchannels():
+    """逐語では相づちを前の行に含めさせない。
+
+    **「一切要約・整文しない」と正面から矛盾する指示だった。**しかも相づちは
+    消えるのではなく前の話者の行に混ざるので、「誰が言ったか」の記録としては
+    消えるより悪い（別人の発言として残る）。
+    CLAUDE.md の原則:「短い相づちの自動削除・自動重複除去はしない」。
+    """
+    p = build_prompt(True, True, verbatim=True)
+    assert "前の発言と同じ行に含めてよい" not in p
+    assert "独立した行" in p
+
+
+def test_verbatim_prompt_limits_line_length():
+    """同じ話者が続いても行を分けさせる。
+
+    区切りが話者交代だけだと 1 区間が 112 秒に達し（実測）、**その区間には
+    話者を割り当てられない**——間に何人も話しているため。
+    """
+    p = build_prompt(True, True, verbatim=True)
+    assert "20 秒" in p
+
+
+def test_verbatim_example_shows_short_lines():
+    """例は指示より強く効く。相づちが独立した行になっている例を見せる。"""
+    p = build_prompt(True, True, verbatim=True)
+    assert "[00:08] 【発言者B】 はい。" in p
+
+
+def test_cleanup_prompt_keeps_the_old_rule():
+    """整文モード（既定）は従来どおり。手数を減らすための指示なので残す。"""
+    p = build_prompt(True, True, verbatim=False)
+    assert "前の発言と同じ行に含めてよい" in p
+    assert "20 秒" not in p
+
+
+def _long_turn(lines: int = 19) -> str:
+    """同じ話者が 6 秒おきに話し続ける出力。実データと同じ形。"""
+    out = ["[00:00] 【A】 よろしくお願いいたします。",
+           "[00:05] 【B】 はい。",
+           "[00:06] 【A】 はい、以上。"]
+    for i in range(lines - 3):
+        s = 7 + i * 6
+        out.append(f"[{s//60:02d}:{s%60:02d}] 【C】 えー、あの、それでですね、続きの話をします。")
+    return "\n".join(out)
+
+
+def test_verbatim_does_not_merge_a_turn_into_one_block():
+    """逐語では、同じ人が話し続けても 1 区間に潰さない。
+
+    **Gemini は 5〜8 秒ごとに出しているのに、後処理が 112 秒の塊にしていた**
+    （実測）。その長さの区間には話者を割り当てられない——間に何人も話すため。
+    """
+    u = parse_utterances(_long_turn(), chunk_seconds=103.0, verbatim=True)
+    assert len(u) > 6, f"潰れている: {len(u)} 区間"
+    # **最後の区間は除く。**「区間の終わりは次の区間の開始、最後だけチャンク
+    # 末尾」という別の規則で伸びるので、連結の上限とは無関係に長くなる。
+    assert max(x.rel_end - x.rel_start for x in u[:-1]) <= 21.0
+
+
+def test_cleanup_still_merges_long_turns():
+    """整文モード（既定）は従来どおり連結する。
+
+    52 分の音声で 600 区間を超えると割当が現実的でなくなる、という判断は
+    そのまま残す。
+    """
+    u = parse_utterances(_long_turn(), chunk_seconds=103.0, verbatim=False)
+    assert max(x.rel_end - x.rel_start for x in u) > 60.0
+
+
+def test_verbatim_still_joins_fragments():
+    """断片の連結は逐語でも効く。1 文が数行に割れるのは読みづらい。"""
+    text = ("[00:00] 【A】 求めるものは、\n"
+            "[00:02] 【A】 工程表、\n"
+            "[00:04] 【A】 えー、財源計画、\n"
+            "[00:06] 【A】 年度別資金繰り計画です。")
+    u = parse_utterances(text, chunk_seconds=30.0, verbatim=True)
+    assert len(u) == 1, f"断片が連結されていない: {len(u)} 区間"
+
+
+def test_verbatim_keeps_another_speaker_separate():
+    """別の人の相づちは、逐語でも整文でも連結しない（元からの挙動）。"""
+    text = "[00:00] 【A】 そうですね。\n[00:02] 【B】 はい。\n[00:03] 【A】 それで、"
+    for vb in (True, False):
+        u = parse_utterances(text, chunk_seconds=30.0, verbatim=vb)
+        assert len(u) == 3, f"verbatim={vb} で {len(u)} 区間"
+
+
+def test_verbatim_cache_key_carries_the_prompt_version():
+    """逐語のキャッシュキーにプロンプトの版が入る。
+
+    **無いと、指示を変えても古い転写を使い回す。**CLAUDE.md:
+    「どれかを欠くと古い転写の使い回し事故になる」。
+    """
+    from src.pipeline import VERBATIM_PROMPT_VER, _cache_suffix
+    now = _cache_suffix(True, True, True, "", 10, "abc")
+    assert f"vb{VERBATIM_PROMPT_VER}" in now
+    assert ".vb." not in now            # 版なしの古い形と衝突しない
+    # 逐語でなければ版は付かない
+    assert "vb" not in _cache_suffix(True, True, False, "", 10, "abc")
+
+
 # ======================================================================
 # 候補の学習・並べ替え
 # ======================================================================

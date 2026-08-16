@@ -46,6 +46,26 @@ _RULES_DIAR = """- **話者が変わるごとに新しい行として書き出�
   (時刻はゼロ埋め2桁の分:秒。ミリ秒や1/100秒は付けない)
 - 短い相づち(「はい」「うん」程度)は前の発言と同じ行に含めてよい"""
 
+# 逐語モードでは相づちを吸収させない。**吸収は _RULES_VERBATIM の
+# 「一切要約・整文しない」と正面から矛盾する。**しかも消えるのではなく、
+# 別の人の「はい」が前の話者の行に混ざるので、「誰が言ったか」の記録としては
+# 消えるより悪い(誤って別人の発言として残る)。
+# CLAUDE.md の原則:「短い相づちの自動削除・自動重複除去はしない。
+# 同意の意思表示が記録から消えるため」。
+#
+# 併せて「話者が変わるごと」だけを区切りにするのをやめる。同じ人が話し続けると
+# 1 区間が 112 秒に達し(実測)、**その区間には話者を割り当てられない**——
+# 間に何人も話しているため。逐語の正解と突き合わせる測定も、区間が窓より
+# 長いと成立しなくなる(段階 2 で判明)。
+_RULES_DIAR_VERBATIM = """- **話者が変わるごとに新しい行として書き出す**
+- **各行の冒頭に必ず以下の形式を入れる**:
+  [MM:SS] 【話者ラベル】 本文...
+  (時刻はゼロ埋め2桁の分:秒。ミリ秒や1/100秒は付けない)
+- **短い相づち(「はい」「うん」「なるほど」等)も必ず独立した行にする。**
+  前の発言の行に含めてはならない。誰がいつ同意したかが記録として要る
+- **同じ話者が続く場合も、文の切れ目や間(ま)で行を分ける。
+  1 行が 20 秒を超えないようにする**"""
+
 _TAIL = "- 説明や前置き、Markdown 装飾は不要。書き起こし本文のみを出力する。"
 
 # v2.0.0: 手動割当モード用。名簿は渡さず、声質だけで区間に切り分けさせる。
@@ -92,6 +112,17 @@ _EXAMPLE_DIAR = """出力例:
 [00:25] 【発言者B】 すみません、確認ですが、前回の議事録は配布済みですか?
 [00:32] 【発言者A】 はい、配布済みです。修正点も反映されています。"""
 
+# **例は指示より強く効く。**逐語では相づちが独立した行になっている様子と、
+# 同じ話者でも 20 秒以内で分かれている様子を実演する。従来の例は 25 秒・32 秒
+# 間隔で相づちも出てこないため、粗い区切りを手本として示していた。
+_EXAMPLE_DIAR_VERBATIM = """出力例:
+[00:00] 【発言者A】 えー、本日はお忙しい中お集まりいただき、あの、ありがとうございます。
+[00:08] 【発言者B】 はい。
+[00:09] 【発言者A】 それでは、えーと、議事を始めます。
+[00:14] 【発言者C】 うん。
+[00:15] 【発言者B】 すみません、確認ですが、前回の議事録は配布済みですか?
+[00:20] 【発言者A】 はい、配布済みです。えー、修正点も反映されています。"""
+
 _EXAMPLE_TS = """出力例:
 [00:00] 本日の会議を開始します。まず議題ですが、予算と人事の二点になります。
 [00:42] それでは一つ目、来期予算について議論を始めます。
@@ -127,7 +158,7 @@ def build_prompt(
 
     parts.append("ルール:")
     if with_diarization:
-        parts.append(_RULES_DIAR)
+        parts.append(_RULES_DIAR_VERBATIM if verbatim else _RULES_DIAR)
         if not roster.strip():
             parts.append(_LABEL_ABC)
     elif with_timestamps:
@@ -140,7 +171,7 @@ def build_prompt(
     parts.append(_TAIL)
 
     if with_diarization and not roster.strip():
-        parts += ["", _EXAMPLE_DIAR]
+        parts += ["", _EXAMPLE_DIAR_VERBATIM if verbatim else _EXAMPLE_DIAR]
     elif with_timestamps and not with_diarization:
         parts += ["", _EXAMPLE_TS]
 
@@ -481,6 +512,14 @@ def normalize_cluster_label(label: str | None) -> str:
 MERGE_MAX_SECONDS = 180.0    # これを超えたら区切る(聴き直しが辛くなるため)
 MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
 
+# 逐語モードの連結の上限。**180 秒のままだと、同じ人が話し続ける限り連結が
+# 進み、1 区間が 112 秒に達する(実測)。その区間には話者を割り当てられない**
+# ——間に何人も話しているため。Gemini 自体は 5〜8 秒ごとに出しており、
+# 潰していたのはこちらの後処理だった。
+# 20 秒はプロンプトの指示(「1 行が 20 秒を超えないように」)と揃えた値。
+# **連結を止めるのではない。**文の途中で割れた断片は従来どおりまとまる。
+VERBATIM_MERGE_MAX_SECONDS = 20.0
+
 # ----------------------------------------------------------------------
 # 発言の長さの見積もり
 #
@@ -639,6 +678,7 @@ def parse_utterances(
     text: str,
     chunk_seconds: float | None = None,
     merge_same_speaker: bool = True,
+    verbatim: bool = False,
 ) -> list[Utterance]:
     """1 チャンクの出力テキストを Utterance の並びに変換する。
 
@@ -707,7 +747,12 @@ def parse_utterances(
             r["rel_end"] = r["rel"] + 1.0
 
     if merge_same_speaker:
-        raw = merge_consecutive(raw)
+        # **関数の中身は触らない**(CLAUDE.md の注意点)。既にある引数で
+        # 上限だけを変える。逐語では 20 秒、整文では従来どおり 180 秒。
+        raw = merge_consecutive(
+            raw,
+            max_seconds=(VERBATIM_MERGE_MAX_SECONDS if verbatim
+                         else MERGE_MAX_SECONDS))
 
     # 連結が済んでから、時刻を割り振り直す。
     # (詰まっている箇所を本文の長さで按分。区間どうしは重ならない)
@@ -731,6 +776,7 @@ def parse_segments(
     chunk_seconds: float | None = None,
     start_index: int = 0,
     merge_same_speaker: bool = True,
+    verbatim: bool = False,
 ) -> list[dict]:
     """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
 
@@ -739,7 +785,7 @@ def parse_segments(
     キーを持つ(従来どおり)。
     """
     segments = utterances_to_segments(
-        parse_utterances(text, chunk_seconds, merge_same_speaker),
+        parse_utterances(text, chunk_seconds, merge_same_speaker, verbatim),
         chunk_index=chunk_index,
         offset_seconds=offset_seconds,
         start_index=start_index,
