@@ -28,6 +28,7 @@ from typing import Iterable, Optional
 from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
 from .audio import audio_hashes, extract_peaks
 from .config import load_config
+from . import listen_order
 from .inspection import (
     Proposal,
     clip_to_neighbours,
@@ -329,6 +330,11 @@ class AssignWindow(tk.Toplevel):
         # 90 分の会議で数百回の判断が必要になる。
         self.var_apply_cluster = tk.BooleanVar(value=True)
         self.var_filter = tk.StringVar(value=FILTER_ALL)
+        # 聴く順(取りこぼしを見つけやすい順)。**既定は時間順のまま**——
+        # 並びが黙って変わると「上から順に聴いた」という作業の前提が崩れる。
+        self.var_listen_order = tk.BooleanVar(value=False)
+        # orig_start(丸め) → ListenHint。無ければ None(=並べ替えは出せない)
+        self._listen_hints = self._load_listen_hints()
         self.var_status = tk.StringVar(value="")
         self.var_seginfo = tk.StringVar(value="")
         self.var_action = tk.StringVar(value="")
@@ -397,6 +403,14 @@ class AssignWindow(tk.Toplevel):
                 filt, text=label, value=value, variable=self.var_filter,
                 command=self._on_filter_change, takefocus=False,
             ).pack(side="left", padx=(0, 8))
+        # 聴く順。話者分離を通した作業ファイルでだけ選べる。
+        # 「検出」とは名乗らない——順番が付かない区間にも取りこぼしはある。
+        self.chk_listen = ttk.Checkbutton(
+            filt, text="聴く順(取りこぼしを見つけやすい順)",
+            variable=self.var_listen_order,
+            command=self._on_listen_order_change, takefocus=False,
+            state="normal" if self._listen_hints else "disabled")
+        self.chk_listen.pack(side="left", padx=(16, 0))
 
         cols = ("time", "cluster", "speaker", "text")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
@@ -742,10 +756,34 @@ class AssignWindow(tk.Toplevel):
             return not (seg.speaker_id and seg.reviewed)
         return True
 
+    def _load_listen_hints(self):
+        """聴く順の sidecar を読む。無ければ None(並べ替えは出せない)。
+
+        **これは検出器ではない。**再現率は約 4 割で、順番が付かない区間にも
+        取りこぼしはある。判定は出さず、並び順としてだけ使う。
+        """
+        try:
+            hints = listen_order.load_hints(listen_order.hints_path(
+                self._work_dir(), self.proj.audio_fingerprint or ""))
+            if not hints:
+                return None
+            return listen_order.match(hints, self.proj.segments) or None
+        except Exception:
+            return None
+
     def _visible_indexes(self) -> list[int]:
         if self.var_filter.get() == FILTER_ALL:
-            return [s.index for s in self.proj.segments]
-        return [s.index for s in self.proj.segments if self._match_filter(s)]
+            out = [s.index for s in self.proj.segments]
+        else:
+            out = [s.index for s in self.proj.segments if self._match_filter(s)]
+        if self.var_listen_order.get() and self._listen_hints:
+            # 点数の高い順、同点は時間順。順番が付かない区間(分割で増えた側
+            # など)は末尾に時間順で置く——**外すと「安全」に見えてしまう。**
+            hints = self._listen_hints
+            out.sort(key=lambda i: (
+                -(hints[i].score if i in hints else -1),
+                self.proj.segments[i].start))
+        return out
 
     def _remaining_count(self) -> int:
         """今の絞り込み基準で、まだ手を付けていない区間の数。"""
@@ -767,6 +805,21 @@ class AssignWindow(tk.Toplevel):
             self.goto(vis[0])
         label = dict((v, k) for k, v in FILTER_LABELS).get(self.var_filter.get(), "")
         self._set_action(f"表示: {label}({len(vis)} 区間)")
+
+    def _on_listen_order_change(self) -> None:
+        self.reload_tree()
+        if not self.var_listen_order.get():
+            self._set_action("時間順に戻しました。")
+            return
+        hints = self._listen_hints or {}
+        high = sum(1 for h in hints.values() if h.is_high)
+        # **言い切らない。**実測の再現率は約 4 割で、順番が付かない区間や
+        # 下位の区間にも取りこぼしはある。「上位だけ聴けば済む」とは
+        # 読ませない。
+        self._set_action(
+            f"聴く順に並べました(手がかりの強い区間 {high}/{len(hints)})。"
+            "上位から聴くと取りこぼしを見つけやすくなります。"
+            "下位や順番の無い区間にも取りこぼしはあります。")
 
     def reload_tree(self) -> None:
         sel = self.current

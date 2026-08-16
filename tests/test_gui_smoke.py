@@ -907,8 +907,52 @@ def run() -> int:
                   local_proj.segments[0].reviewed is True)
         finally:
             assign_gui.messagebox.showwarning = real_warn
+        # 聴く順: 順番の sidecar が無い作業ファイルでは選べない。
+        # **0 点や「無し」を安全と読ませないため、灰色にして出さない。**
+        check("順番が無ければ聴く順は選べない",
+              str(lwin.chk_listen.cget("state")) == "disabled")
         lwin.player.close()
         lwin.destroy()
+
+        # --- 聴く順(順番の sidecar がある場合) ---------------------------
+        from src import listen_order as lo
+        lp = Project(audio_path=str(tmp / "meeting.m4a"),
+                     duration=600.0, chunk_seconds=420)
+        lp.speakers = parse_roster("佐藤\n田中")
+        lp.segments = [
+            Segment(index=i, start=i * 10.0, end=i * 10.0 + 8,
+                    text=f"発言 {i}。", cluster="g:A", chunk=0)
+            for i in range(4)
+        ]
+        lp.audio_fingerprint = "fp-listen"
+        lp.json_path = str(tmp / "listen.speakers.json")
+        lp.save()
+        work = tmp / ".work_meeting"
+        # 2 番の区間だけ点数が高い順番を置く
+        lo.save_hints(lo.hints_path(work, "fp-listen"), [
+            lo.ListenHint(orig_start=float(s.start), start=float(s.start),
+                          score=(9 if s.index == 2 else 1), index=s.index)
+            for s in lp.segments
+        ])
+        wwin = AssignWindow(root, lp)
+        wwin.var_autoplay.set(False)
+        wwin.update()
+        check("順番があれば聴く順を選べる",
+              str(wwin.chk_listen.cget("state")) == "normal")
+        check("既定は時間順のまま",
+              wwin.var_listen_order.get() is False
+              and wwin._visible_indexes() == [0, 1, 2, 3])
+        wwin.var_listen_order.set(True)
+        wwin._on_listen_order_change()
+        check("聴く順にすると点数の高い区間が先頭に来る",
+              wwin._visible_indexes()[0] == 2)
+        check("言い切らない(取りこぼしが残ると添える)",
+              "取りこぼしはあります" in wwin.var_action.get())
+        wwin.var_listen_order.set(False)
+        wwin._on_listen_order_change()
+        check("時間順に戻せる", wwin._visible_indexes() == [0, 1, 2, 3])
+        wwin.player.close()
+        wwin.destroy()
         root.destroy()
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
