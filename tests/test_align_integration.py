@@ -43,6 +43,7 @@ from src.align import (  # noqa: E402
     transcribe_words,
     words_cache_path,
 )
+from src import diarize  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import PSEUDO_UNKNOWN  # noqa: E402
 
@@ -272,6 +273,53 @@ def run() -> int:
             check("単語時刻も同時に取れる", bool(result.words))
             check("単語時刻が align.py の実測と一致する",
                   flatten(result.words) == flatten(words))
+
+        # --------------------------------------------------------------
+        # 話者分離(diarize.py)。合成音声は 1 人が読み上げているだけなので、
+        # 「誰が何人か」は測れない。ここで見るのは配線が通っているか——
+        # モデルが見つかり、区間が返り、時刻が音声の中に収まり、キャッシュが
+        # 効き、中断できること。品質は 67 分の実会議と正解ラベルで測る
+        # (claude_正解ラベルの作り方_設計書.md §7)。
+        # --------------------------------------------------------------
+        print("\n[話者分離] 同じ音声を話者ごとに分けます...")
+        try:
+            diarize.ensure_available()
+        except diarize.DiarizeUnavailable as e:
+            print(f"  飛ばします: {str(e).splitlines()[0]}")
+        else:
+            t0 = time.time()
+            turns = diarize.diarize(
+                wav, num_speakers=2, work_dir=tmp / ".work_sample",
+                on_log=lambda m: print(f"    {m}"))
+            print(f"  {time.time() - t0:.1f} 秒かかりました。")
+            check("話者区間が返る", bool(turns))
+            if turns:
+                check("時刻が前から後ろへ並ぶ",
+                      all(a.start <= b.start for a, b in zip(turns, turns[1:])))
+                check("開始が終了を追い越さない",
+                      all(t.start <= t.end for t in turns))
+                dur = float(len(turns) and max(t.end for t in turns))
+                check("時刻が音声の中に収まる", dur <= 60.0)
+                check("話者番号は 0 以上", all(t.speaker >= 0 for t in turns))
+
+                cache = diarize.turns_cache_path(
+                    tmp / ".work_sample", audio_fingerprint(wav), 2)
+                check("キャッシュが残る", cache is not None and cache.exists())
+                again = diarize.diarize(wav, num_speakers=2,
+                                        work_dir=tmp / ".work_sample")
+                check("二度目はキャッシュから返す", again == turns)
+                # 話者数を変えれば別物として取り直す
+                other = diarize.turns_cache_path(
+                    tmp / ".work_sample", audio_fingerprint(wav), 3)
+                check("話者数が違えば別のキャッシュ",
+                      other is not None and not other.exists())
+
+            cancel_dir = tmp / ".work_dcancel"
+            stopped = diarize.diarize(wav, num_speakers=2, work_dir=cancel_dir,
+                                      is_cancelled=lambda: True)
+            check("中断すると None", stopped is None)
+            check("中断分のキャッシュは残さない",
+                  not list(cancel_dir.rglob("turns.*.json")))
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
     return 1 if failures else 0

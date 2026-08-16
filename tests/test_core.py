@@ -47,7 +47,7 @@ from src.transcribe import (  # noqa: E402
     parse_utterances,
 )
 from src.align import AlignUnavailable  # noqa: E402
-from src import evaluate  # noqa: E402
+from src import diarize, evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1269,6 +1269,68 @@ def test_carry_over_absorbs_only_matched_families():
     ]
     result, _ = _carry(old, new)
     assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
+# 話者分離(diarize.py)
+#
+# モデルもライブラリも要らない部分だけを見る。実モデルでの確認は
+# tests/test_align_integration.py が担う(CI 対象外)。
+# ======================================================================
+
+def test_speaker_turn_round_trip():
+    t = diarize.SpeakerTurn(start=1.5, end=3.25, speaker=2)
+    assert diarize.SpeakerTurn.from_dict(t.to_dict()) == t
+
+
+def test_turns_cache_key_includes_the_speaker_count():
+    """話者数が変われば結果が変わる。同じキャッシュを共有してはいけない。"""
+    a = diarize.turns_cache_path("w", "ff00", 6)
+    b = diarize.turns_cache_path("w", "ff00", 9)
+    assert a != b
+    assert a == diarize.turns_cache_path("w", "ff00", 6)     # 同じなら同じ
+    # 手動配置のモデルを差し替えたら別物
+    assert diarize.turns_cache_path("w", "ff00", 6, model_dir="C:/m/a") != a
+    # 指紋が取れない音声はキャッシュしない(古い結果の使い回しを防ぐ)
+    assert diarize.turns_cache_path("w", "", 6) is None
+
+
+def test_turns_cache_round_trip_and_version():
+    with tempfile.TemporaryDirectory() as d:
+        path = diarize.turns_cache_path(d, "ff00", 6)
+        turns = [diarize.SpeakerTurn(0.0, 1.0, 0),
+                 diarize.SpeakerTurn(0.8, 2.0, 1)]      # 重なっていてよい
+        diarize.save_turns(path, turns, num_speakers=6,
+                           fingerprint="ff00", duration=2.0)
+        assert diarize.load_turns(path) == turns
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["diarize_ver"] = diarize.DIARIZE_VER + 1
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert diarize.load_turns(path) is None          # 実装版が違えば読まない
+
+        path.write_text("これは JSON ではない", encoding="utf-8")
+        assert diarize.load_turns(path) is None
+        assert diarize.load_turns(Path(d) / "nope.json") is None
+
+
+def test_missing_models_say_where_they_were_looked_for():
+    """「モデルがありません」だけでは、何を置けばよいか分からない。"""
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            diarize.resolve_models(d)
+        except diarize.DiarizeUnavailable as e:
+            msg = str(e)
+            assert d in msg                       # 探した場所
+            assert "model.onnx" in msg            # 必要なファイル
+            assert "DIARIZE_MODELS" in msg        # 逃げ道
+        else:
+            raise AssertionError("モデルが無いのに通ってしまった")
+
+
+def test_default_speaker_count_is_not_automatic():
+    """自動(-1)は選ばない。実測で 246 人・148 まとまりに割れた(設計書 §7)。"""
+    assert diarize.DEFAULT_NUM_SPEAKERS > 0
 
 
 # ======================================================================
