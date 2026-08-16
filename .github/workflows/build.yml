@@ -66,6 +66,15 @@ jobs:
           Get-ChildItem ffmpeg | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
           & ffmpeg/ffmpeg.exe -version
 
+      - name: Download speaker diarization models
+        shell: pwsh
+        run: |
+          # models/ は .gitignore で除外してある(合計 44MB・ライセンスも別々)。
+          # 取得元と SHA-256 はスクリプト側に 1 つだけ書く。ここに URL を
+          # 書き写すと、片方だけ古くなる。
+          # 依存を入れる前に走る —— 標準ライブラリだけで動く。
+          python tools/fetch_diarize_models.py
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip

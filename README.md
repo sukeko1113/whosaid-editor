@@ -235,6 +235,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 | --- | --- | --- |
 | Python 3.11 以上 | アプリ本体 | https://www.python.org/downloads/ (PATH 追加にチェック) |
 | ffmpeg + ffplay(static build) | 音声分割・区間再生 | https://www.gyan.dev/ffmpeg/builds/ の **release-essentials** |
+| 話者分離のモデル(44MB) | 声のまとまりを作る | `python tools\fetch_diarize_models.py`(手順 3) |
 | Inno Setup 6 | インストーラ作成 | https://jrsoftware.org/isdl.php |
 | Gemini API キー | 文字起こし | https://aistudio.google.com/apikey |
 
@@ -254,9 +255,34 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
      └─ ...
    ```
 
-3. **(任意) アイコンを置く**: `resources\icon.ico`。
+3. **話者分離のモデルを取得**します。
 
-4. **`build.bat` をダブルクリック** → `Output\GeminiTranscriberSetup-2.1.0.exe`。
+   ```
+   python tools\fetch_diarize_models.py
+   ```
+
+   `models\diarize\` に 2 つ（合計 44MB）置かれます。取得元と SHA-256 は
+   スクリプトの中にあり、照合してから配置します。
+
+   ```
+   models\diarize\
+     ├─ sherpa-onnx-pyannote-segmentation-3-0\model.onnx  ← 5.7MB・MIT
+     └─ nemo_en_titanet_small.onnx                        ← 38.4MB・CC-BY-4.0
+   ```
+
+   リポジトリには含めていません（大きさとライセンスが別々のため）。
+   **無いと `build.spec` がビルドを止めます。**入れ忘れたまま配ると、
+   利用者の端末で初めて「話者分離のモデルが見つかりません」と出て、
+   ローカル経路の区間がすべて `?` になります。
+
+   > **TitaNet は CC-BY-4.0 で、配布物への表示が条件です。**
+   > `resources\CREDITS.txt` がその表示にあたります。同梱は `build.spec` が
+   > 行い、アプリ画面の［使っている部品と表示］から読めます。
+   > このファイルが無い場合もビルドは止まります。
+
+4. **(任意) アイコンを置く**: `resources\icon.ico`。
+
+5. **`build.bat` をダブルクリック** → `Output\GeminiTranscriberSetup-2.1.0.exe`。
 
 > Inno Setup を入れずにビルドした場合は、`dist\GeminiTranscriber\` をフォルダごと
 > コピーすれば動きます(ポータブル運用)。

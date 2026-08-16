@@ -394,3 +394,24 @@ int8 に寄せるかどうかは別の判断（4MB の差と、量子化によ�
   筋が違う**
 - 検査 4 件で固定した（実在する／CC-BY のモデルとライセンス名がある／
   他の同梱モデルもある／ファイルが無くても落ちない）
+
+### 9.3 モデルの取得【決定 — 2026-08-16】
+
+`models/` はリポジトリに入れない（合計 44MB・ライセンスが別々）。
+取得は `tools/fetch_diarize_models.py` に一本化し、**CI も手作業も同じ経路**を通す。
+
+| | |
+| --- | --- |
+| 分割 | `k2-fsa/sherpa-onnx` releases `speaker-segmentation-models` の tar.bz2 から `model.onnx` を取り出す |
+| 埋め込み | 同 `speaker-recongition-models` の `nemo_en_titanet_small.onnx`（tag の綴りは配布元のまま） |
+
+- **SHA-256 で留める。**配布元の資産が差し替わったら、黙って別物を配るのでは
+  なく止まる。合わなければ**落としたファイルを消してから**止める
+  （残すと次回「ある」と判断されて壊れたまま配る）
+- 置き先の名前は `SEG_NAME` / `EMB_NAME` を import して決める。直書きすると
+  片方だけ直したときに「置いたのに見つからない」になる
+- **URL は workflow にも README にも書き写さない。**片方だけ古くなるため。
+  README は `python tools\fetch_diarize_models.py` を案内するだけにする
+- 標準ライブラリだけで動く。CI では依存の導入より前に走らせられる
+
+CI の順序: ffmpeg 取得 → **モデル取得** → 依存導入 → テスト → PyInstaller。
