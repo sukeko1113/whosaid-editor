@@ -178,17 +178,22 @@ class VerbatimWindow(tk.Tk):
             text="この区間で足した「別の人の発話」（正解の一部として数えます）")
         miss.grid(row=5, column=0, sticky="ew", **pad)
         miss.columnconfigure(0, weight=1)
-        self.var_missing = tk.StringVar()
-        ttk.Label(miss, textvariable=self.var_missing, wraplength=920,
-                  foreground="#B26500").grid(row=0, column=0, sticky="w",
-                                             padx=8, pady=(6, 0))
+        self.lst_missing = tk.Listbox(miss, height=3, activestyle="dotbox")
+        self.lst_missing.grid(row=0, column=0, sticky="ew", padx=(8, 4), pady=6)
+        side = ttk.Frame(miss)
+        side.grid(row=0, column=1, sticky="n", padx=(0, 8), pady=6)
+        ttk.Button(side, text="直す", width=6,
+                   command=self._edit_missing).pack()
+        ttk.Button(side, text="消す", width=6,
+                   command=self._delete_missing).pack(pady=(4, 0))
         ttk.Label(
-            miss, foreground="#888", wraplength=920, justify="left",
-            text="※ 本文とは別に持ちます。集計では時刻の順に本文へ差し込んで"
-                 "「正解の全文」にすると同時に、"
+            miss, foreground="#888", wraplength=880, justify="left",
+            text="※ 足した順に並びます。本文とは別に持ち、集計では本文へ"
+                 "差し込んで「正解の全文」にすると同時に、"
                  "**この分だけを取り出して「各エンジンが拾えているか」を測ります**。"
-                 "本文に溶かし込むと、その測定ができなくなります。",
-        ).grid(row=1, column=0, sticky="w", padx=8, pady=(2, 6))
+                 "\n※ 区間の中のどこで言われたかまでは記録しません"
+                 "（並び順だけ保ちます）。",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 6))
 
         # ボタンを出す。キーだけにすると「何をすればよいか」が画面から
         # 読み取れない(実際に分からないと報告を受けた)。
@@ -251,15 +256,56 @@ class VerbatimWindow(tk.Tk):
         self._refresh_missing()
         self._play_current()
 
-    def _refresh_missing(self) -> None:
+    def _here(self) -> list[dict]:
+        """いまの区間に足した発話を、足した順で返す。"""
         seg = self._target()
         if seg is None:
+            return []
+        here = [m for m in self.missing if m.get("after_index") == seg.index]
+        return sorted(here, key=lambda m: m.get("order", 0))
+
+    def _refresh_missing(self) -> None:
+        self.lst_missing.delete(0, "end")
+        here = self._here()
+        if not here:
+            self.lst_missing.insert(
+                "end", "（なし。別の人の声が落ちていなければ、これで正しいです）")
             return
-        here = [m for m in self.missing
-                if seg.start <= m["at"] <= seg.end]
-        self.var_missing.set(
-            "／".join(f"{fmt_hms(m['at'])} 「{m['text']}」" for m in here)
-            or "（なし。別の人の声が落ちていなければ、これで正しいです）")
+        for i, m in enumerate(here, 1):
+            self.lst_missing.insert("end", f"{i}. 「{m['text']}」")
+
+    def _selected_missing(self) -> Optional[dict]:
+        here = self._here()
+        sel = self.lst_missing.curselection()
+        if not here or not sel or sel[0] >= len(here):
+            self.var_action.set("先に一覧から選んでください。")
+            return None
+        return here[sel[0]]
+
+    def _edit_missing(self) -> None:
+        m = self._selected_missing()
+        if m is None:
+            return
+        new = self._ask_text("足した発話を直す", m["text"])
+        if new is None:
+            return
+        if new:
+            m["text"] = new
+            self.var_action.set(f"「{new}」に直しました")
+        else:                       # 空にしたら消す扱い
+            self.missing.remove(m)
+            self.var_action.set("空にしたので消しました")
+        self._save()
+        self._refresh_missing()
+
+    def _delete_missing(self) -> None:
+        m = self._selected_missing()
+        if m is None:
+            return
+        self.missing.remove(m)
+        self._save()
+        self._refresh_missing()
+        self.var_action.set(f"「{m['text']}」を消しました")
 
     def _play_current(self) -> None:
         seg = self._target()
@@ -275,48 +321,64 @@ class VerbatimWindow(tk.Tk):
             other = self.all_segments[pos]
             self.player.play(self.audio, other.start, other.end)
 
-    def _add_missing(self) -> None:
-        """この区間で聞こえたのに本文に無い発話を足す。"""
+    def _ask_text(self, title: str, initial: str = "") -> Optional[str]:
+        """短い文字列を尋ねる。やめたら None、空文字なら ""。"""
         seg = self._target()
-        if seg is None:
-            return
         dlg = tk.Toplevel(self)
-        dlg.title("拾われていない発話を足す")
+        dlg.title(title)
         dlg.transient(self)
+        dlg.resizable(False, False)
+        where = (f"{fmt_hms(seg.start)}〜{fmt_hms(seg.end)} の範囲で、"
+                 if seg is not None else "")
         ttk.Label(dlg, wraplength=440, justify="left",
-                  text=f"{fmt_hms(seg.start)}〜{fmt_hms(seg.end)} の範囲で、"
-                       "本文に出ていない**別の人の発話**が聞こえましたか。\n"
-                       "聞こえたとおりに書いてください（「うん」「あー」等）。\n\n"
+                  text=f"{where}本文に出ていない"
+                       "「別の人の発話」を書いてください（「うん」「あー」等）。\n\n"
                        "※ 同じ人が言ったのに落ちている言葉なら、ここではなく"
-                       "「正解の本文」に直接書き足してください。")\
+                       "「正解の本文」に直接書き足してください。\n"
+                       "※ 複数あるときは 1 つずつ足してください"
+                       "（聞こえた順に並びます）。")\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 6))
-        var = tk.StringVar()
-        ent = ttk.Entry(dlg, textvariable=var, width=44)
+        var = tk.StringVar(value=initial)
+        ent = ttk.Entry(dlg, textvariable=var, width=46)
         ent.grid(row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 10))
+        result: dict[str, Optional[str]] = {"value": None}
 
         def ok() -> None:
-            text = var.get().strip()
-            if text:
-                self.missing.append({
-                    "after_index": seg.index,
-                    "at": round((seg.start + seg.end) / 2, 2),
-                    "text": text,
-                })
-                self._save()
-                self.var_action.set(f"「{text}」を足しました")
+            result["value"] = var.get().strip()
             dlg.destroy()
-            self._refresh_missing()
 
         btns = ttk.Frame(dlg)
         btns.grid(row=2, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 14))
-        ttk.Button(btns, text="足す", command=ok).pack(side="left")
+        ttk.Button(btns, text="決定", command=ok).pack(side="left")
         ttk.Button(btns, text="やめる", command=dlg.destroy).pack(side="left", padx=8)
         dlg.bind("<Return>", lambda e: ok())
         dlg.bind("<Escape>", lambda e: dlg.destroy())
         ent.focus_set()
+        ent.select_range(0, "end")
         dlg.grab_set()
         self.wait_window(dlg)
         self.txt.focus_set()
+        return result["value"]
+
+    def _add_missing(self) -> None:
+        """この区間で聞こえたのに本文に無い発話を足す。何度でも足せる。"""
+        seg = self._target()
+        if seg is None:
+            return
+        text = self._ask_text("聞こえた発話を足す")
+        if not text:
+            return
+        # order は足した順。同じ時刻の発話が複数あるとき、集計での並びを
+        # これで決める(無いと本文の五十音順で並んでしまう)。
+        self.missing.append({
+            "after_index": seg.index,
+            "at": round((seg.start + seg.end) / 2, 2),
+            "order": len(self.missing),
+            "text": text,
+        })
+        self._save()
+        self._refresh_missing()
+        self.var_action.set(f"「{text}」を足しました（一覧から直す・消すもできます）")
 
     def _commit(self) -> str:
         seg = self._target()

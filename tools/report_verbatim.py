@@ -117,10 +117,14 @@ def main() -> int:
         if not rows:
             continue
 
-        # 正解の全文 = 直した本文 ＋ 足した発話(時間順に差し込む)
-        pieces = [(float(r["start"]), r["truth"]) for r in rows]
-        pieces += [(float(m["at"]), m["text"]) for m in missing]
-        truth_text = "".join(t for _, t in sorted(pieces))
+        # 正解の全文 = 直した本文 ＋ 足した発話(時間順に差し込む)。
+        # 2 番目の要素で並びを決める: 同じ時刻なら本文が先、足した発話は
+        # 足した順。これが無いと、同じ時刻の発話が本文の五十音順で並ぶ。
+        pieces = [(float(r["start"]), 0, i, r["truth"])
+                  for i, r in enumerate(rows)]
+        pieces += [(float(m["at"]), 1, int(m.get("order", i)), m["text"])
+                   for i, m in enumerate(missing)]
+        truth_text = "".join(t for *_k, t in sorted(pieces, key=lambda p: p[:3]))
 
         print(f"\n{'='*62}\n【{band['name']}】{fmt_hms(lo)}〜{fmt_hms(hi)}"
               f"  正解 {len(rows)} 区間 / 足した発話 {len(missing)} 件"
