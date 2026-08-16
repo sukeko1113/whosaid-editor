@@ -1792,6 +1792,25 @@ def test_local_asr_does_not_use_vad():
     assert fake.calls[0]["language"] == "ja"
 
 
+def test_local_asr_keeps_conditioning_on_by_default():
+    """直前の本文の引き継ぎは既定で入り。faster-whisper の既定と同じ。
+
+    ここが黙って False になると、同じキャッシュキー(音声指紋 + チャンク長 +
+    逐語フラグ)のまま別物の転写ができてしまう。切るのは測定専用。
+    """
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["condition_on_previous_text"] is True
+
+
+def test_local_asr_can_turn_conditioning_off():
+    """測定のために切れる(段階 2 の比較で使う)。"""
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.condition_on_previous_text = False
+    t.transcribe(__file__)
+    assert fake.calls[0]["condition_on_previous_text"] is False
+
+
 def test_local_asr_cancel_leaves_nothing_behind():
     """中断したら None。途中までの区間を返さない。"""
     t, _ = _local([

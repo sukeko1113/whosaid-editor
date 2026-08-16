@@ -150,9 +150,23 @@ class LocalTranscriber:
     """
 
     def __init__(self, model: str = DEFAULT_MODEL,
-                 model_dir: Optional[Path | str] = None) -> None:
+                 model_dir: Optional[Path | str] = None,
+                 condition_on_previous_text: bool = True) -> None:
+        """condition_on_previous_text: 直前までの本文を次の 30 秒に引き継ぐか。
+
+        **既定は True。faster-whisper の既定と同じで、これまでの挙動を変えない。**
+        False にすると各 30 秒が独立に起きるので、言い淀みが整えられて落ちる
+        度合いが変わる(段階 2 の測定で、同じ small でも渡す長さを変えると
+        フィラー保持が 9.0% → 20.9% と動いた)。
+
+        **ここを変えたまま pipeline に載せるなら、キャッシュキーに足すこと。**
+        いまはキー(音声指紋 + チャンク長 + 逐語フラグ)に入っていないので、
+        設定違いの転写が同じキーを共有してしまう。だから今は測定専用で、
+        pipeline からは渡していない。
+        """
         self.model = model
         self.model_dir = model_dir
+        self.condition_on_previous_text = condition_on_previous_text
         # 置き場の間違い(フォルダが無い・model.bin が無い)はここで分かる。
         # 音声を分割し終わってから気づくのでは遅い。
         self.target = resolve_model(model, model_dir)
@@ -225,6 +239,7 @@ class LocalTranscriber:
             # 恐れがある。ここは本文を作る経路なので、落ちればその発言は
             # 記録から消える(align.py の「照合不能」より重い)。
             vad_filter=False,
+            condition_on_previous_text=self.condition_on_previous_text,
         )
         total = float(getattr(info, "duration", 0.0) or 0.0)
 
