@@ -562,7 +562,12 @@ def run() -> int:
 # ローカル経路(faster-whisper)。モデルは使わず、偽の転写器を差し込む。
 # ======================================================================
 
-LOCAL = pipeline.EngineSpec(mode=ENGINE_LOCAL, model="small")
+LOCAL = pipeline.EngineSpec(mode=ENGINE_LOCAL, model="small", diarize=False)
+LOCAL_DIAR = pipeline.EngineSpec(mode=ENGINE_LOCAL, model="small", diarize=True)
+
+
+def _raise_unavailable(*a, **k):
+    raise pipeline.diarize_mod.DiarizeUnavailable("モデルがありません(検査用)")
 
 
 def run_local() -> int:
@@ -717,6 +722,71 @@ def run_local() -> int:
             finally:
                 pipeline.local_asr.LocalTranscriber = FakeLocal  # type: ignore[misc]
                 pipeline.split_audio = real_split                # type: ignore[assignment]
+
+        # --- 話者分離を繋いだとき(話者分離設計書 §4・§8) -----------------
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 150)
+
+            print("\n[話者分離を繋ぐ]")
+            calls["transcribe"] = 0
+            diar_calls = {"n": 0, "num_speakers": None}
+
+            def fake_diarize(audio_path, *, num_speakers=6, **kw):
+                diar_calls["n"] += 1
+                diar_calls["num_speakers"] = num_speakers
+                # 1 チャンク目は話者 0、2 チャンク目以降は話者 1 が話す想定
+                return [
+                    pipeline.diarize_mod.SpeakerTurn(0.0, 30.0, 0),
+                    pipeline.diarize_mod.SpeakerTurn(30.0, 200.0, 1),
+                ]
+
+            real_diar = pipeline.diarize_mod.diarize
+            real_ensure = pipeline.diarize_mod.ensure_available
+            pipeline.diarize_mod.diarize = fake_diarize
+            pipeline.diarize_mod.ensure_available = lambda *a, **k: None
+            try:
+                proj = pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, engine=LOCAL_DIAR,
+                    chunk_minutes=1,
+                    on_log=lambda m: None, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤\n鈴木\n田中",
+                )
+                assert proj is not None
+                check("話者分離を 1 回だけ呼ぶ(全長で 1 回)", diar_calls["n"] == 1)
+                check("名簿の人数を上限として渡す",
+                      diar_calls["num_speakers"] == 3)
+                check("まとまりが全長の名前空間になる",
+                      all(s.cluster.startswith("g:") for s in proj.segments))
+                real = {s.cluster for s in proj.segments
+                        if not s.is_pseudo_cluster}
+                check("声のまとまりが付く", len(real) >= 1)
+                check("処理経路に話者分離が残る",
+                      "diarize" in proj.engine
+                      and proj.engine["diarize"]["num_speakers"] == 3)
+                check("確定はしない(✓ を立てない)",
+                      not any(s.reviewed for s in proj.segments))
+                check("話者は未確定のまま",
+                      all(s.speaker_id is None for s in proj.segments))
+
+                # 部品が無くても転写は捨てない
+                pipeline.diarize_mod.ensure_available = _raise_unavailable
+                calls["transcribe"] = 0
+                logs: list[str] = []
+                proj2 = pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, engine=LOCAL_DIAR,
+                    chunk_minutes=1, force_retranscribe=True,
+                    on_log=logs.append, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤",
+                )
+                check("話者分離が使えなくても転写は残る",
+                      proj2 is not None and len(proj2.segments) > 0)
+                check("使えない理由を知らせる",
+                      any("話者分離は使えません" in m for m in logs))
+            finally:
+                pipeline.diarize_mod.diarize = real_diar
+                pipeline.diarize_mod.ensure_available = real_ensure
 
         # --- 経路が変わったときの引き継ぎ(設計書 §8.1) ------------------
         with tempfile.TemporaryDirectory() as d:

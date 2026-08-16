@@ -1042,6 +1042,18 @@ def run_main_window() -> int:
             check("経路を戻すとモデルの選択も戻る",
                   app.var_model.get() == "gemini-2.5-pro")
 
+            # 名簿が空のときの人数の問い合わせ。**画面を出す処理なので必ず
+            # 差し替える。**差し替え忘れると、テストが応答を待って止まる
+            # (実際に止めた)。
+            asked = {"n": 0}
+
+            def fake_ask(parent):
+                asked["n"] += 1
+                return 4
+
+            real_ask_count = main_gui._ask_speaker_count
+            main_gui._ask_speaker_count = fake_ask
+
             # ローカルなら鍵が無くても開始できる(入力が無いことだけ言われる)
             warned: list[str] = []
             real_warn = main_gui.messagebox.showwarning
@@ -1077,6 +1089,17 @@ def run_main_window() -> int:
             check("ローカルで走らせても逐語モードの設定を潰さない",
                   saved.get("verbatim") is True)
             check("経路も保存される", saved.get("engine") == ENGINE_LOCAL)
+            check("名簿が空なら人数を聞く", asked["n"] == 1)
+            check("話者分離の設定も保存される", saved.get("diarize") is True)
+
+            # 話者分離を切れば人数は聞かない(使わない値を尋ねない)
+            app.var_diarize_local.set(False)
+            asked["n"] = 0
+            main_gui.messagebox.askyesno = lambda *a, **k: True
+            app._start()
+            check("話者分離を切れば人数を聞かない", asked["n"] == 0)
+            app.var_diarize_local.set(True)
+            main_gui._ask_speaker_count = real_ask_count
         finally:
             app.destroy()
     finally:

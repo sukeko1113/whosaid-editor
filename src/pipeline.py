@@ -15,6 +15,7 @@ from typing import Callable, Optional
 from google import genai
 from google.genai import types as genai_types
 
+from . import diarize as diarize_mod
 from . import local_asr
 from .align import DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
 from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
@@ -27,7 +28,9 @@ from .segments import (
     Segment,
     Speaker,
     Utterance,
+    assign_speaker_clusters,
     fmt_hms,
+    merge_same_speaker,
     parse_roster,
     utterances_to_segments,
 )
@@ -74,10 +77,20 @@ class EngineSpec:
     model: str = ""
     api_key: str = ""
     model_dir: Optional[str] = None
+    # 話者分離(ローカル経路のみ)。クラウドは Gemini が A/B/C を出すので当てない
+    # (話者分離設計書 §10)。
+    diarize: bool = True
+    # 話者数の上限。0 なら名簿の人数を使う。名簿も空なら既定値。
+    # **正解の話者数である必要はない**——上限を与えて過剰分割を防ぐのが目的。
+    num_speakers: int = 0
 
     @property
     def is_local(self) -> bool:
         return self.mode == ENGINE_LOCAL
+
+    @property
+    def wants_diarize(self) -> bool:
+        return self.is_local and self.diarize
 
     @property
     def label(self) -> str:
@@ -502,10 +515,13 @@ def run_segment_pipeline(
     on_log(f"作業ファイル: {json_path}")
     on_log(f"処理経路: {engine.label}(モデル {model})")
     if engine.is_local:
-        # 期待値をここで正しておく。ローカルには声のまとまりを作る者がいない。
         on_log("ローカル転写は端末内で完結します。録音も本文も外へ出しません。")
-        on_log("※ 声のまとまり(A/B/C…)は作られません。全区間が未判別として"
-               "取り込まれ、割当画面で 1 件ずつ確定することになります。")
+        if engine.diarize:
+            on_log("転写のあと、声のまとまりを端末内で分けます"
+                   "(会議全体で 1 つのまとまりになるので、割当がまとめて行えます)。")
+        else:
+            on_log("※ 話者分離は使いません。全区間が未判別として取り込まれ、"
+                   "割当画面で 1 件ずつ確定することになります。")
         if verbatim:
             # 逐語は書式の指定ではなくプロンプトの指示。whisper に対応する
             # 指示は無いので、選べるように見せない(設計書 §5.4)。
@@ -526,6 +542,19 @@ def run_segment_pipeline(
         transcriber = local_asr.LocalTranscriber(
             model=model, model_dir=engine.model_dir)
         transcriber.ensure_available()
+
+    # 話者分離も先に確かめる。ただし**使えなくても止めない**——転写は 25 分
+    # かかる。それを終えてから「話者分離の部品がありません」で全部を捨てるのは
+    # 割に合わない。まとまりの無い状態でも作業はできる(1 件ずつになるだけ)。
+    do_diarize = engine.wants_diarize
+    if do_diarize:
+        try:
+            diarize_mod.ensure_available()
+        except diarize_mod.DiarizeUnavailable as e:
+            do_diarize = False
+            on_log("※ 話者分離は使えません。転写だけ行います"
+                   "(声のまとまりが付かないため、割当は 1 件ずつになります)。")
+            on_log(f"  理由: {str(e).splitlines()[0]}")
 
     duration = probe_duration(audio_path)
     if duration:
@@ -671,11 +700,54 @@ def run_segment_pipeline(
             "原因を解消して再実行すると、失敗したぶんだけ取得し直します。"
         )
 
+    # ---- 話者分離(ローカル経路のみ・話者分離設計書 §4・§8) ----------------
+    # 全長で 1 回走らせる。チャンクをまたいで同じ人を同じまとまりにできるのが
+    # 要点で、Gemini のチャンク内クラスタ(実測 70 個)が 6 個になる。
+    roster_speakers = parse_roster(roster)
+    diarize_record: Optional[dict] = None
+    if do_diarize and all_segments:
+        n_speakers = (engine.num_speakers or len(roster_speakers)
+                      or diarize_mod.DEFAULT_NUM_SPEAKERS)
+        try:
+            turns = diarize_mod.diarize(
+                audio_path,
+                num_speakers=n_speakers,
+                work_dir=work_dir,
+                model_dir=engine.model_dir,
+                fingerprint=fingerprint,
+                on_log=on_log,
+                on_progress=lambda d, t: on_progress(int(d), int(t) or 1),
+                is_cancelled=is_cancelled,
+                force=force_retranscribe,
+            )
+        except diarize_mod.DiarizeUnavailable as e:
+            # ここまで来て落ちても転写は捨てない(上と同じ理由)
+            on_log(f"※ 話者分離に失敗しました。転写はそのまま使えます: {e}")
+            turns = None
+        if turns is None and is_cancelled():
+            on_log("キャンセルされました。")
+            return None
+        if turns:
+            all_segments = sorted(all_segments, key=lambda s: (s.start, s.index))
+            for seg, cluster in zip(
+                    all_segments, assign_speaker_clusters(all_segments, turns)):
+                seg.cluster = cluster
+            before = len(all_segments)
+            all_segments = merge_same_speaker(all_segments)
+            found = len({s.cluster for s in all_segments
+                         if not s.is_pseudo_cluster})
+            on_log(f"声のまとまりを {found} 種類に整理しました"
+                   f"(区間 {before} → {len(all_segments)})。")
+            diarize_record = {
+                "model": "pyannote-segmentation-3.0 + nemo-titanet-small",
+                "num_speakers": n_speakers,
+            }
+
     # 通し番号を振り直す
     for n, seg in enumerate(all_segments):
         seg.index = n
 
-    speakers = parse_roster(roster)
+    speakers = roster_speakers
     # 再実行しても文書の履歴(版・編集履歴)は消さない。ただし音声の中身が
     # 変わっていた場合は別の文書の系譜なので引き継がない。
     carried_revision = 0
@@ -733,15 +805,19 @@ def run_segment_pipeline(
         verbatim=verbatim and not engine.is_local,
         audio_fingerprint=fingerprint,
         source_sha256=source_sha,
-        engine=engine.record(),
+        # 話者分離を使ったかどうかも処理経路の一部。第三者が「どうやって
+        # まとまりが付いたのか」を読めるようにする。
+        engine={**engine.record(),
+                **({"diarize": diarize_record} if diarize_record else {})},
         doc_revision=carried_revision,
         edit_log=carried_log,
         speakers=speakers,
         segments=all_segments,
     )
     proj.save(json_path)
-    if engine.is_local:
-        on_log(f"完了: {len(all_segments)} 区間(話者は全て未判別)")
+    real = {s.cluster for s in all_segments if not s.is_pseudo_cluster}
+    if real:
+        on_log(f"完了: {len(all_segments)} 区間 / 声のまとまり {len(real)} 種類")
     else:
-        on_log(f"完了: {len(all_segments)} 区間 / 声のまとまり {len(proj.clusters())} 種類")
+        on_log(f"完了: {len(all_segments)} 区間(話者は全て未判別)")
     return proj

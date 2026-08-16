@@ -14,7 +14,10 @@ from tkinter import filedialog, messagebox, ttk
 from .assign_gui import open_assign_window
 from .audio import audio_fingerprint
 from .config import load_config, save_config
+from typing import Optional
+
 from .align import AVAILABLE_MODELS as LOCAL_MODELS, DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
+from .diarize import DEFAULT_NUM_SPEAKERS
 from .pipeline import DEFAULT_CLOUD_MODEL, EngineSpec, run_pipeline, run_segment_pipeline
 from .transcribe import FatalTranscriptionError
 from .segments import ENGINE_CLOUD, ENGINE_LOCAL, Project
@@ -48,6 +51,63 @@ ROSTER_HINT = (
     "1行に1人、「名前(役職)」の形式で入力(例: 佐藤(理事長))。"
     "よく発言する人を上に置くと、初期の候補順が良くなります。"
 )
+
+
+def _ask_speaker_count(parent) -> Optional[int]:
+    """出席者が空のとき、話者分離に渡す人数を尋ねる。
+
+    キャンセルなら None。話者分離設計書 §7 のとおり、**開始を押した時点で**
+    聞く——転写が終わってからでは長い会議で 20 分以上あとになり、席を外して
+    いればそこで処理が止まる。
+
+    この数は正解である必要がない。上限を与えて過剰分割を防ぐのが目的で、
+    自動に任せると 246 人に割れることを実測している。
+    """
+    dlg = tk.Toplevel(parent)
+    dlg.title("出席者リストが空です")
+    dlg.transient(parent)
+    dlg.resizable(False, False)
+    result: dict[str, Optional[int]] = {"value": None}
+
+    ttk.Label(
+        dlg, wraplength=420, justify="left",
+        text="出席者を入力しておくと、割当画面ですぐ候補から選べます。\n"
+             "(あとから割当画面で追加することもできます)",
+    ).grid(row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(14, 8))
+
+    ttk.Label(
+        dlg, wraplength=420, justify="left", foreground="#555",
+        text="この録音では何人が話しますか？\n"
+             "声のまとまりを分けるときの目安に使います。"
+             "多めでも構いません(正確でなくても動きます)。",
+    ).grid(row=1, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 6))
+
+    var = tk.IntVar(value=DEFAULT_NUM_SPEAKERS)
+    row = ttk.Frame(dlg)
+    row.grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(0, 12))
+    spin = ttk.Spinbox(row, from_=1, to=30, textvariable=var, width=6)
+    spin.pack(side="left")
+    ttk.Label(row, text=" 人").pack(side="left")
+
+    btns = ttk.Frame(dlg)
+    btns.grid(row=3, column=0, columnspan=2, sticky="e", padx=14, pady=(0, 14))
+
+    def ok() -> None:
+        try:
+            result["value"] = max(1, int(var.get()))
+        except Exception:
+            result["value"] = DEFAULT_NUM_SPEAKERS
+        dlg.destroy()
+
+    ttk.Button(btns, text="この人数で進める", command=ok).pack(side="left")
+    ttk.Button(btns, text="やめる", command=dlg.destroy).pack(side="left", padx=8)
+    dlg.bind("<Return>", lambda e: ok())
+    dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+    spin.focus_set()
+    dlg.grab_set()
+    parent.wait_window(dlg)
+    return result["value"]
 
 
 class App(tk.Tk):
@@ -255,6 +315,21 @@ class App(tk.Tk):
         )
         self.chk_verbatim.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
 
+        # 話者分離(ローカル経路のみ)
+        self.var_diarize_local = tk.BooleanVar(value=True)
+        self.chk_diarize = ttk.Checkbutton(
+            frm_adv,
+            text="声のまとまりを端末内で分ける(話者分離。ローカル処理のみ)",
+            variable=self.var_diarize_local,
+            command=self._update_diarize_note,
+        )
+        self.chk_diarize.grid(row=7, column=0, columnspan=4, sticky="w",
+                              padx=6, pady=(0, 0))
+        self.lbl_diarize_note = ttk.Label(
+            frm_adv, text="", foreground="#888", wraplength=700)
+        self.lbl_diarize_note.grid(row=8, column=0, columnspan=4, sticky="w",
+                                   padx=24, pady=(0, 2))
+
         # やり直しチェックボックス(v2.0.1)
         # 通常は音声の指紋で自動判定するが、手動で強制できる逃げ道も用意する。
         self.var_force = tk.BooleanVar(value=False)
@@ -262,7 +337,7 @@ class App(tk.Tk):
             frm_adv,
             text="キャッシュを使わず最初からやり直す(結果がおかしいときに)",
             variable=self.var_force,
-        ).grid(row=7, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        ).grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
         # === 出席者(候補者リスト) ===
         self.frm_roster = ttk.LabelFrame(body, text="出席者(候補者リスト)")
@@ -320,6 +395,8 @@ class App(tk.Tk):
                 self._model_by_engine[ENGINE_LOCAL] = str(lmodel)
         if self.cfg.get("engine") in (ENGINE_LOCAL, ENGINE_CLOUD):
             self.var_engine.set(str(self.cfg["engine"]))
+        if "diarize" in self.cfg:
+            self.var_diarize_local.set(bool(self.cfg.get("diarize")))
         if chunk := self.cfg.get("chunk_minutes"):
             try:
                 self.var_chunk.set(int(chunk))
@@ -368,6 +445,21 @@ class App(tk.Tk):
         self.update_idletasks()
         self._canvas.yview_moveto(1.0)
 
+    def _update_diarize_note(self) -> None:
+        """話者分離の設定に応じて、何が起きるかをその場に出す。"""
+        if self.var_engine.get() != ENGINE_LOCAL:
+            self.lbl_diarize_note.configure(
+                text="※ クラウドでは AI が声のまとまりを付けるため、この設定は"
+                     "使いません。")
+        elif self.var_diarize_local.get():
+            self.lbl_diarize_note.configure(
+                text="※ 転写のあとに実行します(音声の長さの 2 割ほど時間が"
+                     "増えます)。まとまりは会議全体で 1 つになるので、"
+                     "割当をまとめて行えます。")
+        else:
+            self.lbl_diarize_note.configure(
+                text="※ 切ると全区間が未判別になり、割当は 1 件ずつになります。")
+
     def _update_engine_state(self) -> None:
         """処理経路の切替に応じて、要らない設定を触れなくする。
 
@@ -403,6 +495,9 @@ class App(tk.Tk):
         for w in (self.lbl_api, self.entry_api, self.btn_api_show, self.btn_api_save):
             w.configure(state=state)
         self.chk_verbatim.configure(state=state)
+        # 話者分離はローカル経路だけの設定(クラウドは Gemini が A/B/C を出す)
+        self.chk_diarize.configure(state="normal" if local else "disabled")
+        self._update_diarize_note()
 
         if local:
             # 従来方式(名簿から実名を推定させる)はクラウド専用。
@@ -609,8 +704,19 @@ class App(tk.Tk):
         if with_diar:
             with_ts = True  # 強制
 
+        # 話者分離に渡す上限。名簿があればその人数、無ければ人に聞く。
+        # 0 のままなら pipeline 側が名簿から数える。
+        num_speakers = 0
         if mode == MODE_MANUAL and not roster.strip():
-            if not messagebox.askyesno(
+            wants_diarize = (engine_mode == ENGINE_LOCAL
+                             and bool(self.var_diarize_local.get()))
+            if wants_diarize:
+                # **ここで聞く。**転写が終わってからでは 67 分の会議で 25 分後に
+                # なり、席を外していればそこで処理が止まる(話者分離設計書 §7)。
+                num_speakers = _ask_speaker_count(self)
+                if num_speakers is None:
+                    return
+            elif not messagebox.askyesno(
                 "出席者リストが空です",
                 "出席者を入力しておくと、割当画面ですぐ候補から選べます。\n"
                 "(あとから割当画面で追加することもできます)\n\nこのまま進めますか?",
@@ -622,6 +728,7 @@ class App(tk.Tk):
         self.cfg.update({
             "api_key": api,
             "engine": engine_mode,
+            "diarize": bool(self.var_diarize_local.get()),
             "model": self._model_by_engine[ENGINE_CLOUD],
             "local_model": self._model_by_engine[ENGINE_LOCAL],
             "chunk_minutes": int(self.var_chunk.get()),
@@ -654,7 +761,9 @@ class App(tk.Tk):
                 Path(in_path),
                 Path(out_dir),
                 EngineSpec(mode=engine_mode, model=self.var_model.get(),
-                           api_key=api),
+                           api_key=api,
+                           diarize=bool(self.var_diarize_local.get()),
+                           num_speakers=num_speakers),
                 int(self.var_chunk.get()),
                 with_ts,
                 with_diar,
