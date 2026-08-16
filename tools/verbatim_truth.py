@@ -69,6 +69,7 @@ class VerbatimWindow(tk.Tk):
 
         self.fixed: dict[int, str] = {}          # 区間 index → 直した本文
         self.missing: list[dict] = []            # 拾われていない発話
+        self.seen: Optional[str] = None          # 開いたときのファイルの中身
         self._load_existing()
         self.cur = self._first_untouched()
 
@@ -83,12 +84,29 @@ class VerbatimWindow(tk.Tk):
         if not self.out.exists():
             return
         try:
-            data = json.loads(self.out.read_text(encoding="utf-8"))
+            raw = self.out.read_text(encoding="utf-8")
+            data = json.loads(raw)
         except Exception:
             return
         for row in data.get("segments", []):
             self.fixed[int(row["index"])] = row.get("truth", "")
         self.missing = list(data.get("missing", []))
+        self.seen = raw                       # 外で書き換わったかを見るため
+
+    def _outside_change(self) -> bool:
+        """開いてから外でファイルが変わったか。
+
+        この窓は開いたときの中身を丸ごと覚えていて、保存のたびに全部を
+        書き出す。**外で直したものが黙って書き戻る**——実際に起きた
+        (窓を開けたまま、こちらで足した発話を消したあと閉じた)。
+        窓を 2 つ開いた場合も同じ。
+        """
+        if self.seen is None or not self.out.exists():
+            return False
+        try:
+            return self.out.read_text(encoding="utf-8") != self.seen
+        except Exception:
+            return False
 
     def _first_untouched(self) -> int:
         for i, s in enumerate(self.targets):
@@ -97,9 +115,21 @@ class VerbatimWindow(tk.Tk):
         return max(0, len(self.targets) - 1)
 
     def _save(self) -> None:
+        if self._outside_change():
+            keep = messagebox.askyesno(
+                "外で書き換わっています",
+                "この窓を開いたあとで、正解のファイルが外で書き換わりました。\n"
+                "（別の窓で作業した／こちらで直した など）\n\n"
+                "このまま保存すると、外での直しは**消えます**。\n\n"
+                "　はい … この窓の内容で上書きする\n"
+                "　いいえ … 保存しない（窓を閉じて開き直してください）",
+                parent=self)
+            if not keep:
+                self.var_action.set(
+                    "保存しませんでした。窓を閉じて開き直してください。")
+                return
         self.out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.out.with_suffix(".tmp")
-        tmp.write_text(json.dumps({
+        raw = json.dumps({
             "project": Path(self.proj.json_path or "").name,
             "audio_sha256": self.proj.source_sha256,
             "made_by": "human-verbatim",
@@ -111,8 +141,13 @@ class VerbatimWindow(tk.Tk):
                 for s in self.targets if s.index in self.fixed
             ],
             "missing": self.missing,
-        }, ensure_ascii=False, indent=1), encoding="utf-8")
+        }, ensure_ascii=False, indent=1)
+        tmp = self.out.with_suffix(".tmp")
+        tmp.write_text(raw, encoding="utf-8")
         tmp.replace(self.out)
+        # 自分の保存を「外での書き換え」と誤らないよう追いつかせる。上書きを
+        # 選んだあともここで揃うので、次にまた外で変われば改めて聞く。
+        self.seen = raw
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
