@@ -26,6 +26,7 @@ from src.listen_order import (  # noqa: E402
     ListenHint,
     coverage,
     hints_path,
+    match,
     listen_first,
     load_hints,
     save_hints,
@@ -56,7 +57,32 @@ def test_score_counts_turns_around_the_segment():
                (30.0, 31.0, 3))          # 遠い
     (h,) = score_segments(segs, t)
     assert h.score == 3
-    assert h.index == 0
+    assert h.orig_start == 10.0
+
+
+def test_key_is_orig_start_not_index():
+    """区間を指す鍵は orig_start。**index は分割・再実行で振り直る**ので
+    鍵にしない(自動点検設計書 §6.1 と同じ理由)。"""
+    seg = _seg(7, 50.0, 52.0)
+    seg.orig_start = 30.0                # 分割・時刻編集で本来の位置が別にある
+    (h,) = score_segments([seg], _turns((50.0, 51.0, 0)))
+    assert h.orig_start == 30.0 and h.start == 50.0
+
+
+def test_match_uses_orig_start():
+    """番号が振り直されても、同じ区間に当たる。"""
+    a = _seg(0, 10.0, 11.0)
+    hints = score_segments([a], _turns((10.0, 11.0, 0)))
+    moved = _seg(5, 10.0, 11.0)          # 番号だけ変わった
+    got = match(hints, [moved])
+    assert set(got) == {5} and got[5].score == 1
+
+
+def test_match_skips_segments_without_a_hint():
+    """当たらない区間は入らない。**呼び出し側はそれを安全とみなさないこと。**"""
+    hints = score_segments([_seg(0, 10.0, 11.0)], _turns((10.0, 11.0, 0)))
+    other = _seg(1, 900.0, 901.0)
+    assert match(hints, [other]) == {}
 
 
 def test_score_is_zero_without_diarization():
@@ -90,21 +116,22 @@ def test_empty_input_is_empty_output():
 # ======================================================================
 
 def test_listen_first_sorts_by_score_then_time():
-    hints = [ListenHint(0, 100.0, 2), ListenHint(1, 10.0, 7),
-             ListenHint(2, 50.0, 7), ListenHint(3, 20.0, 5)]
-    got = [h.index for h in listen_first(hints)]
-    assert got == [1, 2, 3, 0]        # 7点(時間順) → 5点 → 2点
+    hints = [ListenHint(100.0, 100.0, 2), ListenHint(10.0, 10.0, 7),
+             ListenHint(50.0, 50.0, 7), ListenHint(20.0, 20.0, 5)]
+    got = [h.start for h in listen_first(hints)]
+    assert got == [10.0, 50.0, 20.0, 100.0]   # 7点(時間順) → 5点 → 2点
 
 
 def test_listen_first_skips_confirmed_segments():
-    """人が聴いて確定した区間は、もう勧めない。"""
-    hints = [ListenHint(0, 10.0, 9), ListenHint(1, 20.0, 8)]
-    assert [h.index for h in listen_first(hints, skip={0})] == [1]
+    """人が聴いて確定した区間は、もう勧めない。skip も orig_start で指す。"""
+    hints = [ListenHint(10.0, 10.0, 9), ListenHint(20.0, 20.0, 8)]
+    assert [h.start for h in listen_first(hints, skip={10.0})] == [20.0]
 
 
 def test_coverage_reports_how_many_are_high():
-    hints = [ListenHint(0, 1.0, HIGH_SCORE), ListenHint(1, 2.0, HIGH_SCORE - 1),
-             ListenHint(2, 3.0, HIGH_SCORE + 3)]
+    hints = [ListenHint(1.0, 1.0, HIGH_SCORE),
+             ListenHint(2.0, 2.0, HIGH_SCORE - 1),
+             ListenHint(3.0, 3.0, HIGH_SCORE + 3)]
     assert coverage(hints) == (2, 3)
 
 
@@ -128,9 +155,9 @@ def test_hints_path_needs_a_fingerprint():
 def test_save_and_load_round_trip():
     with tempfile.TemporaryDirectory() as d:
         p = hints_path(d, "fp")
-        save_hints(p, [ListenHint(3, 12.5, 7)])
+        save_hints(p, [ListenHint(12.5, 12.5, 7, 3)])
         got = load_hints(p)
-        assert got == [ListenHint(3, 12.5, 7)]
+        assert got == [ListenHint(12.5, 12.5, 7, 3)]
 
 
 def test_saved_file_keeps_the_warning():
@@ -138,7 +165,7 @@ def test_saved_file_keeps_the_warning():
     「印が無い＝脱落が無い」と解釈する。"""
     with tempfile.TemporaryDirectory() as d:
         p = hints_path(d, "fp")
-        save_hints(p, [ListenHint(0, 1.0, 9)])
+        save_hints(p, [ListenHint(1.0, 1.0, 9)])
         data = json.loads(p.read_text(encoding="utf-8"))
         assert "脱落の有無を表さない" in data["note"]
         assert "再現率" in data["measured"]
@@ -148,7 +175,7 @@ def test_old_version_is_discarded():
     """版が違えば読まない。作り直せる派生データなので捨ててよい。"""
     with tempfile.TemporaryDirectory() as d:
         p = hints_path(d, "fp")
-        save_hints(p, [ListenHint(0, 1.0, 9)])
+        save_hints(p, [ListenHint(1.0, 1.0, 9)])
         data = json.loads(p.read_text(encoding="utf-8"))
         data["version"] = LISTEN_ORDER_VER + 1
         p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
@@ -165,7 +192,7 @@ def test_missing_or_broken_file_is_none():
 
 
 def test_save_with_no_path_does_nothing():
-    save_hints(None, [ListenHint(0, 1.0, 5)])      # 例外を出さない
+    save_hints(None, [ListenHint(1.0, 1.0, 5)])      # 例外を出さない
 
 
 # ======================================================================
@@ -196,10 +223,11 @@ def test_measured_numbers_still_hold():
     sampled = {int(r["index"]) for r in lab["labels"]}
     marked = {int(r["index"]) for r in lab["untranscribed_voice"]}
 
-    hints = [h for h in score_segments(proj.segments, turns)
-             if h.index in sampled]
+    by_index = match(score_segments(proj.segments, turns), proj.segments)
+    hints = [h for i, h in by_index.items() if i in sampled]
     high = [h for h in hints if h.is_high]
-    hit = sum(1 for h in high if h.index in marked)
+    hit = sum(1 for i, h in by_index.items()
+              if i in sampled and h.is_high and i in marked)
     prec = hit / len(high)
     rec = hit / len(marked & sampled)
     base = len(marked & sampled) / len(hints)

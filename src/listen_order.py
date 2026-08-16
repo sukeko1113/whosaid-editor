@@ -53,24 +53,30 @@ class ListenHint:
 
     score は前後 WINDOW_SECONDS 秒に重なる話者 turn の数。
     **順番を決めるためだけの数字で、脱落の有無を表さない。**
+
+    **区間を指す鍵は `orig_start`。**`index` は分割・結合・再実行で振り直るので
+    鍵にしてはいけない(自動点検設計書 §6.1 と同じ理由)。`index` は表示の
+    ためだけに持ち、突き合わせには使わない。
     """
 
-    index: int
+    orig_start: float
     start: float
     score: int
+    index: int = -1
 
     @property
     def is_high(self) -> bool:
         return self.score >= HIGH_SCORE
 
     def to_dict(self) -> dict:
-        return {"index": self.index, "start": round(self.start, 3),
-                "score": self.score}
+        return {"orig_start": round(self.orig_start, 3),
+                "start": round(self.start, 3),
+                "score": self.score, "index": self.index}
 
     @classmethod
     def from_dict(cls, d: dict) -> "ListenHint":
-        return cls(index=int(d["index"]), start=float(d["start"]),
-                   score=int(d["score"]))
+        return cls(orig_start=float(d["orig_start"]), start=float(d["start"]),
+                   score=int(d["score"]), index=int(d.get("index", -1)))
 
 
 def score_segments(
@@ -92,18 +98,40 @@ def score_segments(
     for seg in segments:
         lo, hi = seg.start - window, seg.end + window
         n = sum(1 for t in ordered if t.end > lo and t.start < hi)
-        out.append(ListenHint(index=seg.index, start=seg.start, score=n))
+        out.append(ListenHint(
+            orig_start=float(seg.orig_start if seg.orig_start is not None
+                             else seg.start),
+            start=seg.start, score=n, index=seg.index))
+    return out
+
+
+def match(hints: Sequence[ListenHint],
+          segments: Sequence[Segment]) -> dict[int, ListenHint]:
+    """いまの区間に順番を当てる。**鍵は `orig_start`。**
+
+    当たらなかった区間は入らない（分割で増えた側など）。呼び出し側は
+    「順番が付いていない区間」を安全とみなさないこと。
+    """
+    by_orig: dict[float, ListenHint] = {
+        round(h.orig_start, 3): h for h in hints}
+    out: dict[int, ListenHint] = {}
+    for seg in segments:
+        key = round(float(seg.orig_start if seg.orig_start is not None
+                          else seg.start), 3)
+        h = by_orig.get(key)
+        if h is not None:
+            out[seg.index] = h
     return out
 
 
 def listen_first(hints: Sequence[ListenHint],
-                 skip: Optional[Iterable[int]] = None) -> list[ListenHint]:
+                 skip: Optional[Iterable[float]] = None) -> list[ListenHint]:
     """聴く順に並べる。同点なら時間順（前から聴くほうが自然なため）。
 
-    skip: 既に人が聴いて確定した区間の index。もう一度勧めない。
+    skip: 既に人が聴いて確定した区間の `orig_start`。もう一度勧めない。
     """
-    done = set(skip or ())
-    rest = [h for h in hints if h.index not in done]
+    done = {round(float(x), 3) for x in (skip or ())}
+    rest = [h for h in hints if round(h.orig_start, 3) not in done]
     return sorted(rest, key=lambda h: (-h.score, h.start))
 
 

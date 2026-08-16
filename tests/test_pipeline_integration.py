@@ -9,6 +9,7 @@ ffmpeg が無い環境ではスキップする。
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -769,6 +770,35 @@ def run_local() -> int:
                       not any(s.reviewed for s in proj.segments))
                 check("話者は未確定のまま",
                       all(s.speaker_id is None for s in proj.segments))
+
+                # --- 聴く順番(listen_order) --------------------------
+                from src import listen_order as lo
+                work = tmp / f".work_{audio.stem}"
+                hp = lo.hints_path(work, proj.audio_fingerprint or "")
+                hints = lo.load_hints(hp)
+                check("聴く順番が sidecar に残る", hints is not None)
+                check("本体の JSON には入れない",
+                      "listen" not in json.loads(
+                          Path(proj.json_path).read_text(encoding="utf-8")))
+                if hints:
+                    idx = {h.index for h in hints}
+                    check("番号を振り直したあとの区間を指す",
+                          idx == {s.index for s in proj.segments})
+                    check("順番は点数の高い順",
+                          [h.score for h in lo.listen_first(hints)]
+                          == sorted((h.score for h in hints), reverse=True))
+
+                # 話者分離が無ければ順番も出さない(手がかりが無いため)
+                proj_nd = pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, engine=LOCAL,
+                    chunk_minutes=1, force_retranscribe=True,
+                    on_log=lambda m: None, on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤",
+                )
+                hp2 = lo.hints_path(
+                    work, (proj_nd.audio_fingerprint if proj_nd else "") or "")
+                check("話者分離が無ければ順番を作らない",
+                      hp2 is None or not hp2.exists())
 
                 # 部品が無くても転写は捨てない
                 pipeline.diarize_mod.ensure_available = _raise_unavailable

@@ -16,6 +16,7 @@ from google import genai
 from google.genai import types as genai_types
 
 from . import diarize as diarize_mod
+from . import listen_order
 from . import local_asr
 from .align import DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
 from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
@@ -717,6 +718,7 @@ def run_segment_pipeline(
     # 要点で、Gemini のチャンク内クラスタ(実測 70 個)が 6 個になる。
     roster_speakers = parse_roster(roster)
     diarize_record: Optional[dict] = None
+    turns = None                      # 聴く順番の計算にも使う(下の §listen)
     if do_diarize and all_segments:
         n_speakers = (engine.num_speakers or len(roster_speakers)
                       or diarize_mod.DEFAULT_NUM_SPEAKERS)
@@ -758,6 +760,32 @@ def run_segment_pipeline(
     # 通し番号を振り直す
     for n, seg in enumerate(all_segments):
         seg.index = n
+
+    # §listen: 聴く順番を出す。**必ず番号を振り直したあとで計算する**
+    # ——sidecar は index で区間を指すので、先に計算すると全部ずれる。
+    #
+    # 話者分離が無ければ出さない(手がかりが turns なので)。失敗しても
+    # 転写は捨てない。順番が無くても作業は成立する。
+    listen_path = listen_order.hints_path(work_dir, fingerprint)
+    if turns and all_segments:
+        try:
+            hints = listen_order.score_segments(all_segments, turns)
+            listen_order.save_hints(listen_path, hints)
+            high, total = listen_order.coverage(hints)
+            on_log(f"聴く順番を付けました(手がかりの強い区間 {high}/{total})。"
+                   "上位から聴くと取りこぼしを見つけやすくなります"
+                   "(印の無い区間にも取りこぼしはあります)。")
+        except Exception as e:                    # 順番が出せなくても続ける
+            on_log(f"※ 聴く順番は出せませんでした: {e}")
+    elif listen_path is not None and listen_path.exists():
+        # **前回の順番を残さない。**話者分離を切って作り直したのに古い順番が
+        # 残ると、いまの区間と対応しない案内が出る。作り直せる派生データ
+        # なので消してよい(話者分離を入れ直せば戻る)。
+        try:
+            listen_path.unlink()
+            on_log("話者分離が無いので、前回の「聴く順番」は消しました。")
+        except OSError:
+            pass
 
     speakers = roster_speakers
     # 再実行しても文書の履歴(版・編集履歴)は消さない。ただし音声の中身が
