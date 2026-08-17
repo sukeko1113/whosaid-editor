@@ -43,6 +43,7 @@ from .inspection import (
 from .player import SegmentPlayer
 from .segments import (
     MIN_SEGMENT_SECONDS,
+    PSEUDO_UNKNOWN,
     Project,
     SPECIAL_MULTI,
     SPECIAL_NOISE,
@@ -494,6 +495,17 @@ class AssignWindow(tk.Toplevel):
                    command=self.merge_with_prev).pack(side="left", padx=6)
         ttk.Button(row_edit, text="次の区間と結合", takefocus=False,
                    command=self.merge_with_next).pack(side="left")
+        ttk.Separator(row_edit, orient="vertical").pack(side="left", fill="y",
+                                                        padx=10)
+        # 聞こえたのに本文に無い発話を足す。**どのエンジンも会話途中の相づちを
+        # 書けない**(6 系統の実測で、和集合でも 33 件中 14 件が拾えない)ので、
+        # 機械が時刻と声を用意し、人が言葉を入れる。
+        ttk.Button(row_edit, text="＋この声を足す...", takefocus=False,
+                   command=self.add_utterance).pack(side="left")
+        self.btn_del_added = ttk.Button(
+            row_edit, text="この区間を消す", takefocus=False,
+            command=self.remove_added, state="disabled")
+        self.btn_del_added.pack(side="left", padx=6)
 
         frm_text = ttk.LabelFrame(right, text="この区間の発言(編集できます)")
         frm_text.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
@@ -987,6 +999,12 @@ class AssignWindow(tk.Toplevel):
         self.txt_body.insert("1.0", seg.text)
         self._rebuild_candidates()
         self._draw_timeline()
+        # 消せるのは人が足した区間だけ。**音声認識が出した区間には削除の
+        # 入口を作らない**(短い相づちの自動削除をしない原則)。
+        if hasattr(self, "btn_del_added"):
+            self.btn_del_added.configure(
+                state="normal" if self.proj.is_added_utterance(seg)
+                else "disabled")
 
     def _update_seginfo(self) -> None:
         """区間ヘッダ(右ペイン最上段)を書き直す。"""
@@ -1387,6 +1405,100 @@ class AssignWindow(tk.Toplevel):
             f"{fmt_hms_frac(tail.start)}〜{fmt_hms_frac(tail.end)} に分けました。"
             "後半は話者を確定してください(分割の取り消しは「前の区間と結合」)。"
         )
+
+    # ---------------------------------------------------- 相づちを足す
+    def _load_turns(self) -> list:
+        """話者分離の turn をキャッシュから読む。無ければ空。
+
+        作業ファイルは turn を持たない(クラスタだけ)ので、
+        `.work_<名前>/diarize/` から読む。消えていれば手入力に落ちる。
+        """
+        try:
+            from . import diarize as dz
+            n = int((self.proj.engine or {}).get("diarize", {})
+                    .get("num_speakers") or dz.DEFAULT_NUM_SPEAKERS)
+            turns = dz.load_turns(dz.turns_cache_path(
+                self._work_dir(), self.proj.audio_fingerprint or "", n))
+            return list(turns or [])
+        except Exception:
+            return []
+
+    def _voice_letter(self, speaker: int) -> str:
+        """話者番号 → A/B/C…。**本体の表示と同じ対応にする**
+        (`_speaker_letters` は出現順に振るので、同じ turn 一式から作る)。"""
+        if not hasattr(self, "_letters_cache"):
+            from .segments import _speaker_letters
+            self._letters_cache = _speaker_letters(self._load_turns())
+        return self._letters_cache.get(speaker, "?")
+
+    def _voice_label(self, speaker: int) -> str:
+        return f"声{self._voice_letter(speaker)}"
+
+    def _ask_utterance(self, seg: Segment, turns: list):
+        """小窓を開いて (開始, 終了, 本文, まとまり, 話者) を返す。やめたら None。
+
+        **画面を出す処理なので、検査では必ず差し替える。**差し替え忘れると
+        応答待ちで止まる(GUI 検査で実際に止めた前例がある)。
+        """
+        dlg = AddUtteranceDialog(self, seg, turns)
+        self.wait_window(dlg)
+        return dlg.result
+
+    def add_utterance(self) -> None:
+        """聞こえたのに本文に無い発話を足す。"""
+        if not self.proj.segments:
+            return
+        self._commit_text()
+        seg = self.proj.segments[self.current]
+        # いまの区間の前後 3 秒に重なる turn を候補に出す(聴きどころと同じ窓)
+        turns = [t for t in self._load_turns()
+                 if t.end > seg.start - listen_order.WINDOW_SECONDS
+                 and t.start < seg.end + listen_order.WINDOW_SECONDS]
+        turns.sort(key=lambda t: (t.start, t.end))
+        got = self._ask_utterance(seg, turns)
+        if not got:
+            return
+        start, end, text, cluster, sid = got
+        added = self.proj.add_utterance(start, end, text, cluster)
+        if sid:
+            # **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
+            added.speaker_id = sid
+            added.reviewed = True
+        self._remap_undo_for_split(added.index)
+        self._dirty = True
+        self.suggester.refresh()
+        self.current = added.index
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        who = self.proj.speaker_name(sid) if sid else "話者は未確定"
+        self._set_action(
+            f"{fmt_hms_frac(added.start)} に「{text}」を足しました({who})。"
+            "取り消しは［この区間を消す］。")
+
+    def remove_added(self) -> None:
+        """人が足した区間を消す。**それ以外は消せない。**"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        if not self.proj.is_added_utterance(seg):
+            self._set_action("この区間は人が足したものではないので消せません。")
+            return
+        if not messagebox.askyesno(
+                "足した発話を消す",
+                f"{fmt_hms_frac(seg.start)}「{seg.preview(30)}」を消します。"
+                "よろしいですか。", parent=self):
+            return
+        index = seg.index
+        self.proj.remove_added_utterance(index)
+        self._remap_undo_for_merge(index)
+        self._dirty = True
+        self.suggester.refresh()
+        self.current = max(0, min(index, len(self.proj.segments) - 1))
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action("足した発話を消しました。")
 
     def merge_with_prev(self) -> None:
         self._merge_at(self.current - 1)
@@ -2457,6 +2569,151 @@ class SplitDialog(tk.Toplevel):
 
     def _close(self) -> None:
         self._stop_mark()
+        self.win.player.stop()
+        self.grab_release()
+        self.destroy()
+
+
+class AddUtteranceDialog(tk.Toplevel):
+    """聞こえたのに本文に無い発話を足す小窓（相づちを足す設計書 §5）。
+
+    決めることは 3 つ:
+      - どこで言われたか（話者分離の turn 候補から選ぶ。無ければ手入力）
+      - 何と言ったか（人が打つ。**機械はここを埋められない**）
+      - 誰が言ったか（任意。選べば ✓ になる）
+
+    turn は「誰かが話していた区間」なので、時刻と声のまとまりを機械から
+    もらえる。人が入れるのは言葉だけで済む。
+    """
+
+    def __init__(self, win: "AssignWindow", seg: Segment,
+                 turns: list) -> None:
+        super().__init__(win)
+        self.win = win
+        self.seg = seg
+        self.result: Optional[tuple[float, float, str, str, Optional[str]]] = None
+        self.title("聞こえた発話を足す")
+        self.transient(win)
+        self.resizable(False, False)
+
+        pad = {"padx": 12, "pady": 6}
+        ttk.Label(self, wraplength=520, justify="left", text=(
+            f"いまの区間 {fmt_hms_frac(seg.start)}〜{fmt_hms_frac(seg.end)} の"
+            "あたりで、本文に無い発話が聞こえたときに足します。\n"
+            "**同じ人の言い淀みは、ここではなく本文欄に直接書き足してください。**"
+        )).grid(row=0, column=0, columnspan=2, sticky="w", **pad)
+
+        # --- どこで言われたか ---
+        box = ttk.LabelFrame(self, text="どこで言われたか")
+        box.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
+        box.columnconfigure(0, weight=1)
+        self._turns = turns
+        values = [f"{fmt_hms_frac(t.start)}〜{fmt_hms_frac(t.end)}"
+                  f"   {win._voice_label(t.speaker)}" for t in turns]
+        self.cmb = ttk.Combobox(box, values=values, state="readonly", width=44)
+        self.cmb.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
+        self.cmb.bind("<<ComboboxSelected>>", self._pick_turn)
+        if values:
+            self.cmb.current(0)
+        else:
+            self.cmb.configure(state="disabled")
+            ttk.Label(box, foreground="#B26500", wraplength=500, justify="left",
+                      text="話者分離の結果がありません。時刻を手で入れてください。"
+                      ).grid(row=1, column=0, sticky="w", padx=8)
+
+        row = ttk.Frame(box)
+        row.grid(row=2, column=0, sticky="w", padx=8, pady=(2, 8))
+        mid = round((seg.start + seg.end) / 2, 1)
+        self.var_start = tk.StringVar(value=fmt_hms_frac(mid))
+        self.var_end = tk.StringVar(value=fmt_hms_frac(mid + 0.8))
+        ttk.Label(row, text="開始:").pack(side="left")
+        ttk.Entry(row, textvariable=self.var_start, width=12).pack(side="left", padx=4)
+        ttk.Label(row, text="終了:").pack(side="left", padx=(8, 0))
+        ttk.Entry(row, textvariable=self.var_end, width=12).pack(side="left", padx=4)
+        ttk.Button(row, text="▶ ここを聴く", takefocus=False,
+                   command=self._play).pack(side="left", padx=(12, 0))
+        if turns:
+            self._pick_turn()
+
+        # --- 何と言ったか ---
+        ttk.Label(self, text="聞こえた言葉:").grid(row=2, column=0, sticky="w",
+                                                  padx=12)
+        self.var_text = tk.StringVar()
+        ent = ttk.Entry(self, textvariable=self.var_text, width=52)
+        ent.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12)
+
+        # --- 誰が言ったか ---
+        who = ttk.LabelFrame(self, text="誰が言ったか（選ぶと ✓ になります）")
+        who.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
+        self.var_speaker = tk.StringVar(value="")
+        names = [("（決めない）", "")] + [
+            (sp.name, sp.id) for sp in win.proj.speakers]
+        self._sp_ids = [v for _, v in names]
+        self.cmb_sp = ttk.Combobox(who, values=[n for n, _ in names],
+                                   state="readonly", width=34)
+        self.cmb_sp.current(0)
+        self.cmb_sp.pack(side="left", padx=8, pady=6)
+        ttk.Label(who, foreground="#666", wraplength=240, justify="left",
+                  text="いま聴いたところなので、選べば「聴いて確定」になります。"
+                  ).pack(side="left", padx=(4, 8))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", **pad)
+        ttk.Button(btns, text="入れる", command=self._ok).pack(side="left")
+        ttk.Button(btns, text="やめる", command=self._cancel).pack(side="left",
+                                                                   padx=8)
+        self.bind("<Escape>", lambda e: self._cancel())
+        ent.focus_set()
+        self.grab_set()
+
+    # ------------------------------------------------------------------
+    def _pick_turn(self, _e=None) -> None:
+        i = self.cmb.current()
+        if 0 <= i < len(self._turns):
+            t = self._turns[i]
+            self.var_start.set(fmt_hms_frac(t.start))
+            self.var_end.set(fmt_hms_frac(t.end))
+
+    def _span(self) -> Optional[tuple[float, float]]:
+        try:
+            a = parse_hms(self.var_start.get())
+            b = parse_hms(self.var_end.get())
+        except Exception:
+            return None
+        return (a, b) if b > a else (a, a + 0.5)
+
+    def _play(self) -> None:
+        span = self._span()
+        if span:
+            self.win.player.play(self.win.proj.audio_path, span[0], span[1])
+
+    def _cluster(self) -> str:
+        i = self.cmb.current()
+        if 0 <= i < len(self._turns):
+            return f"g:{self.win._voice_letter(self._turns[i].speaker)}"
+        return f"{self.seg.chunk}:{PSEUDO_UNKNOWN}"
+
+    def _ok(self) -> None:
+        span = self._span()
+        text = self.var_text.get().strip()
+        if span is None:
+            messagebox.showwarning("時刻が読めません",
+                                   "開始・終了は 00:01:23.4 の形で入れてください。",
+                                   parent=self)
+            return
+        if not text:
+            messagebox.showwarning("言葉が空です",
+                                   "聞こえた言葉を入れてください。", parent=self)
+            return
+        sid = self._sp_ids[self.cmb_sp.current()] or None
+        self.result = (span[0], span[1], text, self._cluster(), sid)
+        self._close()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self._close()
+
+    def _close(self) -> None:
         self.win.player.stop()
         self.grab_release()
         self.destroy()

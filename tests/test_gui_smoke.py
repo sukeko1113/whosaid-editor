@@ -953,6 +953,73 @@ def run() -> int:
         check("時間順に戻せる", wwin._visible_indexes() == [0, 1, 2, 3])
         wwin.player.close()
         wwin.destroy()
+
+        # --- 相づちを足す ------------------------------------------------
+        ap = Project(audio_path=str(tmp / "meeting.m4a"),
+                     duration=600.0, chunk_seconds=420)
+        ap.speakers = parse_roster("佐藤\n田中")
+        ap.segments = [
+            Segment(index=i, start=i * 10.0, end=i * 10.0 + 8,
+                    text=f"発言 {i}。", cluster="g:A", chunk=0)
+            for i in range(4)
+        ]
+        ap.json_path = str(tmp / "add.speakers.json")
+        ap.save()
+        awin = AssignWindow(root, ap)
+        awin.var_autoplay.set(False)
+        awin.update()
+
+        check("足した区間でなければ消せない",
+              str(awin.btn_del_added.cget("state")) == "disabled")
+
+        # 小窓は差し替える(開くと応答待ちで止まる)
+        real_ask_utt = awin._ask_utterance
+        awin._ask_utterance = lambda seg, turns: (
+            14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)
+        try:
+            awin.current = 1
+            awin.add_utterance()
+        finally:
+            awin._ask_utterance = real_ask_utt
+
+        added = [s for s in ap.segments if s.text == "はいはい"]
+        check("足した発話が入る", len(added) == 1)
+        if added:
+            a = added[0]
+            check("時間順の位置に入る",
+                  [s.start for s in ap.segments]
+                  == sorted(s.start for s in ap.segments))
+            check("話者を選んだので ✓ になる",
+                  a.speaker_id == ap.speakers[0].id and a.reviewed is True)
+            check("人が足した区間だと分かる", ap.is_added_utterance(a) is True)
+            check("足した区間へ移動している", awin.current == a.index)
+            check("消すボタンが押せるようになる",
+                  str(awin.btn_del_added.cget("state")) == "normal")
+            # 消す(確認ダイアログは「はい」に差し替える)
+            real_ask = assign_gui.messagebox.askyesno
+            assign_gui.messagebox.askyesno = lambda *a2, **k2: True
+            try:
+                awin.remove_added()
+            finally:
+                assign_gui.messagebox.askyesno = real_ask
+            check("足した発話を消せる",
+                  not any(s.text == "はいはい" for s in ap.segments))
+            check("元の 4 区間は残る", len(ap.segments) == 4)
+
+        # 話者を選ばなかった場合は ✓ を立てない
+        awin._ask_utterance = lambda seg, turns: (24.0, 24.6, "うん", "g:C", None)
+        try:
+            awin.current = 2
+            awin.add_utterance()
+        finally:
+            awin._ask_utterance = real_ask_utt
+        got = [s for s in ap.segments if s.text == "うん"]
+        check("話者を選ばなければ ✓ を立てない",
+              len(got) == 1 and got[0].speaker_id is None
+              and got[0].reviewed is False)
+
+        awin.player.close()
+        awin.destroy()
         root.destroy()
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
