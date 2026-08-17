@@ -398,8 +398,22 @@ def _carry_over_assignments(
     戻り値は新しい区間リスト。分割・結合を復元するために区間が増減するので、
     呼び出し側はこの戻り値で置き換えること。
     """
-    kept = [s for s in old.segments if s.speaker_id or s.text_edited or s.time_edited]
-    if not kept:
+    # **人が足した区間は突き合わせから完全に外す**(相づちを足す設計書 §4)。
+    # これらの orig_start は独自の値なので、
+    #   - 近くの再生成区間に誤って照合され、time_edited があればその区間を
+    #     置き換えて消す(1 秒の相づちが 8 秒の発言を上書きする)
+    #   - どこにも当たらなければ、相づちのほうが黙って捨てられる(実測はこちら)
+    # どちらにせよ人の作業が消える。照合にも吸収範囲にも参加させず、
+    # 最後に時間順の位置へ挿し直す。
+    added_keys = old.added_utterance_keys()
+    added = [s for s in old.segments
+             if round(float(s.orig_start if s.orig_start is not None
+                            else s.start), 3) in added_keys]
+
+    kept = [s for s in old.segments
+            if (s.speaker_id or s.text_edited or s.time_edited)
+            and s not in added]
+    if not kept and not added:
         return new_segments
 
     # 同じ orig_start を共有する旧区間は、1 つの区間を分割した兄弟(ファミリー)。
@@ -473,9 +487,20 @@ def _carry_over_assignments(
             carried += sum(1 for s in fam if s.speaker_id)
             carried_text += sum(1 for s in fam if s.text_edited)
 
+    # 人が足した区間を時間順の位置へ挿し直す。照合には参加していないので
+    # 再生成区間を置き換えることも、消されることもない。
+    if added:
+        result.extend(added)
+        result.sort(key=lambda s: (s.start, s.end))
+
     for n, seg in enumerate(result):
         seg.index = n
 
+    if added:
+        on_th = "、".join(fmt_hms(s.start) for s in added[:5])
+        more = " ほか" if len(added) > 5 else ""
+        on_log(f"人が足した発話 {len(added)} 件をそのまま残しました"
+               f"({on_th}{more})。")
     if carried:
         on_log(f"以前の割当 {carried} 区間を引き継ぎました。")
     if carried_text:

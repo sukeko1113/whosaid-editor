@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
@@ -604,6 +605,102 @@ class Project:
         self.segments[index:index + 1] = [head, tail]
         self.renumber()
         return head, tail
+
+    # -------------------------------------------------- 相づちを足す
+    def added_utterance_keys(self) -> set[float]:
+        """人が足した区間の orig_start（丸め済み）。
+
+        **再実行の引き継ぎがこれを見て、突き合わせから外す。**外さないと、
+        足した区間の独自の時刻が近くの無関係な区間に誤って照合され、
+        その区間を置き換えて消す（設計書 §4）。
+
+        識別に区間のフラグを使わないのは、スキーマを増やさないため
+        （v3 の一括移行まで待つ）。edit_log は既にあり、再実行でも
+        引き継がれるので、ここに置くのが自然。
+        """
+        keys: set[float] = set()
+        for rec in self.edit_log:
+            op = rec.get("op")
+            k = rec.get("orig_start")
+            if k is None:
+                continue
+            if op == "add_utterance":
+                keys.add(round(float(k), 3))
+            elif op == "remove_added_utterance":
+                keys.discard(round(float(k), 3))
+        return keys
+
+    def is_added_utterance(self, seg: Segment) -> bool:
+        """この区間は人が足したものか（消してよいか）。"""
+        key = float(seg.orig_start if seg.orig_start is not None else seg.start)
+        return round(key, 3) in self.added_utterance_keys()
+
+    def add_utterance(self, start: float, end: float, text: str,
+                      cluster: str = "") -> Segment:
+        """聞こえたのに本文に無い発話を、区間として足す（設計書 §2）。
+
+        時刻と声のまとまりは機械（話者分離の turn）が用意し、本文は人が打つ。
+        **重なりを禁止しない。**相づちは主発言と重なるのが本性なので、
+        既存区間と時間的に重なってよい。
+
+        話者は付けずに返す。付けるのは呼び出し側の通常の割当操作で、
+        そのときの ✓/△ は既存の意味論に従う（機械が ✓ を立てる経路は無い）。
+        """
+        start = round(float(start), 3)
+        end = round(max(float(end), start + MIN_SEGMENT_SECONDS), 3)
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("本文が空です。")
+        # 前後の区間と同じチャンクに属させる（チャンク番号は再生や
+        # クラスタ記号の表示に使われる）
+        near = min(self.segments, key=lambda s: abs(s.start - start),
+                   default=None)
+        seg = Segment(
+            index=0,                        # renumber で振り直す
+            start=start,
+            end=end,
+            text=text,
+            cluster=cluster or f"{near.chunk if near else 0}:{PSEUDO_UNKNOWN}",
+            chunk=near.chunk if near else 0,
+            speaker_id=None,
+            reviewed=False,
+            text_edited=True,               # 人が打った本文
+            time_edited=False,              # 時刻は turn 由来の機械値
+        )
+        pos = len([s for s in self.segments if (s.start, s.index) < (start, 0)])
+        self.segments.insert(pos, seg)
+        self.renumber()
+        self.edit_log.append({
+            "op": "add_utterance",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            "orig_start": float(seg.orig_start),
+            "start": start,
+            "end": end,
+            "cluster": seg.cluster,
+        })
+        return seg
+
+    def remove_added_utterance(self, index: int) -> None:
+        """人が足した区間を消す。**それ以外は消せない。**
+
+        短い相づちの自動削除をしない原則（CLAUDE.md）はそのまま。
+        ここで消せるのは人がいま足したものだけで、音声認識が出した区間には
+        削除の入口を作らない。
+        """
+        if not (0 <= index < len(self.segments)):
+            raise ValueError("その区間はありません。")
+        seg = self.segments[index]
+        if not self.is_added_utterance(seg):
+            raise ValueError("人が足した区間ではないので消せません。")
+        del self.segments[index]
+        self.renumber()
+        self.edit_log.append({
+            "op": "remove_added_utterance",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            "orig_start": float(seg.orig_start),
+        })
 
     def merge_segments(self, index: int) -> Segment:
         """index の区間と、その次の区間を 1 つにまとめる。

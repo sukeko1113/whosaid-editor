@@ -191,6 +191,53 @@ def run() -> int:
             check("引き継ぎ先が正しい話者",
                   all(s.speaker_id == sid for s in proj2.segments[:5]))
 
+            # --- 人が足した相づちが、再実行で消えないこと -----------------
+            # **対策前は黙って消えた**(相づちを足す設計書 §4・実測)。
+            # 足した区間の orig_start は独自の値なので、照合に参加させると
+            # どこにも当たらず捨てられるか、近くの区間を置き換えて消す。
+            base = proj2.segments[0]
+            inside = round(base.start + (base.end - base.start) / 2, 2)
+            added = proj2.add_utterance(inside, inside + 0.6, "はいはい")
+            before_texts = [s.text for s in proj2.segments]
+            proj2.save()
+
+            logs3: list[str] = []
+            proj4 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1, on_log=logs3.append,
+                on_progress=lambda c, t: None, is_cancelled=lambda: False,
+                verbatim=False, roster="佐藤(理事長)\n田中\n鈴木",
+            )
+            assert proj4 is not None
+            check("足した相づちが再実行後も残る",
+                  any(s.text == "はいはい" for s in proj4.segments))
+            check("足した区間だとまだ分かる(edit_log が生きている)",
+                  proj4.is_added_utterance(
+                      next(s for s in proj4.segments if s.text == "はいはい")))
+            check("他の区間を消していない",
+                  all(t in [s.text for s in proj4.segments]
+                      for t in before_texts))
+            check("残したことをログに出す",
+                  any("人が足した発話" in m for m in logs3))
+            check("時間順の位置に入る",
+                  [s.start for s in proj4.segments]
+                  == sorted(s.start for s in proj4.segments))
+
+            # 消してから再実行すると、もう戻らない
+            proj4.remove_added_utterance(
+                next(s.index for s in proj4.segments if s.text == "はいはい"))
+            proj4.save()
+            proj5 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=CLOUD,
+                chunk_minutes=1, on_log=lambda m: None,
+                on_progress=lambda c, t: None, is_cancelled=lambda: False,
+                verbatim=False, roster="佐藤(理事長)\n田中\n鈴木",
+            )
+            check("消した相づちは再実行でも戻らない",
+                  proj5 is not None
+                  and not any(s.text == "はいはい" for s in proj5.segments))
+            _ = added
+
             # --- 名簿を並べ替えて再実行しても人が入れ替わらないこと ---------
             # 話者 ID を振り直すと、確定済みの区間が別人を指してしまう
             proj3 = pipeline.run_segment_pipeline(

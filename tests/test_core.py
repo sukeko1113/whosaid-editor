@@ -963,6 +963,115 @@ def _splittable() -> Project:
     return proj
 
 
+# ======================================================================
+# 相づちを足す(設計書 claude_相づちを足す_設計書.md)
+# ======================================================================
+
+def test_add_utterance_inserts_in_time_order():
+    """時間順の正しい位置に入り、番号が振り直される。"""
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はいはい", cluster="g:B")
+    assert len(proj.segments) == 4
+    assert [s.index for s in proj.segments] == [0, 1, 2, 3]
+    assert proj.segments[2] is seg                    # 100〜110 の次
+    assert (seg.start, seg.end, seg.text) == (105.0, 105.8, "はいはい")
+    assert seg.cluster == "g:B"
+
+
+def test_add_utterance_does_not_assign_a_speaker():
+    """話者は付けずに返す。**機械が ✓ を立てる経路は作らない。**
+
+    話者を付けるのは呼び出し側の通常の割当操作で、そのときの ✓/△ は
+    既存の意味論に従う。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "うん")
+    assert seg.speaker_id is None
+    assert seg.reviewed is False
+
+
+def test_add_utterance_marks_text_edited_not_time_edited():
+    """本文は人が打った(text_edited)。時刻は turn 由来の機械値。
+
+    time_edited を立てると、再実行の引き継ぎで「旧側が正しい」枝に入り、
+    **他の区間を置き換えて消す**(設計書 §4)。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "ええ")
+    assert seg.text_edited is True
+    assert seg.time_edited is False
+
+
+def test_add_utterance_allows_overlap():
+    """既存区間と時間的に重なってよい。**相づちは重なるのが本性。**"""
+    proj = _splittable()
+    seg = proj.add_utterance(102.0, 103.0, "はい")     # 100〜110 の内側
+    assert len(proj.segments) == 4
+    others = [s for s in proj.segments if s is not seg]
+    assert any(s.start < seg.start and s.end > seg.end for s in others)
+
+
+def test_add_utterance_rejects_empty_text():
+    proj = _splittable()
+    try:
+        proj.add_utterance(105.0, 105.8, "   ")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("空の本文を受け付けてしまった")
+
+
+def test_add_utterance_records_the_key_in_edit_log():
+    """識別は edit_log。**スキーマ(区間のフラグ)を増やさない。**"""
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    rec = [r for r in proj.edit_log if r.get("op") == "add_utterance"]
+    assert len(rec) == 1
+    assert rec[0]["orig_start"] == seg.orig_start
+    assert rec[0]["actor"] == "user"
+    assert proj.added_utterance_keys() == {round(seg.orig_start, 3)}
+    assert proj.is_added_utterance(seg) is True
+    assert proj.is_added_utterance(proj.segments[0]) is False
+
+
+def test_remove_added_utterance_only_removes_added_ones():
+    """**音声認識が出した区間には削除の入口を作らない。**
+
+    短い相づちの自動削除をしない原則(CLAUDE.md)はそのまま。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    try:
+        proj.remove_added_utterance(0)               # ASR 由来の区間
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("ASR の区間を消せてしまった")
+    proj.remove_added_utterance(seg.index)
+    assert len(proj.segments) == 3
+    assert [s.index for s in proj.segments] == [0, 1, 2]
+    # 消したら鍵も落ちる(再実行の引き継ぎが古い鍵を掴まないように)
+    assert proj.added_utterance_keys() == set()
+
+
+def test_added_keys_survive_save_and_load(tmp_path=None):
+    """保存して読み直しても、人が足した区間だと分かる。
+
+    edit_log は本体 JSON に入り、再実行でも引き継がれる。
+    """
+    import tempfile
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.speakers.json"
+        proj.json_path = str(p)
+        proj.save()
+        again = Project.load(p)
+    assert again.added_utterance_keys() == {round(seg.orig_start, 3)}
+    got = [s for s in again.segments if s.text == "はい"]
+    assert len(got) == 1 and again.is_added_utterance(got[0]) is True
+
+
 def test_split_segment_basics():
     proj = _splittable()
     head, tail = proj.split_segment(1, 105.0, len("そうですね"))
