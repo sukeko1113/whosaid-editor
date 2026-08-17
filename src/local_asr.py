@@ -219,10 +219,15 @@ class LocalTranscriber:
         on_log=None,
         on_progress=None,
         is_cancelled=None,
+        word_timestamps: bool = True,
     ) -> Optional[ChunkResult]:
         """1 チャンクを起こす。中断されたら None(途中結果は残さない)。
 
         on_progress: (処理済み秒, チャンク全体の秒) で呼ぶ。
+        word_timestamps: 単語時刻も取るか。**製品経路は常に既定(True)。**
+        False は測定用——CT2 変換が不完全なモデル(kotoba-whisper-v2.0-faster)は
+        単語時刻の位置合わせでネイティブ層ごと落ちる(0xC0000005・実測)。
+        本文だけの測定ならこれで回避できる。
         """
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -234,7 +239,7 @@ class LocalTranscriber:
             str(audio_path),
             language=LANGUAGE,
             # 本文と一緒に単語時刻も取る。自動点検が使う実測値がただで手に入る。
-            word_timestamps=True,
+            word_timestamps=word_timestamps,
             # VAD は使わない。無音を飛ばすと速くなるが、短い相づちを落とす
             # 恐れがある。ここは本文を作る経路なので、落ちればその発言は
             # 記録から消える(align.py の「照合不能」より重い)。

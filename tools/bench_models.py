@@ -22,6 +22,7 @@ report_verbatim.py は帯 [開始, 終わり] で突き合わせるので、相�
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import time
@@ -80,15 +81,22 @@ def main() -> int:
         print(f"  切り出し: {name} ({lo:.0f}〜{hi:.0f} 秒)")
 
     for model in models:
-        srt = outdir / f"{model}.srt"
+        # HF の repo ID は「/」を含む。そのまま使うと下位フォルダに割れて
+        # 書き出しで落ちる(kotoba-tech/... で実際に落ちた)。
+        srt = outdir / (re.sub(r"[\\/:]+", "-", model) + ".srt")
         if srt.exists():
             print(f"\n[{model}] 既にあります: {srt.name}")
             continue
-        # 「small+nocond」で、直前の本文の引き継ぎを切って回す
-        name_only, _, opt = model.partition("+")
-        cond = opt != "nocond"
+        # 「small+nocond」= 直前の本文を引き継がない
+        # 「…+nowords」 = 単語時刻を取らない(CT2 変換が不完全なモデルは
+        #                 単語時刻でネイティブ層ごと落ちる。kotoba で実測)
+        parts = model.split("+")
+        name_only, opts = parts[0], set(parts[1:])
+        cond = "nocond" not in opts
+        words = "nowords" not in opts
         print(f"\n[{model}] 読み込み中…"
-              + ("" if cond else "（直前の本文を引き継がない）"))
+              + ("" if cond else "（直前の本文を引き継がない）")
+              + ("" if words else "（単語時刻なし）"))
         t0 = time.monotonic()
         try:
             tr = LocalTranscriber(model=name_only,
@@ -102,7 +110,7 @@ def main() -> int:
         for name, lo, path in cuts:
             print(f"  {name} …", end="", flush=True)
             t1 = time.monotonic()
-            res = tr.transcribe(path)
+            res = tr.transcribe(path, word_timestamps=words)
             if res is None:
                 print(" 中止")
                 continue
@@ -123,7 +131,10 @@ def main() -> int:
               f"実時間比 {took/spoken:.2f}）" if spoken else f"  → {srt.name}")
 
     print(f"\n次:\n  python tools\\report_verbatim.py <truth> "
-          + " ".join(f"{m}={outdir / (m + '.srt')}" for m in models))
+          + " ".join(
+              f"{re.sub(r'[^A-Za-z0-9]+', '_', m)}="
+              f"{outdir / (re.sub(r'[\\\\/:]+', '-', m) + '.srt')}"
+              for m in models))
     return 0
 
 

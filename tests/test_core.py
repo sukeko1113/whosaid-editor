@@ -1894,6 +1894,19 @@ def test_local_asr_does_not_use_vad():
     assert fake.calls[0]["language"] == "ja"
 
 
+def test_local_asr_takes_word_timestamps_by_default():
+    """単語時刻は既定で取る(自動点検の実測値になる)。製品経路は常にこちら。
+
+    切れるようにしたのは測定用——CT2 変換が不完全なモデルは単語時刻の
+    位置合わせでネイティブ層ごと落ちる(kotoba-whisper-v2.0-faster で実測)。
+    """
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["word_timestamps"] is True
+    t.transcribe(__file__, word_timestamps=False)
+    assert fake.calls[1]["word_timestamps"] is False
+
+
 def test_local_asr_keeps_conditioning_on_by_default():
     """直前の本文の引き継ぎは既定で入り。faster-whisper の既定と同じ。
 

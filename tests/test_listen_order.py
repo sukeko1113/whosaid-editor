@@ -208,7 +208,12 @@ def test_measured_numbers_still_hold():
     **手がかりを変えたときに、ここが落ちれば気づける。**
     データが無い環境では飛ばす（CI にはこの音声を置かない）。
     """
-    proj_p = _TA / "01+02edited.speakers.json"
+    # **作業中のファイルではなく、凍結した写し(話者分離前・1219 区間)を使う。**
+    # 印は当時の index で記録されており、作業ファイルは利用者が触るたびに
+    # 区間が変わる(実際に再実行で 705 区間になり、この検査が一度壊れた)。
+    # 実測の再現は「同じデータで手がかりだけを変えたら気づく」ための検査
+    # なので、データ側を凍結する。
+    proj_p = _TA / "01+02edited.premerge.speakers.json"
     turn_p = _TA / "01+02edited.diarize.auto.4036s.json"
     lab_p = _TA / "truth" / "labels_blind.r1.json"
     if not (proj_p.exists() and turn_p.exists() and lab_p.exists()):
