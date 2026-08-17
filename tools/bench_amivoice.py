@@ -67,27 +67,48 @@ def recognize(key: str, wav: Path, engine: str) -> dict:
         return json.loads(r.read().decode("utf-8"))
 
 
+# 区切りの規則。**他のエンジンと粒度を揃えるために要る。**
+# AmiVoice の同期 API は 2 分の音声を 1 件で返す（実測: 120 秒 / 567 字）。
+# そのままだと短発話再現・脱落の再現が測れない（±2 秒の窓を 120 秒から
+# 按分で切り出すと位置が大きくずれる）。単語ごとの時刻が返るので、
+# **句点と無音**という機械的な規則で割る。AmiVoice に有利にも不利にも
+# ならないよう、他エンジンの自然な切れ目（文末・間）と同じ基準にする。
+SPLIT_AFTER = "。？！?!"
+SPLIT_GAP_SECONDS = 0.5
+
+
 def to_rows(resp: dict, offset: float) -> list[tuple[float, float, str]]:
-    """API の結果を (絶対開始, 絶対終了, 本文) に直す。
+    """API の結果を (絶対開始, 絶対終了, 本文) の並びに直す。
 
     フィラーは written が「%えー%」のように % で囲まれて返ることがある。
     **語そのものは残し、印だけ剥がす**（落とせば keepFillerToken の意味が無い）。
     """
-    rows = []
+    rows: list[tuple[float, float, str]] = []
     for res in resp.get("results", []):
+        cur: list[dict] = []
+
+        def flush() -> None:
+            if not cur:
+                return
+            text = "".join((t.get("written") or "").replace("%", "")
+                           for t in cur).strip()
+            if text:
+                s = float(cur[0].get("starttime", 0)) / 1000.0
+                e = float(cur[-1].get("endtime", 0)) / 1000.0
+                rows.append((offset + s, offset + max(e, s + 0.2), text))
+            cur.clear()
+
         tokens = res.get("tokens") or []
-        if not tokens:
-            continue
-        text = "".join((t.get("written") or "").replace("%", "")
-                       for t in tokens).strip()
-        if not text:
-            continue
-        start = float(tokens[0].get("starttime", 0)) / 1000.0
-        end = float(tokens[-1].get("endtime", 0)) / 1000.0
-        if end <= start:
-            end = start + 0.5
-        rows.append((offset + start, offset + end, text))
-    return rows
+        for i, tok in enumerate(tokens):
+            cur.append(tok)
+            written = (tok.get("written") or "").strip()
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else None
+            gap = ((float(nxt.get("starttime", 0))
+                    - float(tok.get("endtime", 0))) / 1000.0) if nxt else 0.0
+            if (written and written[-1] in SPLIT_AFTER) or gap >= SPLIT_GAP_SECONDS:
+                flush()
+        flush()
+    return sorted(rows, key=lambda r: (r[0], r[1]))
 
 
 def main() -> int:
@@ -124,6 +145,16 @@ def main() -> int:
     rows: list[tuple[float, float, str]] = []
     t0 = time.monotonic()
     for name, lo, path in cuts:
+        # **生の応答を残す。**区切りの規則を変えるたびに API を呼び直すと、
+        # 無料枠を無駄に使い、録音も繰り返し送ることになる。
+        raw_p = outdir / f"amivoice.raw.{name}.json"
+        if raw_p.exists():
+            print(f"  {name} … 保存済みの応答を使います", end="")
+            resp = json.loads(raw_p.read_text(encoding="utf-8"))
+            got = to_rows(resp, lo)
+            rows += got
+            print(f" / {len(got)} 区間")
+            continue
         print(f"  {name} …", end="", flush=True)
         t1 = time.monotonic()
         try:
@@ -134,6 +165,7 @@ def main() -> int:
         except Exception as e:
             print(f" 失敗: {e}")
             continue
+        raw_p.write_text(json.dumps(resp, ensure_ascii=False), encoding="utf-8")
         got = to_rows(resp, lo)
         rows += got
         print(f" {len(got)} 区間 / {time.monotonic()-t1:.0f} 秒")
