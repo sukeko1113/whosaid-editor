@@ -1224,6 +1224,8 @@ def test_legend_explains_each_style():
     assert CONTINUE_MARK in INSERT_LEGEND[INSERT_STYLE_LINE]
     assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_LINE]
     assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_INLINE]
+    # 検証要約に「凡例」という項目があるので、見出しをそれと重ねない
+    assert not any(v.startswith("凡例") for v in INSERT_LEGEND.values())
 
 
 def test_write_text_carries_the_style(tmp_path=None):

@@ -1245,6 +1245,93 @@ def run() -> int:
               all("cut" in r for r in dlg.result))
 
 
+        # --- 出力の書き方を選ぶ（設計書 §11・2026-08-18）------------------
+        # 標準の表記法を調べたら BTSJ に規定があった。データは 1 つのまま、
+        # 出し方だけを 2 通りから選ぶ。小窓を実際に開いて Word まで出す。
+        Path(ap.audio_path).write_bytes(b"RIFF-dummy")
+        base_seg = ap.segments[1]
+        ap.add_utterance(14.0, 14.6, "はいはい", cluster="g:B", cut=2,
+                         parent_orig=base_seg.orig_start)
+        added_one = [s for s in ap.segments if s.text == "はいはい"][0]
+        added_one.speaker_id = ap.speakers[0].id
+
+        def _all_widgets(w):
+            out = [w]
+            for c in w.winfo_children():
+                out.extend(_all_widgets(c))
+            return out
+
+        def _export(style, out_path):
+            """出力設定の小窓を開き、書き方を選んで［保存先を選ぶ］を押す。"""
+            seen = {}
+
+            def fake_wait(dlg):
+                dlg.update()
+                ws = _all_widgets(dlg)
+                seen["radios"] = [w for w in ws
+                                  if w.winfo_class() == "TRadiobutton"]
+                if style is not None:
+                    awin.var_insert_style.set(style)
+                for w in ws:
+                    if (w.winfo_class() == "TButton"
+                            and "保存先" in str(w.cget("text"))):
+                        w.invoke()
+                        return
+                dlg.destroy()
+
+            real_wait = awin.wait_window
+            real_save = assign_gui.filedialog.asksaveasfilename
+            real_err = assign_gui.messagebox.showerror
+            # 出力で落ちるとエラーの小窓で止まる。記録して先へ進める
+            assign_gui.messagebox.showerror = (
+                lambda *a, **k: seen.setdefault('error', a))
+            awin.wait_window = fake_wait
+            assign_gui.filedialog.asksaveasfilename = (
+                lambda *a, **k: str(out_path))
+            try:
+                awin.export_docx()
+            finally:
+                awin.wait_window = real_wait
+                assign_gui.filedialog.asksaveasfilename = real_save
+                assign_gui.messagebox.showerror = real_err
+            return seen
+
+        def _docx_text(path):
+            from docx import Document
+            return chr(10).join(
+                par.text for par in Document(str(path)).paragraphs)
+
+        seen = _export(assign_gui.INSERT_STYLE_LINE, tmp / "style_line.docx")
+        check("出力で落ちない", "error" not in seen)
+        check("差し込みがあれば書き方を選べる", len(seen.get("radios", [])) == 2)
+        body = _docx_text(tmp / "style_line.docx")
+        check("行を分ける形で出る（,, でつなぐ）", "発言,," in body)
+        check("読み方の説明が付く", "BTSJ" in body and "表記について" in body)
+        check("相づちが別の行に出る",
+              any(ln.strip().endswith("はいはい") for ln in body.splitlines()))
+        check("割られた後半に時刻を書かない",
+              any("1。" in ln and "[" not in ln for ln in body.splitlines()))
+
+        seen2 = _export(assign_gui.INSERT_STYLE_INLINE, tmp / "style_inline.docx")
+        body2 = _docx_text(tmp / "style_inline.docx")
+        check("行に埋め込む形も出せる", "(佐藤：はいはい)" in body2)
+        check("埋め込みでは ,, を使わない", ",," not in body2)
+        check("埋め込みにも読み方の説明が付く", "表記について" in body2)
+        check("同じ作業ファイルから両方出せる",
+              (tmp / "style_line.docx").exists()
+              and (tmp / "style_inline.docx").exists())
+        check("言葉そのものは変わらない",
+              ("はいはい" in body) and ("はいはい" in body2))
+
+        # 差し込みが無ければ、選びようが無いので出さない（凡例も出さない）
+        for s in [s for s in ap.segments if ap.is_added_utterance(s)]:
+            ap.remove_added_utterance(s.index)
+        seen3 = _export(None, tmp / "style_none.docx")
+        check("差し込みが無ければ選択肢を出さない", seen3.get("radios") == [])
+        # 「凡例」は検証要約にもある見出しなので、それでは判定できない
+        check("差し込みが無ければ読み方の説明も出さない",
+              "表記について" not in _docx_text(tmp / "style_none.docx"))
+
         # --- 時刻へ飛ぶ（2026-08-18 の指摘への対応）----------------------
         # 「聴く順にすると時間順でないので探せない」。700 区間をスクロールで
         # 探すのは現実的でない。逐語正解の道具にはあった機能で、本体に

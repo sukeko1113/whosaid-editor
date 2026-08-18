@@ -42,6 +42,8 @@ from .inspection import (
 )
 from .player import SegmentPlayer
 from .segments import (
+    INSERT_STYLE_INLINE,
+    INSERT_STYLE_LINE,
     MIN_SEGMENT_SECONDS,
     PSEUDO_UNKNOWN,
     Project,
@@ -53,6 +55,7 @@ from .segments import (
     audio_span,
     fmt_hms,
     fmt_hms_frac,
+    has_inserted_utterances,
     parse_hms,
     parse_roster,
     roster_to_text,
@@ -2190,6 +2193,32 @@ class AssignWindow(tk.Toplevel):
             ttk.Checkbutton(dlg, text=text, variable=var)\
                 .grid(row=2 + i, column=0, columnspan=2, sticky="w", padx=12, pady=1)
 
+        # 人が足した相づちの書き方(設計書 §11)。データは 1 つのまま、出し方
+        # だけを選ぶ。同じ作業ファイルから (ア) で反訳書、(イ) で QDA 用を
+        # 続けて出せる。差し込みが無いときは選びようが無いので出さない。
+        self.var_insert_style = tk.StringVar(value=INSERT_STYLE_LINE)
+        row = 7
+        if has_inserted_utterances(self.proj):
+            box = ttk.LabelFrame(dlg, text="足した相づちの入れ方")
+            box.grid(row=row, column=0, columnspan=2, sticky="ew",
+                     padx=12, pady=(8, 2))
+            for text, value in (
+                ("行を分ける（別の行に出し、続く行を ,, でつなぐ）",
+                 INSERT_STYLE_LINE),
+                ("行に埋め込む（本文の中に (氏名：はい) の形で入れる）",
+                 INSERT_STYLE_INLINE),
+            ):
+                ttk.Radiobutton(box, text=text, value=value,
+                                variable=self.var_insert_style).pack(
+                                    anchor="w", padx=8, pady=1)
+            ttk.Label(
+                box,
+                text="どちらも日本語会話研究の標準（BTSJ）に沿った書き方です。"
+                     "読み方の説明は冒頭に入ります。",
+                foreground="#555555", wraplength=430, justify="left").pack(
+                    anchor="w", padx=8, pady=(2, 6))
+            row += 1
+
         result: dict[str, object] = {}
 
         def ok() -> None:
@@ -2197,7 +2226,7 @@ class AssignWindow(tk.Toplevel):
             dlg.destroy()
 
         btns = ttk.Frame(dlg)
-        btns.grid(row=8, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
+        btns.grid(row=row, column=0, columnspan=2, sticky="ew", padx=12, pady=12)
         ttk.Button(btns, text="保存先を選ぶ...", command=ok).pack(side="right")
         ttk.Button(btns, text="キャンセル", command=dlg.destroy).pack(side="right", padx=6)
         dlg.bind("<Return>", lambda e: ok())
@@ -2228,10 +2257,13 @@ class AssignWindow(tk.Toplevel):
                 include_attendees=var_attend.get(),
                 drop_noise=var_noise.get(),
                 revision=next_revision,
+                insert_style=self.var_insert_style.get(),
             )
             if var_txt.get():
                 write_text(self.proj, Path(path).with_suffix(".txt"),
-                           merge_consecutive=var_merge.get(), drop_noise=var_noise.get())
+                           merge_consecutive=var_merge.get(),
+                           drop_noise=var_noise.get(),
+                           insert_style=self.var_insert_style.get())
         except Exception:
             messagebox.showerror("出力エラー", traceback.format_exc(), parent=self)
             return
