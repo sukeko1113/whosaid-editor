@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .assign_gui import open_assign_window
+from .assign_gui import RosterTable, open_assign_window
 from .audio import audio_fingerprint
 from .config import credits_text, load_config, save_config
 from typing import Optional
@@ -48,7 +48,8 @@ MODE_AUTO_DESC = (
     "後から直すのが大変です。"
 )
 ROSTER_HINT = (
-    "1行に1人、「名前(役職)」の形式で入力(例: 佐藤(理事長))。"
+    "名前と、企業・役職を分けて入れてください(例: 佐藤 / 理事長)。"
+    "本文の【 】に何を出すかは、出力のときに選べます。"
     "よく発言する人を上に置くと、初期の候補順が良くなります。"
 )
 
@@ -345,11 +346,27 @@ class App(tk.Tk):
         self.frm_roster.columnconfigure(0, weight=1)
         ttk.Label(self.frm_roster, text=ROSTER_HINT, foreground="#666", wraplength=700)\
             .grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(4, 0))
-        self.txt_roster = tk.Text(self.frm_roster, height=5, wrap="word")
-        self.txt_roster.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
-        sb_roster = ttk.Scrollbar(self.frm_roster, orient="vertical", command=self.txt_roster.yview)
-        sb_roster.grid(row=1, column=1, sticky="ns", pady=6)
-        self.txt_roster.configure(yscrollcommand=sb_roster.set)
+        head_roster = ttk.Frame(self.frm_roster)
+        head_roster.grid(row=1, column=0, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(head_roster, text="名前", font=("", 9, "bold"),
+                  width=RosterTable.NAME_WIDTH).grid(row=0, column=0, sticky="w")
+        ttk.Label(head_roster, text="企業・役職", font=("", 9, "bold"))            .grid(row=0, column=1, sticky="w", padx=(6, 0))
+        # 主画面はそれ自体がスクロールするので、表は内側にスクロールを持たない
+        self.tbl_roster = RosterTable(self.frm_roster, note_width=40)
+        self.tbl_roster.grid(row=2, column=0, columnspan=2, sticky="ew",
+                             padx=6, pady=(2, 4))
+        self.tbl_roster.add_row()
+        tools_roster = ttk.Frame(self.frm_roster)
+        tools_roster.grid(row=3, column=0, sticky="w", padx=6, pady=(0, 6))
+        ttk.Button(tools_roster, text="行を足す",
+                   command=lambda: self.tbl_roster.add_row(focus=True))            .pack(side="left")
+        ttk.Button(tools_roster, text="一覧をまとめて貼り付け...",
+                   command=self._paste_roster).pack(side="left", padx=6)
+        ttk.Button(tools_roster, text="名前と役職に自動で分ける",
+                   command=self._split_roster).pack(side="left")
+        self.var_roster_note = tk.StringVar(value="")
+        ttk.Label(tools_roster, textvariable=self.var_roster_note,
+                  foreground="#555").pack(side="left", padx=6)
 
         # === 操作ボタン ===
         frm_btn = ttk.Frame(body)
@@ -415,8 +432,8 @@ class App(tk.Tk):
         if "verbatim" in self.cfg:
             self.var_verbatim.set(bool(self.cfg.get("verbatim")))
         if roster := self.cfg.get("roster"):
-            self.txt_roster.delete("1.0", "end")
-            self.txt_roster.insert("1.0", str(roster))
+            # 保存済みは「名前(役職)」形式。分かれていない古い名簿だけ分ける
+            self.tbl_roster.set_text(str(roster))
         if last_in := self.cfg.get("last_input"):
             if Path(last_in).exists():
                 self.var_input.set(last_in)
@@ -536,7 +553,7 @@ class App(tk.Tk):
                     text="※ この方式では名簿を AI に渡しません。声質だけで区切った区間を、"
                          "あとの割当画面で 1 区間ずつ確定します。"
                 )
-            self.txt_roster.configure(state="normal", background="white")
+            self.tbl_roster.set_enabled(True)
             self.btn_start.configure(text="文字起こし → 割当画面へ")
         else:
             self.chk_diarization.configure(state="normal")
@@ -554,10 +571,10 @@ class App(tk.Tk):
         if self.var_diarization.get():
             self.var_timestamps.set(True)
             self.chk_timestamps.configure(state="disabled")
-            self.txt_roster.configure(state="normal", background="white")
+            self.tbl_roster.set_enabled(True)
         else:
             self.chk_timestamps.configure(state="normal")
-            self.txt_roster.configure(state="disabled", background="#f0f0f0")
+            self.tbl_roster.set_enabled(False)
 
     # ------------------------------------------------------------------
     def _open_saved_project(self) -> None:
@@ -692,15 +709,48 @@ class App(tk.Tk):
             messagebox.showerror("エラー", str(e))
 
     def _get_roster(self) -> str:
-        """名簿欄のテキストを取得(disabled 状態でも読めるように一時的に戻す)"""
-        state = self.txt_roster.cget("state")
-        if state == "disabled":
-            self.txt_roster.configure(state="normal")
-            text = self.txt_roster.get("1.0", "end").strip()
-            self.txt_roster.configure(state="disabled")
-        else:
-            text = self.txt_roster.get("1.0", "end").strip()
-        return text
+        """名簿を「名前(役職)」1 行 1 人の形にして返す(保存と転写経路に渡す形)"""
+        return self.tbl_roster.to_text()
+
+    def _split_roster(self) -> None:
+        """名前の欄に肩書ごと入っている行を、名前と役職に分ける提案。"""
+        done = self.tbl_roster.auto_split()
+        self.var_roster_note.set(
+            f"{done} 人を分けました。外れたものは直してください。" if done
+            else "分けられる行がありませんでした。")
+
+    def _paste_roster(self) -> None:
+        """一覧をまとめて貼り込む小窓。1 行 1 人で読み、名前と役職に分ける。"""
+        dlg = tk.Toplevel(self)
+        dlg.title("一覧をまとめて貼り付け")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(1, weight=1)
+        ttk.Label(
+            dlg,
+            text=("1 行に 1 人ぶんを貼り付けてください。"
+                  "名前と役職は端末内の規則で分けます(外部には送りません)。"
+                  + chr(10) + "分け方が外れたものは、貼り付けたあとに直せます。"),
+            foreground="#555", justify="left",
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
+        txt = tk.Text(dlg, width=60, height=12, wrap="none")
+        txt.grid(row=1, column=0, sticky="nsew", padx=12)
+        txt.insert("1.0", self.tbl_roster.to_text())
+        txt.focus_set()
+        btns = ttk.Frame(dlg)
+        btns.grid(row=2, column=0, sticky="ew", padx=12, pady=12)
+
+        def ok() -> None:
+            self.tbl_roster.set_text(txt.get("1.0", "end"))
+            self.var_roster_note.set(
+                f"{len(self.tbl_roster.values())} 人を読み込みました。"
+                "分け方が外れたものは直してください。")
+            dlg.destroy()
+
+        ttk.Button(btns, text="読み込む", command=ok).pack(side="right")
+        ttk.Button(btns, text="キャンセル", command=dlg.destroy)            .pack(side="right", padx=6)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     # ------------------------------------------------------------------
     # 実行

@@ -59,6 +59,8 @@ from .segments import (
     parse_hms,
     parse_roster,
     speaker_label,
+    roster_to_text,
+    suggest_roster_rows,
     suggest_split,
     write_docx,
     write_text,
@@ -263,16 +265,131 @@ class RosterPlan:
                     seg.reviewed = False
 
 
-class RosterDialog(tk.Toplevel):
-    """出席者を「名前」と「企業・役職」の 2 列で編集する小窓(設計書 §11.8)。
+class RosterTable(ttk.Frame):
+    """出席者を「名前」と「企業・役職」の 2 列で編集する表(設計書 §11.8)。
 
     **行が話者 ID を持ち回る。**名前の一致で引き継ぐと、名前を直しただけで
     別人が入って古い方が消えたと判断され、確定済みの割当が外れる。
     各行が元の ID を覚えているので、名前を直しても並べ替えても保たれる。
+
+    文字起こし画面(名簿を作るとき)と割当画面(名簿を直すとき)の両方で使う。
+    前者には話者 ID がまだ無いので、その場合は空文字のままでよい。
     """
 
     NAME_WIDTH = 16
     NOTE_WIDTH = 46
+
+    def __init__(self, parent: tk.Misc, note_width: int = NOTE_WIDTH) -> None:
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self._note_width = note_width
+        self.rows: list[dict] = []
+
+    def add_row(self, sid: str = "", name: str = "", note: str = "",
+                focus: bool = False) -> dict:
+        """1 人ぶんの行を足す。sid が空なら新しい人。"""
+        frm = ttk.Frame(self)
+        var_name = tk.StringVar(value=name)
+        var_note = tk.StringVar(value=note)
+        ent = ttk.Entry(frm, textvariable=var_name, width=self.NAME_WIDTH)
+        ent.grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=var_note, width=self._note_width).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0))
+        frm.columnconfigure(1, weight=1)
+        row = {"sid": sid, "name": var_name, "note": var_note,
+               "frame": frm, "entry": ent}
+        ttk.Button(frm, text="×", width=3, command=lambda: self.del_row(row)).grid(
+            row=0, column=2, padx=(6, 0))
+        self.rows.append(row)
+        self._relayout()
+        if focus:
+            ent.focus_set()
+        return row
+
+    def del_row(self, row: dict) -> None:
+        if row not in self.rows:
+            return
+        self.rows.remove(row)
+        row["frame"].destroy()
+        if not self.rows:
+            self.add_row()
+        self._relayout()
+
+    def clear(self) -> None:
+        for row in list(self.rows):
+            row["frame"].destroy()
+        self.rows.clear()
+
+    def set_speakers(self, speakers: Sequence[Speaker]) -> None:
+        self.clear()
+        for sp in speakers:
+            self.add_row(sp.id, sp.name, sp.note)
+        if not self.rows:
+            self.add_row()
+
+    def set_text(self, text: str, split: bool = True) -> None:
+        """名簿テキストを流し込む。split=True なら分かれていない行を分ける。
+
+        一覧をそのまま貼り込めるようにするためのもの。話者 ID は付かない。
+        """
+        rows = (suggest_roster_rows(text) if split
+                else [(sp.name, sp.note) for sp in parse_roster(text)])
+        self.clear()
+        for name, note in rows:
+            self.add_row("", name, note)
+        if not self.rows:
+            self.add_row()
+
+    def _relayout(self) -> None:
+        for i, row in enumerate(self.rows):
+            row["frame"].grid(row=i, column=0, sticky="ew", pady=1)
+
+    def auto_split(self) -> int:
+        """名前の欄に肩書ごと入っている行を、名前と役職に分ける**提案**。
+
+        **すでに役職が入っている行は触らない。**人が入れたものを
+        推測で上書きしない。戻り値は分けた行数。
+        """
+        names = [r["name"].get().strip() for r in self.rows]
+        done = 0
+        for i, row in enumerate(self.rows):
+            if row["note"].get().strip():
+                continue
+            others = [n for j, n in enumerate(names) if j != i and n]
+            name, note = suggest_split(names[i], others)
+            if note:
+                row["name"].set(name)
+                row["note"].set(note)
+                done += 1
+        return done
+
+    def values(self) -> list[tuple[str, str, str]]:
+        """(話者 ID, 名前, 企業・役職) の並び。名前が空の行は数えない。"""
+        out: list[tuple[str, str, str]] = []
+        for row in self.rows:
+            name = row["name"].get().strip()
+            if name:
+                out.append((row["sid"], name, row["note"].get().strip()))
+        return out
+
+    def to_text(self) -> str:
+        """1 行 1 人の「名前(役職)」形式。設定の保存と転写経路に渡す形。"""
+        return roster_to_text(
+            [Speaker(id=sid or f"sp{i + 1:02d}", name=name, note=note, order=i)
+             for i, (sid, name, note) in enumerate(self.values())])
+
+    def set_enabled(self, on: bool) -> None:
+        state = "normal" if on else "disabled"
+        for row in self.rows:
+            for w in row["frame"].winfo_children():
+                try:
+                    w.configure(state=state)
+                except tk.TclError:
+                    pass
+
+
+class RosterDialog(tk.Toplevel):
+    """名簿を直す小窓。中身は RosterTable(設計書 §11.8)。"""
 
     def __init__(self, parent: tk.Misc, speakers: Sequence[Speaker]) -> None:
         super().__init__(parent)
@@ -286,24 +403,24 @@ class RosterDialog(tk.Toplevel):
         self.rowconfigure(2, weight=1)
 
         self.result: Optional[list[tuple[str, str, str]]] = None
-        self.rows: list[dict] = []
 
         ttk.Label(
             self,
-            text="名前と、企業・役職を分けて入れてください。\n"
-                 "本文の【 】に何を出すかは、出力のときに選べます"
-                 "(名前だけ / 役職も付ける)。出席者一覧には常に両方が載ります。\n"
-                 "上から順に並ぶので、よく発言する人を上に置くと"
-                 "最初の候補順が良くなります。",
+            text=("名前と、企業・役職を分けて入れてください。" + chr(10)
+                  + "本文の【 】に何を出すかは、出力のときに選べます"
+                  + "(名前だけ / 役職も付ける)。出席者一覧には常に両方が載ります。"
+                  + chr(10)
+                  + "上から順に並ぶので、よく発言する人を上に置くと"
+                  + "最初の候補順が良くなります。"),
             foreground="#555", justify="left",
         ).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 6))
 
         head = ttk.Frame(self)
         head.grid(row=1, column=0, sticky="w", padx=12)
-        ttk.Label(head, text="名前", font=("", 9, "bold"), width=self.NAME_WIDTH)\
-            .grid(row=0, column=0, sticky="w")
-        ttk.Label(head, text="企業・役職", font=("", 9, "bold"))\
-            .grid(row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(head, text="名前", font=("", 9, "bold"),
+                  width=RosterTable.NAME_WIDTH).grid(row=0, column=0, sticky="w")
+        ttk.Label(head, text="企業・役職", font=("", 9, "bold")).grid(
+            row=0, column=1, sticky="w", padx=(6, 0))
 
         outer = ttk.Frame(self)
         outer.grid(row=2, column=0, sticky="nsew", padx=12)
@@ -314,9 +431,9 @@ class RosterDialog(tk.Toplevel):
         sb = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.canvas.configure(yscrollcommand=sb.set)
-        self.body = ttk.Frame(self.canvas)
-        item = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
-        self.body.bind(
+        self.table = RosterTable(self.canvas)
+        item = self.canvas.create_window((0, 0), window=self.table, anchor="nw")
+        self.table.bind(
             "<Configure>",
             lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind(
@@ -329,104 +446,51 @@ class RosterDialog(tk.Toplevel):
             lambda e: self.canvas.bind_all("<MouseWheel>", self._on_wheel))
         self.canvas.bind(
             "<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
-
-        for sp in speakers:
-            self.add_row(sp.id, sp.name, sp.note)
-        if not self.rows:
-            self.add_row()
+        self.table.set_speakers(speakers)
 
         tools = ttk.Frame(self)
         tools.grid(row=3, column=0, sticky="w", padx=12, pady=(8, 0))
-        ttk.Button(tools, text="行を足す", command=lambda: self.add_row())\
-            .pack(side="left")
-        self.btn_split = ttk.Button(
-            tools, text="名前と役職に自動で分ける", command=self.auto_split)
-        self.btn_split.pack(side="left", padx=6)
+        ttk.Button(tools, text="行を足す",
+                   command=lambda: self.table.add_row(focus=True)).pack(side="left")
+        ttk.Button(tools, text="名前と役職に自動で分ける",
+                   command=self.auto_split).pack(side="left", padx=6)
         self.var_note = tk.StringVar(value="")
-        ttk.Label(tools, textvariable=self.var_note, foreground="#555")\
-            .pack(side="left", padx=6)
+        ttk.Label(tools, textvariable=self.var_note, foreground="#555").pack(
+            side="left", padx=6)
 
         btns = ttk.Frame(self)
         btns.grid(row=4, column=0, sticky="ew", padx=12, pady=12)
-        self.btn_ok = ttk.Button(btns, text="OK", command=self._ok)
-        self.btn_ok.pack(side="right")
-        ttk.Button(btns, text="キャンセル", command=self._cancel)\
-            .pack(side="right", padx=6)
+        ttk.Button(btns, text="OK", command=self._ok).pack(side="right")
+        ttk.Button(btns, text="キャンセル", command=self._cancel).pack(
+            side="right", padx=6)
         self.bind("<Escape>", lambda e: self._cancel())
         self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    @property
+    def rows(self) -> list[dict]:
+        return self.table.rows
+
+    def add_row(self, *a, **k) -> dict:
+        return self.table.add_row(*a, **k)
+
+    def del_row(self, row: dict) -> None:
+        self.table.del_row(row)
+
+    def values(self) -> list[tuple[str, str, str]]:
+        return self.table.values()
+
+    def auto_split(self) -> int:
+        done = self.table.auto_split()
+        self.var_note.set(
+            f"{done} 人を分けました。外れたものは直してください。" if done
+            else "分けられる行がありませんでした。")
+        return done
 
     def _on_wheel(self, event) -> None:
         try:
             self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
         except tk.TclError:
             pass
-
-    def add_row(self, sid: str = "", name: str = "", note: str = "") -> dict:
-        """1 人ぶんの行を足す。sid が空なら新しい人。"""
-        frm = ttk.Frame(self.body)
-        var_name = tk.StringVar(value=name)
-        var_note = tk.StringVar(value=note)
-        ent = ttk.Entry(frm, textvariable=var_name, width=self.NAME_WIDTH)
-        ent.grid(row=0, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=var_note, width=self.NOTE_WIDTH)\
-            .grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        frm.columnconfigure(1, weight=1)
-        row = {"sid": sid, "name": var_name, "note": var_note,
-               "frame": frm, "entry": ent}
-        ttk.Button(frm, text="×", width=3,
-                   command=lambda: self.del_row(row))\
-            .grid(row=0, column=2, padx=(6, 0))
-        self.rows.append(row)
-        self._relayout()
-        if not name:
-            ent.focus_set()
-        return row
-
-    def del_row(self, row: dict) -> None:
-        if row not in self.rows:
-            return
-        self.rows.remove(row)
-        row["frame"].destroy()
-        if not self.rows:
-            self.add_row()
-        self._relayout()
-
-    def _relayout(self) -> None:
-        for i, row in enumerate(self.rows):
-            row["frame"].grid(row=i, column=0, sticky="ew", pady=1)
-        self.body.columnconfigure(0, weight=1)
-
-    def auto_split(self) -> int:
-        """名前の欄に肩書ごと入っている行を、名前と役職に分ける**提案**。
-
-        **すでに役職が入っている行は触らない。**人が入れたものを
-        推測で上書きしない。戻り値は分けた行数。
-        """
-        names = [r["name"].get().strip() for r in self.rows]
-        done = 0
-        for i, row in enumerate(self.rows):
-            if row["note"].get().strip():
-                continue
-            raw = names[i]
-            others = [n for j, n in enumerate(names) if j != i and n]
-            name, note = suggest_split(raw, others)
-            if note:
-                row["name"].set(name)
-                row["note"].set(note)
-                done += 1
-        self.var_note.set(
-            f"{done} 人を分けました。外れたものは直してください。" if done
-            else "分けられる行がありませんでした。")
-        return done
-
-    def values(self) -> list[tuple[str, str, str]]:
-        """(話者 ID, 名前, 企業・役職) の並び。名前が空の行は数えない。"""
-        out: list[tuple[str, str, str]] = []
-        for row in self.rows:
-            name = row["name"].get().strip()
-            if name:
-                out.append((row["sid"], name, row["note"].get().strip()))
-        return out
 
     def _ok(self) -> None:
         if not self.values():

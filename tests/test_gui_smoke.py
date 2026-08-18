@@ -1585,6 +1585,49 @@ def run_main_window() -> int:
             check("送ればログ欄まで届く",
                   0 <= log_y < app._canvas.winfo_height())
 
+            # --- 名簿も 2 列の表(設計書 §11.8)---------------------------
+            # 文字起こし画面と割当画面で同じ部品を使う。**どちらも外部には
+            # 送らない**(分割は端末内の規則)。
+            app.tbl_roster.set_text(chr(10).join([
+                "三ツ林衆議院議員",
+                "山本学　文科省　高等教育局私学部参事官付 企画官",
+                "梅田茂(加茂暁星学園理事)"]))
+            app.update()
+            check("貼り込んだ一覧が行に分かれる", len(app.tbl_roster.rows) == 3)
+            check("貼り込んだ時点で名前と役職に分かれる",
+                  app.tbl_roster.rows[0]["name"].get() == "三ツ林"
+                  and app.tbl_roster.rows[0]["note"].get() == "衆議院議員")
+            check("すでに分かれている行はそのまま",
+                  app.tbl_roster.rows[2]["name"].get() == "梅田茂")
+            check("転写経路には「名前(役職)」の形で渡す",
+                  "三ツ林(衆議院議員)" in app._get_roster())
+            check("入れ子の括弧があっても往復する",
+                  "山本学" in app._get_roster())
+
+            # 往復しても壊れない(保存 → 読み直しに相当)
+            once = app._get_roster()
+            app.tbl_roster.set_text(once)
+            check("保存して読み直しても同じ", app._get_roster() == once)
+
+            app.tbl_roster.add_row(focus=False)
+            check("行を足せる", len(app.tbl_roster.rows) == 4)
+            check("名前が空の行は人として数えない",
+                  len(app.tbl_roster.values()) == 3)
+            app.tbl_roster.del_row(app.tbl_roster.rows[-1])
+            check("行を消せる", len(app.tbl_roster.rows) == 3)
+
+            app._split_roster()
+            check("分けるものが無ければそう言う",
+                  "ありません" in app.var_roster_note.get())
+            app.tbl_roster.set_enabled(False)
+            app.tbl_roster.set_enabled(True)
+            check("有効・無効を切り替えても落ちない",
+                  len(app.tbl_roster.values()) == 3)
+            # 後の検査は名簿が空である前提(空なら話者分離の人数を聞く)。
+            # ここで戻しておかないと、そちらが落ちる。
+            app.tbl_roster.set_text("")
+            check("空にできる", app._get_roster().strip() == "")
+
             # --- ホイールの行き先 ---------------------------------------
             # 窓がスクロールするようになると、設定欄の上でホイールを回す
             # 機会が増える。中身と窓が同時に動いたり、値が黙って変わったり
