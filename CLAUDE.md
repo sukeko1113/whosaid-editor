@@ -36,13 +36,14 @@ AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴�
 ## テスト
 
 - `pytest tests/` は命名規約の関係で GUI・結合テストを黙って skip する。
-  全チェック（約 540 項目）は必ず個別実行で確認する:
+  全チェック（約 780 項目）は必ず個別実行で確認する:
   - `python tests\test_core.py`
   - `python tests\test_anchor.py`
   - `python tests\test_inspection.py`
   - `python tests\test_pipeline_integration.py`
   - `python tests\test_gui_smoke.py`
   - `python tests\test_listen_order.py`
+  - `python tests\test_candidates.py`
 - 実モデル（faster-whisper）を使う確認は `python tests\test_align_integration.py`。
   CI 対象外で、SAPI 合成音声を作って align.py と local_asr.py の両方を見る。
 - 新設テストも、個別実行で全チェックが走る構成にすること。
