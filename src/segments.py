@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -636,7 +636,8 @@ class Project:
         return round(key, 3) in self.added_utterance_keys()
 
     def add_utterance(self, start: float, end: float, text: str,
-                      cluster: str = "") -> Segment:
+                      cluster: str = "", cut: Optional[int] = None,
+                      parent_orig: Optional[float] = None) -> Segment:
         """聞こえたのに本文に無い発話を、区間として足す（設計書 §2）。
 
         時刻と声のまとまりは機械（話者分離の turn）が用意し、本文は人が打つ。
@@ -678,6 +679,11 @@ class Project:
             "start": start,
             "end": end,
             "cluster": seg.cluster,
+            # **どの区間の本文の、どこに割り込んだか。**
+            # 区間は割らない(割ると直すときに元の本文を復元できない)。
+            # 代わりにここを覚えておき、Word に出すときだけ差し込む。
+            "cut": None if cut is None else int(cut),
+            "parent_orig": None if parent_orig is None else float(parent_orig),
         })
         return seg
 
@@ -844,8 +850,56 @@ def _merge_runs(
     merge_consecutive=True なら、同一話者の連続区間を 1 段落にまとめる。
     drop_noise=True なら「発言なし・雑音」と印を付けた区間は出力しない。
     """
-    runs: list[tuple[float, Optional[str], list[str]]] = []
+    # **人が足した発話は、割り込んだ位置で元の本文に差し込む。**
+    # 区間そのものは割らない(割ると、直すときに元の本文を復元できない)。
+    # 割り込み位置は add_utterance が edit_log に残している。
+    # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
+    # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
+    cuts: dict[float, list[tuple[int, float]]] = {}
+    for rec in proj.edit_log:
+        if rec.get("op") == "add_utterance" and rec.get("cut") is not None                 and rec.get("parent_orig") is not None:
+            cuts.setdefault(round(float(rec["parent_orig"]), 3), []).append(
+                (int(rec["cut"]), round(float(rec["orig_start"]), 3)))
+        elif rec.get("op") == "remove_added_utterance":
+            key = round(float(rec.get("orig_start", -1)), 3)
+            for lst in cuts.values():
+                lst[:] = [c for c in lst if c[1] != key]
+    added_by_key = {round(float(s.orig_start), 3): s
+                    for s in proj.segments if proj.is_added_utterance(s)}
+
+    def pieces(seg: Segment) -> list[Segment]:
+        """区間を、割り込みの位置で切った断片に分ける（出力のためだけ）。"""
+        marks = sorted(
+            (c for c in cuts.get(round(float(seg.orig_start), 3), [])
+             if c[1] in added_by_key),
+            key=lambda c: c[0])
+        if not marks:
+            return [seg]
+        out: list[Segment] = []
+        prev = 0
+        for cut, key in marks:
+            cut = max(0, min(len(seg.text), cut))
+            head = seg.text[prev:cut]
+            if head.strip():
+                out.append(replace(seg, text=head))
+            out.append(added_by_key[key])
+            prev = cut
+        tail = seg.text[prev:]
+        if tail.strip():
+            out.append(replace(seg, text=tail))
+        return out
+
+    ordered: list[Segment] = []
     for seg in proj.segments:
+        if proj.is_added_utterance(seg):
+            # 差し込み先で出すので、単独では出さない（先が無ければ出す）
+            key = round(float(seg.orig_start), 3)
+            if any(key in [k for _c, k in v] for v in cuts.values()):
+                continue
+        ordered.extend(pieces(seg))
+
+    runs: list[tuple[float, Optional[str], list[str]]] = []
+    for seg in ordered:
         text = seg.text.strip()
         if not text:
             continue

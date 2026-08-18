@@ -49,6 +49,7 @@ from src.transcribe import (  # noqa: E402
 from src.align import AlignUnavailable  # noqa: E402
 from src import diarize, evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
+from src.segments import _merge_runs  # noqa: E402
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
     Utterance,
@@ -1032,6 +1033,89 @@ def test_add_utterance_records_the_key_in_edit_log():
     assert proj.added_utterance_keys() == {round(seg.orig_start, 3)}
     assert proj.is_added_utterance(seg) is True
     assert proj.is_added_utterance(proj.segments[0]) is False
+
+
+def _base_for_insert() -> Project:
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("西村" + chr(10) + "山本")
+    proj.segments = [
+        Segment(index=0, start=90.0, end=100.0, text="前の発言", cluster="g:A"),
+        Segment(index=1, start=100.0, end=110.0,
+                text="ながらけれどもそれで", cluster="g:B",
+                speaker_id="sp01", reviewed=True),
+        Segment(index=2, start=110.0, end=120.0, text="次の発言", cluster="g:C"),
+    ]
+    return proj
+
+
+def _add_at(proj, base, cut, at, text, sid=None):
+    seg = proj.add_utterance(at, at + 0.6, text, "g:D",
+                             cut=cut, parent_orig=base.orig_start)
+    seg.speaker_id = sid
+    seg.reviewed = bool(sid)
+    return seg
+
+
+def test_added_utterance_records_where_it_cut_in():
+    """**どの区間の本文の、どこに割り込んだかを残す。**
+
+    区間は割らない(割ると、直すときに元の本文を復元できない)。
+    代わりにこれを覚えておき、Word に出すときだけ差し込む。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    rec = [r for r in proj.edit_log if r.get("op") == "add_utterance"][0]
+    assert rec["cut"] == 3
+    assert rec["parent_orig"] == base.orig_start
+    # 元の区間はそのまま（割れていない）
+    assert proj.segments[1].text == "ながらけれどもそれで"
+
+
+def test_word_output_puts_the_added_one_inside_the_text():
+    """**Word 出力が読んだとおりの順になる。**これが cut を残す理由そのもの。
+
+    割り込み位置で本文を切り、その間に足した発話を挟む。やらないと
+    「長い発言 → 相づち」の順になり、しかも同じ話者の相づちが 1 段落に
+    まとまる（実機で「あ、はいはいはいええはいはい」になった）。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    _add_at(proj, base, 7, 107.0, "ええ", "sp02")
+    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    assert "ながら" in bodies, bodies
+    assert "はい" in bodies and "ええ" in bodies, bodies
+    assert "はいええ" not in "".join(bodies), "相づちがひとまとまりになっている"
+    # 元の話者の断片が、相づちを挟んで前後に出る
+    assert bodies.index("はい") == bodies.index("ながら") + 1
+    assert bodies.index("ええ") > bodies.index("はい")
+
+
+def test_word_output_does_not_duplicate_the_added_one():
+    """差し込んだものを、単独でももう一度出さない。"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    assert sum(1 for b in bodies if b == "はい") == 1, bodies
+
+
+def test_word_output_keeps_added_ones_without_a_cut():
+    """位置を持たない足し方（データ層の直呼び）でも消えない。"""
+    proj = _base_for_insert()
+    proj.add_utterance(103.0, 103.6, "うん", "g:D")
+    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    assert "うん" in "".join(bodies)
+
+
+def test_word_output_forgets_removed_ones():
+    """消した発話は差し込まれない。"""
+    proj = _base_for_insert()
+    added = _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    proj.remove_added_utterance(added.index)
+    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    assert "はい" not in "".join(bodies)
+    assert "ながらけれどもそれで" in bodies, bodies
 
 
 def test_remove_added_utterance_only_removes_added_ones():

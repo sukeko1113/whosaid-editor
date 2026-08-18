@@ -324,12 +324,16 @@ class AssignWindow(tk.Toplevel):
         self._row_ids: list[str] = []
 
         self.title(f"話者の割当 - {Path(self.proj.audio_path).name}")
-        # 右ペインのボタン列が収まる幅にする。**既定で全部見えること**
-        # ——窓を広げないと押せないボタンがあった(実機の指摘・2026-08-18)。
-        self.geometry("1320x800")
-        # 1320 で右ペインが 587px になり、いちばん広い行(571px)が収まる。
-        # 最小もそこに合わせる——下回るとまたボタンが切れる。
-        self.minsize(1320, 660)
+        # **既定で全部見えること。**窓を広げないと押せないボタンがあり、
+        # 高さも足りずに下の［保存］が隠れていた(実機の指摘・2026-08-18)。
+        #   幅 1320 … 右ペインのいちばん広い行(571px)が収まる
+        #   高さ 900 … 中身が 845px まであり、800 では下端が窓の縁に接する
+        # ただし画面より大きくはしない(小さい画面では入るところまで)。
+        want_w, want_h = 1320, 900
+        scr_w = self.winfo_screenwidth()
+        scr_h = self.winfo_screenheight()
+        self.geometry(f"{min(want_w, scr_w - 40)}x{min(want_h, scr_h - 90)}")
+        self.minsize(min(1180, scr_w - 40), min(700, scr_h - 90))
 
         self.var_speed = tk.StringVar(value="1.0x")
         self.var_autoplay = tk.BooleanVar(value=True)
@@ -1566,13 +1570,18 @@ class AssignWindow(tk.Toplevel):
                 self.proj.remove_added_utterance(index)
             except ValueError:
                 pass
-        # **1 回の小窓で何件でも受ける**(区間に相づちが 3 つあることは普通)。
+        # **区間は割らない。**割ると、直すときに元の本文を復元できなくなる。
+        # 代わりに「本文のどこに割り込んだか」(cut)を残し、Word に出すときだけ
+        # 差し込む(設計書 §5.0.5)。
         first = None
-        for start, end, text, cluster, sid in got:
-            added = self.proj.add_utterance(start, end, text, cluster)
-            if sid:
+        for it in got:
+            added = self.proj.add_utterance(
+                float(it.get("at", it.get("start", 0.0))), float(it["end"]),
+                it["text"], it.get("cluster") or "",
+                cut=it.get("cut"), parent_orig=seg.orig_start)
+            if it.get("sid"):
                 # **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
-                added.speaker_id = sid
+                added.speaker_id = it["sid"]
                 added.reviewed = True
             self._remap_undo_for_split(added.index)
             if first is None:
@@ -3134,8 +3143,9 @@ class AddUtteranceDialog(tk.Toplevel):
             return
         # **空にして押した場合は「全部消す」。**開いたときに既にあったなら、
         # それを消したいという意思なので通す。
-        self.result = [(it["at"], it["end"], it["text"], it["cluster"],
-                        it["sid"]) for it in self._items]
+        # **cut(本文の位置)も返す。**これが無いと、どこで区間を割るかが
+        # 決まらず、Word の並びが「長い発言 → 相づち」のままになる。
+        self.result = [dict(it) for it in self._items]
         self.applied = True
         self._close()
 

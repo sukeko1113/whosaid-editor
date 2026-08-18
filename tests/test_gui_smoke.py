@@ -975,7 +975,8 @@ def run() -> int:
         # 小窓は差し替える(開くと応答待ちで止まる)
         real_ask_utt = awin._ask_utterance
         awin._ask_utterance = lambda seg, turns, existing=None: (
-            [(14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)], True)
+            [{"cut": 2, "at": 14.0, "end": 14.6, "text": "はいはい",
+              "cluster": "g:B", "sid": ap.speakers[0].id}], True)
         try:
             awin.goto(1)
             awin.add_utterance()
@@ -1023,6 +1024,15 @@ def run() -> int:
               <= _have)
         check("行を分けてある（1 行に詰めない）", len(_rows) >= 4)
 
+        # 高さ: **画面より大きくしない**(はみ出すと下の［保存］が画面外に出る)
+        check("窓が画面からはみ出さない",
+              awin.winfo_width() <= awin.winfo_screenwidth()
+              and awin.winfo_height() <= awin.winfo_screenheight())
+        _bottom_bar = awin.winfo_children()[-1]
+        check("いちばん下の帯（保存など）が窓の中にある",
+              _bottom_bar.winfo_y() + _bottom_bar.winfo_height()
+              <= awin.winfo_height())
+
         # --- 本文欄の書き戻しは、読み込んだ区間にだけ効く ----------------
         # current を直接動かした直後に _commit_text が呼ばれると、**別の区間へ
         # 前の本文を上書きしていた**(この検査を書いていて見つかった)。
@@ -1054,7 +1064,8 @@ def run() -> int:
         base = next(s for s in ap.segments if s.text == "発言 1。")
         # まず 1 件足す
         awin._ask_utterance = lambda seg, turns, existing=None: (
-            [(14.0, 14.6, "もとの", "g:B", None)], True)
+            [{"cut": 2, "at": 14.0, "end": 14.6, "text": "もとの",
+              "cluster": "g:B", "sid": None}], True)
         awin.goto(base.index)
         awin.add_utterance()
         check("下ごしらえ: 1 件入った",
@@ -1064,7 +1075,8 @@ def run() -> int:
         seen: list = []
         awin._ask_utterance = lambda seg, turns, existing=None: (
             seen.append(list(existing or [])),
-            ([(14.0, 14.6, "なおした", "g:B", None)], True))[1]
+            ([{"cut": 2, "at": 14.0, "end": 14.6, "text": "なおした",
+               "cluster": "g:B", "sid": None}], True))[1]
         base = next(s for s in ap.segments if s.text == "発言 1。")
         awin.goto(base.index)
         awin.add_utterance()
@@ -1088,7 +1100,8 @@ def run() -> int:
 
         # やめた場合は何も変えない
         awin._ask_utterance = lambda seg, turns, existing=None: (
-            [(14.0, 14.6, "入れない", "g:B", None)], False)
+            [{"cut": 2, "at": 14.0, "end": 14.6, "text": "入れない",
+              "cluster": "g:B", "sid": None}], False)
         n_before = len(ap.segments)
         awin.goto(base.index)
         awin.add_utterance()
@@ -1099,7 +1112,8 @@ def run() -> int:
 
         # 話者を選ばなかった場合は ✓ を立てない
         awin._ask_utterance = lambda seg, turns, existing=None: (
-            [(24.0, 24.6, "うん", "g:C", None)], True)
+            [{"cut": 2, "at": 24.0, "end": 24.6, "text": "うん",
+              "cluster": "g:C", "sid": None}], True)
         try:
             awin.goto(2)
             awin.add_utterance()
@@ -1226,7 +1240,9 @@ def run() -> int:
         dlg._ok()
         check("まとめて複数件返す", len(dlg.result) == 2)
         check("打ちかけの 1 件も拾う",
-              any(r[2] == "ええ" for r in dlg.result))
+              any(r["text"] == "ええ" for r in dlg.result))
+        check("本文のどこかを返す（区間を割る位置になる）",
+              all("cut" in r for r in dlg.result))
 
 
         # --- 時刻へ飛ぶ（2026-08-18 の指摘への対応）----------------------
