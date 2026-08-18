@@ -618,6 +618,66 @@ def _raise_unavailable(*a, **k):
     raise pipeline.diarize_mod.DiarizeUnavailable("モデルがありません(検査用)")
 
 
+def run_speaker_merge() -> int:
+    """名簿の突き合わせ(設計書 §11.8)。**同じ人が 2 つの ID になるのを防ぐ。**
+
+    実データで 8 組できた(2026-08-18)。文字起こし画面で名簿を「名前」と
+    「企業・役職」に分けてから走らせると、名前だけの照合では別人と判断され、
+    さらに「消えた人も保持する」規則で古い方も残っていた。
+    """
+    from src.segments import Speaker
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print(chr(10) + "[名簿の突き合わせ]")
+    br = chr(10)
+
+    old = [Speaker(id="sp01", name="三ツ林衆議院議員"),
+           Speaker(id="sp02", name="山本学　文科省　高等教育局"),
+           Speaker(id="sp03", name="西村香介")]
+    got = pipeline._merge_speakers(
+        list(old),
+        br.join(["三ツ林(衆議院議員)", "山本学(文科省 高等教育局)", "西村香介"]))
+    check("分けても人数が増えない", len(got) == 3)
+    check("**同じ人の ID を保つ**",
+          [sp.id for sp in got] == ["sp01", "sp02", "sp03"])
+    check("名前が短くなる", got[0].name == "三ツ林" and got[1].name == "山本学")
+    check("役職が別に入る", got[0].note == "衆議院議員")
+    check("空白の違いは無視する", got[1].note.replace(" ", "") .replace(
+        chr(12288), "") == "文科省高等教育局")
+
+    # 名前だけ一致するほうを先に見る(役職を書き換えただけの人を取り違えない)
+    old2 = [Speaker(id="sp01", name="佐藤", note="理事"),
+            Speaker(id="sp02", name="佐藤理事")]
+    got2 = pipeline._merge_speakers(
+        list(old2), br.join(["佐藤(理事)", "佐藤理事"]))
+    check("名前が一致するほうを先に当てる",
+          [sp.id for sp in got2] == ["sp01", "sp02"])
+
+    # 本当に別人なら、これまでどおり新しい ID を振る
+    got3 = pipeline._merge_speakers(
+        [Speaker(id="sp01", name="佐藤")], br.join(["佐藤", "田中"]))
+    check("本当に新しい人には新しい ID", len(got3) == 2
+          and got3[1].id != "sp01")
+
+    # 名簿から消えた人は、割当が残っているかもしれないので保持する(従来どおり)
+    got4 = pipeline._merge_speakers(
+        [Speaker(id="sp01", name="佐藤"), Speaker(id="sp02", name="田中")],
+        "佐藤")
+    check("名簿から外しても消さない",
+          [sp.id for sp in got4] == ["sp01", "sp02"])
+
+    check("ID が重複しない", len({sp.id for sp in got}) == len(got))
+
+    print(chr(10) + ('FAILED: ' + ', '.join(failures)
+                     if failures else 'ALL PASSED'))
+    return 1 if failures else 0
+
+
 def run_local() -> int:
     if not shutil.which("ffmpeg"):
         print("SKIPPED: ffmpeg が無いのでローカル経路の検査は実行されていません。")
@@ -928,4 +988,5 @@ if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_cloud = run()
     rc_local = run_local()
-    sys.exit(rc_cloud or rc_local)
+    rc_merge = run_speaker_merge()
+    sys.exit(rc_cloud or rc_local or rc_merge)

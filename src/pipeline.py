@@ -6,6 +6,7 @@ GUI から別スレッドで run_pipeline() を呼ぶ想定。
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -341,6 +342,11 @@ def _is_same_audio(old: Project, fingerprint: str, duration: float) -> bool:
     return True     # どちらも判定材料が無いときは従来どおり引き継ぐ
 
 
+def _flat_name(name: str, note: str) -> str:
+    """氏名と役職をつないで、空白を取り除いた形。同一人物の判定に使う。"""
+    return re.sub(r"\s", "", (name or "") + (note or ""))
+
+
 def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
     """既存の話者 ID を保ったまま、名簿テキストの内容を反映する。
 
@@ -352,17 +358,29 @@ def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
     if not wanted:
         return list(old_speakers)
 
-    remaining: dict[str, list[Speaker]] = {}
-    for sp in old_speakers:
-        remaining.setdefault(sp.name, []).append(sp)
-
+    remaining: list[Speaker] = list(old_speakers)
     used_ids = {sp.id for sp in old_speakers}
     result: list[Speaker] = []
 
+    def take(match) -> Optional[Speaker]:
+        """条件に合う人を 1 人だけ取り出す(同名が複数いても 1 人ずつ対応付ける)"""
+        for i, sp in enumerate(remaining):
+            if match(sp):
+                return remaining.pop(i)
+        return None
+
     for w in wanted:
-        pool = remaining.get(w.name)
-        if pool:
-            src = pool.pop(0)                  # 同名が複数いても 1 人ずつ対応付ける
+        src = take(lambda sp: sp.name == w.name)
+        if src is None:
+            # **名前が変わっていても、名前＋役職をつないだ形が同じなら同じ人。**
+            # 「三ツ林衆議院議員」を「三ツ林」と「衆議院議員」に分けたときが
+            # これ。名前だけで照合していたため、分けると別人が増えたうえに
+            # 古い方も残り、**同じ人が 2 つの ID になった**(実データで 8 組・
+            # 2026-08-18)。空白は無視して比べる(分けるときに空白が消える)。
+            key = _flat_name(w.name, w.note)
+            src = take(lambda sp: _flat_name(sp.name, sp.note) == key)
+        if src is not None:
+            src.name = w.name
             src.note = w.note or src.note
             result.append(src)
         else:
@@ -374,8 +392,7 @@ def _merge_speakers(old_speakers: list[Speaker], roster: str) -> list[Speaker]:
             result.append(Speaker(id=sid, name=w.name, note=w.note))
 
     # 名簿から消えた人も、割当が残っているかもしれないので保持する
-    for pool in remaining.values():
-        result.extend(pool)
+    result.extend(remaining)
 
     for i, sp in enumerate(result):
         sp.order = i
