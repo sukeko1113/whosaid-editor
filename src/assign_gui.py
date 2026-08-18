@@ -2669,6 +2669,9 @@ class AddUtteranceDialog(tk.Toplevel):
         self.txt.bind("<ButtonRelease-1>", self._on_move)
         self.txt.bind("<KeyRelease>", self._on_move)
         self.txt.tag_configure("here", background="#FFE082")
+        # 鳴っている位置。挿入位置(here)とは別の色にする
+        self.txt.tag_configure("playing", background="#B3E5FC")
+        self._follow_job = None
 
         self.var_where = tk.StringVar()
         ttk.Label(box, textvariable=self.var_where, foreground="#666",
@@ -2699,8 +2702,12 @@ class AddUtteranceDialog(tk.Toplevel):
         # --- ④ 聴く（速さ・一時停止）------------------------------------
         play = ttk.LabelFrame(self, text="聴く")
         play.grid(row=5, column=0, sticky="ew", padx=12, pady=(8, 2))
-        ttk.Button(play, text="▶ この辺を聴く", takefocus=False,
-                   command=self._play).pack(side="left", padx=(8, 4), pady=6)
+        # **まず全部聴けること。**位置を決めるために聴きたいのに、位置を
+        # 決めないと聴けないのでは順序が逆(実機の指摘・2026-08-18)。
+        ttk.Button(play, text="▶ 全部聴く", takefocus=False,
+                   command=self._play_all).pack(side="left", padx=(8, 4), pady=6)
+        ttk.Button(play, text="▶ この辺だけ", takefocus=False,
+                   command=self._play).pack(side="left", padx=4)
         self.btn_pause = ttk.Button(play, text="⏸ 一時停止", takefocus=False,
                                     command=self._toggle_pause)
         self.btn_pause.pack(side="left", padx=4)
@@ -2821,25 +2828,85 @@ class AddUtteranceDialog(tk.Toplevel):
         return f"{self.seg.chunk}:{PSEUDO_UNKNOWN}"
 
     # ------------------------------------------------------------------
+    def _speed(self) -> float:
+        try:
+            return float(self.var_speed.get().rstrip("x"))
+        except ValueError:
+            return 1.0
+
+    def _play_all(self) -> None:
+        """区間を頭から終わりまで鳴らす。**相づちの場所を探すための再生。**
+
+        鳴らしながら本文の現在位置を光らせるので、聞こえた瞬間にその辺りを
+        クリックできる。位置は経過時間からの推定（ffplay は再生位置を
+        問い合わせられない）。数十ミリ秒の誤差は、この用途では問題にならない。
+        """
+        self.win.player.play(self.win.proj.audio_path,
+                             self.seg.start, self.seg.end,
+                             speed=self._speed(), pre_roll=0.0, post_roll=0.0)
+        self.btn_pause.configure(text="⏸ 一時停止")
+        self._follow(self.seg.start, self.seg.end)
+
+    def _follow(self, a: float, b: float) -> None:
+        """鳴っている位置を本文の上で追う。"""
+        self._stop_follow()
+        self._follow_span = (a, b)
+        self._tick()
+
+    def _stop_follow(self) -> None:
+        if getattr(self, "_follow_job", None) is not None:
+            try:
+                self.after_cancel(self._follow_job)
+            except tk.TclError:
+                pass
+        self._follow_job = None
+        self.txt.tag_remove("playing", "1.0", "end")
+
+    def _tick(self) -> None:
+        p = self.win.player
+        cur = getattr(p, "_cur", None)
+        text = self.seg.text or ""
+        span = max(1e-6, self.seg.end - self.seg.start)
+        if cur is None or not p.is_playing() or not text:
+            self._stop_follow()
+            return
+        import time as _t
+        played = (_t.monotonic() - cur["since"]) * float(cur["speed"] or 1.0)
+        at = cur["ss"] + played
+        pos = int(len(text) * (at - self.seg.start) / span)
+        pos = max(0, min(len(text) - 1, pos))
+        self.txt.tag_remove("playing", "1.0", "end")
+        self.txt.tag_add("playing", f"1.0 + {pos} chars", f"1.0 + {pos + 1} chars")
+        self.txt.see(f"1.0 + {pos} chars")
+        self._follow_job = self.after(120, self._tick)
+
     def _play(self) -> None:
         a, b = self._span()
         try:
             around = float(self.var_around.get())
         except ValueError:
             around = 1.5
-        speed = float(self.var_speed.get().rstrip("x"))
-        self.win.player.play(self.win.proj.audio_path,
-                             max(0.0, a - around), b + around,
-                             speed=speed, pre_roll=0.0, post_roll=0.0)
+        lo, hi = max(0.0, a - around), b + around
+        self.win.player.play(self.win.proj.audio_path, lo, hi,
+                             speed=self._speed(), pre_roll=0.0, post_roll=0.0)
         self.btn_pause.configure(text="⏸ 一時停止")
+        self._follow(lo, hi)
 
     def _toggle_pause(self) -> None:
         p = self.win.player
         if p.is_paused():
             p.resume()
             self.btn_pause.configure(text="⏸ 一時停止")
+            if getattr(self, "_follow_span", None):
+                self._follow(*self._follow_span)
         elif p.pause():
             self.btn_pause.configure(text="▶ 続きから")
+            if self._follow_job is not None:
+                try:
+                    self.after_cancel(self._follow_job)
+                except tk.TclError:
+                    pass
+                self._follow_job = None   # 印は残す(どこで止めたか見える)
 
     def _ok(self) -> None:
         text = self.var_text.get().strip()
@@ -2857,6 +2924,7 @@ class AddUtteranceDialog(tk.Toplevel):
         self._close()
 
     def _close(self) -> None:
+        self._stop_follow()
         self.win.player.stop()
         self.grab_release()
         self.destroy()

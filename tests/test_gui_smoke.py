@@ -1063,6 +1063,29 @@ def run() -> int:
         dlg._on_move()
         check("本文を動かすと候補合わせが外れる", dlg.cmb_turn.current() == 0)
 
+        # 全部聴く（位置を決めるために、まず全体を聴けること）
+        check("全部聴く手段がある", hasattr(dlg, "_play_all"))
+        played: list = []
+        real_play = awin.player.play
+        awin.player.play = lambda *a4, **k4: played.append((a4, k4))
+        try:
+            dlg._play_all()
+            check("全部聴くは区間の頭から終わりまで",
+                  played and played[-1][0][1] == 100.0
+                  and played[-1][0][2] == 110.0)
+            played.clear()
+            dlg.txt.mark_set("insert", "1.0 + 5 chars")
+            dlg._on_move()
+            dlg._play()
+            check("この辺だけは挿入位置の周りだけ",
+                  played and played[-1][0][2] - played[-1][0][1] < 6.0)
+            check("速さが再生に渡る",
+                  played[-1][1].get("speed") == float(
+                      dlg.var_speed.get().rstrip("x")))
+        finally:
+            awin.player.play = real_play
+            dlg._stop_follow()
+
         # 速さ・一時停止
         check("小窓で 0.5 倍が選べる", "0.5x" in assign_gui.DIALOG_SPEEDS)
         check("一時停止のボタンがある", dlg.btn_pause is not None)
