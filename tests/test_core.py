@@ -51,6 +51,7 @@ from src import diarize, evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
+    short_labels, Speaker,
     INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1200,6 +1201,54 @@ def test_both_styles_agree_on_what_was_said():
             joined = joined.replace(ch, "")
         return joined
     assert words(INSERT_STYLE_LINE) == words(INSERT_STYLE_INLINE)
+
+
+def test_short_label_cuts_at_the_first_space():
+    """**長い肩書に相づちが埋もれるのを避ける(設計書 §11.7)。**
+
+    実データで、6 字の相づちが 40 字の肩書に埋もれた。
+    """
+    sps = parse_roster(chr(10).join(
+        ["山本学　文科省 高等教育局私学部参事官付 企画官", "西村香介"]))
+    got = short_labels(sps)
+    assert got[sps[0].id] == "山本学", got
+    assert got[sps[1].id] == "西村香介", "空白が無ければそのまま"
+
+
+def test_short_label_keeps_the_full_name_when_it_would_collide():
+    """**短くしてかぶるなら短くしない。**取り違えは読みやすさより重い。"""
+    sps = [Speaker(id="a", name="山本 学"), Speaker(id="b", name="山本 花子")]
+    got = short_labels(sps)
+    assert got["a"] == "山本 学" and got["b"] == "山本 花子", got
+
+
+def test_short_label_avoids_colliding_with_someone_elses_full_name():
+    """「山本」と「山本学　…」が並ぶとき、短くすると別人と読める。"""
+    sps = [Speaker(id="a", name="山本学　文科省"), Speaker(id="b", name="山本学")]
+    got = short_labels(sps)
+    assert got["a"] == "山本学　文科省", got
+
+
+def test_short_label_only_affects_the_inline_form():
+    """**記録は書き換えない。**【 】と出席者一覧は全名のまま。"""
+    proj = _base_for_insert()
+    proj.speakers[0].name = "佐藤　△△株式会社　代表取締役"
+    proj.speakers[1].name = "山本　□□省　企画官"
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+
+    inline = _merge_runs(proj, True, True, INSERT_STYLE_INLINE)
+    assert "(山本：はい)" in "".join(r[2] for r in inline)
+
+    # 行を分ける形では短くしない（そこは話者そのものの表示なので）
+    line = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    sid = proj.speakers[1].id
+    assert any(r[1] == sid and r[2] == "はい" for r in line), line
+    assert proj.speakers[1].name == "山本　□□省　企画官", "名簿を書き換えている"
+
+
+def test_inline_legend_says_the_name_is_abbreviated():
+    """略記だと書いておかないと、受け取った人が別人と思う。"""
+    assert "略記" in INSERT_LEGEND[INSERT_STYLE_INLINE]
 
 
 def test_legend_only_when_something_was_inserted():

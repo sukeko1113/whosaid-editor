@@ -43,7 +43,8 @@ INSERT_LEGEND = {
         "間の行は、そこに重なって入った別の人の発言です。",
     INSERT_STYLE_INLINE:
         "表記について: 本文中の「(氏名：…)」は、その位置に重なって入った"
-        "別の人の発言です(BTSJ 3.2.3 に準拠)。",
+        "別の人の発言です(BTSJ 3.2.3 に準拠)。"
+        "氏名は冒頭の出席者一覧の略記です。",
 }
 
 # 特別扱いの話者 ID(名簿の人物ではない)
@@ -864,6 +865,42 @@ class Project:
 # Word 出力
 # ----------------------------------------------------------------------
 
+def short_labels(speakers: Sequence[Speaker]) -> dict[str, str]:
+    """話者 ID → 埋め込みで使う短い呼び名。
+
+    本文の中に「(氏名：はい)」の形で入れるとき、名前が長いと相づちが肩書に
+    埋もれる(実データで 6 字の相づちが 40 字の肩書に埋もれた・2026-08-18)。
+    そこで**最初の空白まで**を使う。「山本学　文科省 高等教育局…」→「山本学」。
+
+    **短くした結果が他の人とかぶるなら、その人は短くしない。**取り違えは
+    誰が言ったかの記録そのものを壊すので、読みやすさより優先する。
+    空白の無い名前も、切りようが無いのでそのまま。
+
+    記録を書き換えるわけではない(【 】のラベルと出席者一覧は全名のまま)。
+    根拠は設計書 §11.7。
+    """
+    cand: dict[str, str] = {}
+    for sp in speakers:
+        # \s は全角スペース(U+3000)も含む
+        head = re.split(r"\s", sp.name.strip(), maxsplit=1)[0].strip()
+        cand[sp.id] = head if head else sp.name
+    # 短くした形が 2 人以上でぶつかるなら、その人たちは全名に戻す
+    seen: dict[str, list[str]] = {}
+    for sid, short in cand.items():
+        seen.setdefault(short, []).append(sid)
+    full = {sp.id: sp.name for sp in speakers}
+    for short, ids in seen.items():
+        if len(ids) > 1:
+            for sid in ids:
+                cand[sid] = full[sid]
+    # 他人の全名とぶつかる場合も戻す(「山本」と「山本学」が並ぶ等)
+    names = set(full.values())
+    for sid, short in list(cand.items()):
+        if short != full[sid] and short in names:
+            cand[sid] = full[sid]
+    return cand
+
+
 def _insert_cuts(proj: Project) -> dict[float, list[tuple[int, float]]]:
     """「どの区間の、本文の何文字目に、どの追加発話が割り込んだか」を集める。
 
@@ -925,9 +962,14 @@ def _merge_runs(
              if c[1] in added_by_key),
             key=lambda c: c[0])
 
+    shorts = short_labels(proj.speakers) if inline else {}
+
     def label_of(seg: Segment) -> str:
+        """埋め込みで使う呼び名。長い肩書に相づちが埋もれるのを避ける。"""
         sp = proj.speaker(seg.speaker_id)
-        return sp.name if sp else UNKNOWN_LABEL
+        if not sp:
+            return UNKNOWN_LABEL
+        return shorts.get(sp.id, sp.name)
 
     def pieces(seg: Segment) -> list[tuple[Segment, bool, bool]]:
         """区間を割り込みの位置で切った断片に分ける(出力のためだけ)。
