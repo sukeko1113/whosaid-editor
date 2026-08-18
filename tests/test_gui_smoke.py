@@ -36,6 +36,7 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MIN_SECONDS,
     AssignWindow,
     ProposalDialog,
+    RosterDialog,
     ProposalRow,
     SplitDialog,
     clamp_times,
@@ -625,6 +626,77 @@ def run() -> int:
         # 空の名前の行は無視する(表に空行が残っていても落ちない)
         pl4 = plan_roster_rows(rp, [(nishimura, "西村香介", ""), ("", "  ", "")])
         check("空の行は人として数えない", len(pl4.speakers) == 1)
+
+        # --- 名簿を 2 列の表で編集する(設計書 §11.8)-----------------------
+        rd = RosterDialog(root, parse_roster(chr(10).join([
+            "三ツ林衆議院議員", "山本学　文科省　高等教育局私学部参事官付 企画官",
+            "梅田茂(加茂暁星学園理事)"])))
+        rd.withdraw()
+        rd.update()
+        check("既存の出席者が行に入る", len(rd.rows) == 3)
+        check("名前と役職が別の欄に入る",
+              rd.rows[2]["name"].get() == "梅田茂"
+              and rd.rows[2]["note"].get() == "加茂暁星学園理事")
+        check("行は話者 ID を覚えている",
+              all(r["sid"] for r in rd.rows))
+        scr_w = rd.winfo_screenwidth()
+        scr_h = rd.winfo_screenheight()
+        geo = rd.geometry().split("+")[0].split("x")
+        check("窓が画面に収まる",
+              int(geo[0]) <= scr_w - 40 and int(geo[1]) <= scr_h - 90)
+
+        # 自動で分ける
+        n = rd.auto_split()
+        check("肩書ごと入っている行を分ける", n == 2)
+        check("役職語で切る", rd.rows[0]["name"].get() == "三ツ林"
+              and rd.rows[0]["note"].get() == "衆議院議員")
+        check("空白で切る", rd.rows[1]["name"].get() == "山本学"
+              and rd.rows[1]["note"].get().startswith("文科省"))
+        check("**すでに役職が入っている行は触らない**",
+              rd.rows[2]["name"].get() == "梅田茂"
+              and rd.rows[2]["note"].get() == "加茂暁星学園理事")
+        check("何人分けたか知らせる", "2 人" in rd.var_note.get())
+
+        # 行を足す・消す
+        added_row = rd.add_row()
+        check("行を足せる", len(rd.rows) == 4)
+        check("足した行は新しい人(ID が空)", added_row["sid"] == "")
+        check("名前が空の行は人として数えない", len(rd.values()) == 3)
+        added_row["name"].set("新人")
+        check("名前を入れれば数える", len(rd.values()) == 4)
+        rd.del_row(added_row)
+        check("行を消せる", len(rd.rows) == 3)
+
+        vals = rd.values()
+        check("(ID, 名前, 役職) の形で返す",
+              len(vals[0]) == 3 and vals[0][1] == "三ツ林")
+
+        # 確定・取り消し
+        rd._ok()
+        check("OK で中身を返す", rd.result is not None and len(rd.result) == 3)
+
+        rd2 = RosterDialog(root, parse_roster("佐藤"))
+        rd2.withdraw()
+        rd2.update()
+        rd2._cancel()
+        check("キャンセルなら何も返さない", rd2.result is None)
+
+        rd3 = RosterDialog(root, [])
+        rd3.withdraw()
+        rd3.update()
+        check("出席者がいなくても空の行が 1 つ出る", len(rd3.rows) == 1)
+        warned3: list = []
+        real_w3 = assign_gui.messagebox.showwarning
+        assign_gui.messagebox.showwarning = lambda *a, **k: warned3.append(1)
+        try:
+            rd3._ok()
+        finally:
+            assign_gui.messagebox.showwarning = real_w3
+        check("全員空なら確定させない", bool(warned3) and rd3.result is None)
+        rd3.rows[0]["name"].set("佐藤")
+        rd3.del_row(rd3.rows[0])
+        check("最後の 1 行を消しても空の行が残る", len(rd3.rows) == 1)
+        rd3._cancel()
 
         # --- 同姓の人がいても取りこぼさない ------------------------------
         dup = Project(audio_path="x.m4a")

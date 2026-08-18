@@ -976,6 +976,23 @@ def short_labels(speakers: Sequence[Speaker]) -> dict[str, str]:
     return cand
 
 
+def speaker_label(
+    proj: Project, sid: Optional[str], with_role: bool = False
+) -> str:
+    """本文の【 】に出す呼び名(設計書 §11.8)。
+
+    with_role=False … 名前だけ。「山本学」
+    with_role=True  … 役職も付ける。「山本学(文科省 高等教育局…)」
+
+    **出席者一覧は常に両方を載せる**(記録として全名を残す)ので、
+    ここで名前だけにしても、誰なのかは文書の冒頭から辿れる。
+    """
+    sp = proj.speaker(sid)
+    if not sp:
+        return UNKNOWN_LABEL
+    return sp.display if with_role else sp.name
+
+
 def _insert_cuts(proj: Project) -> dict[float, list[tuple[int, float]]]:
     """「どの区間の、本文の何文字目に、どの追加発話が割り込んだか」を集める。
 
@@ -1199,12 +1216,14 @@ def write_docx(
     include_verification: bool = True,
     revision: Optional[int] = None,
     insert_style: str = INSERT_STYLE_LINE,
+    with_role: bool = False,
 ) -> Path:
     """割当結果を Word ファイルに書き出す。
 
     include_verification: 末尾に検証要約(元音声・SHA-256・処理経路・版・
     確認状態)を付ける。revision はこの出力の版番号(省略時は記録済みの値)。
     insert_style: 人が足した相づちの書き方(設計書 §11)。
+    with_role: 本文の【 】に企業・役職も入れる(設計書 §11.8)。
     """
     from docx import Document
     from docx.shared import Pt, RGBColor
@@ -1253,8 +1272,7 @@ def write_docx(
         if with_timestamps and not cont:
             ts = p.add_run(f"[{fmt_hms(start)}] ")
             ts.bold = True
-        sp = proj.speaker(sid)
-        label = sp.name if sp else UNKNOWN_LABEL
+        label = speaker_label(proj, sid, with_role)
         name_run = p.add_run(f"【{label}】 ")
         name_run.bold = True
         if sid is None:
@@ -1290,6 +1308,7 @@ def write_text(
     merge_consecutive: bool = True,
     drop_noise: bool = True,
     insert_style: str = INSERT_STYLE_LINE,
+    with_role: bool = False,
 ) -> Path:
     """プレーンテキスト出力(自分のテンプレートに貼り込む場合や、差分取り用)"""
     output_path = Path(output_path)
@@ -1299,9 +1318,9 @@ def write_text(
         lines.append("")
     for start, sid, text, cont in _merge_runs(
             proj, merge_consecutive, drop_noise, insert_style):
-        sp = proj.speaker(sid)
         # 後半には時刻を書かない。桁だけ空けて縦を揃える(設計書 §11.3)
         head = " " * (len(fmt_hms(start)) + 3) if cont else f"[{fmt_hms(start)}] "
-        lines.append(f"{head}【{sp.name if sp else UNKNOWN_LABEL}】 {text}")
+        lines.append(
+            f"{head}【{speaker_label(proj, sid, with_role)}】 {text}")
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path

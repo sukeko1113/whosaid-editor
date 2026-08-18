@@ -52,6 +52,7 @@ from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
     short_labels, Speaker, suggest_split, suggest_roster_rows,
+    speaker_label,
     INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1308,6 +1309,33 @@ def test_roster_line_accepts_nested_parentheses():
         "山本学(文科省 高等教育局私学部参事官付 企画官（命）学校法人経営指導室長)")[0]
     assert sp.name == "山本学", sp.name
     assert sp.note.endswith("学校法人経営指導室長"), sp.note
+
+
+def test_speaker_label_can_add_the_role():
+    """本文の【 】に役職も入れるかを選べる(設計書 §11.8)。"""
+    proj = _base_for_insert()
+    proj.speakers[0].name = "山本学"
+    proj.speakers[0].note = "文科省 高等教育局私学部参事官付 企画官"
+    sid = proj.speakers[0].id
+    assert speaker_label(proj, sid, False) == "山本学"
+    assert speaker_label(proj, sid, True).startswith("山本学(文科省")
+    assert speaker_label(proj, None, True) == UNKNOWN_LABEL
+
+
+def test_inline_form_never_adds_the_role(tmp_path=None):
+    """**埋め込みの ( ) は常に名前だけ。**本文の中なので長いと意味がない。"""
+    import tempfile
+    proj = _base_for_insert()
+    proj.speakers[1].name = "山本学"
+    proj.speakers[1].note = "文科省 高等教育局私学部参事官付 企画官"
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", proj.speakers[1].id)
+    with tempfile.TemporaryDirectory() as d:
+        out = write_text(proj, Path(d) / "a.txt",
+                         insert_style=INSERT_STYLE_INLINE, with_role=True)
+        body = out.read_text(encoding="utf-8")
+    assert "(山本学：はい)" in body, body
+    assert "(山本学(文科省" not in body, "埋め込みに役職が入っている"
+    assert "【山本学(文科省" in body or "山本学" in body
 
 
 def test_legend_only_when_something_was_inserted():
