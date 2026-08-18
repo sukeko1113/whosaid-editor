@@ -1006,6 +1006,23 @@ def run() -> int:
                   not any(s.text == "はいはい" for s in ap.segments))
             check("元の 4 区間は残る", len(ap.segments) == 4)
 
+        # --- 既定の窓幅で、右ペインのボタンが全部見えること ---------------
+        # 「右側が切れて表示されます。［＋この声を足す...］ボタンを表示させる
+        # には、ウィンドウを広げる必要がある」(実機の指摘・2026-08-18)。
+        awin.geometry("1320x800")
+        awin.update()
+        _frm = awin.btn_del_added.master.master
+        _rows = [r for r in _frm.winfo_children() if r.winfo_children()]
+        _need = max(sum(c.winfo_reqwidth() for c in r.winfo_children()) + 20
+                    for r in _rows)
+        _have = _frm.master.winfo_width()
+        check(f"既定の幅で右ペインのボタン列が収まる（要 {_need} / 幅 {_have}）",
+              _have >= _need)
+        check("＋この声を足す が右端をはみ出さない",
+              awin.btn_del_added.winfo_x() + awin.btn_del_added.winfo_width()
+              <= _have)
+        check("行を分けてある（1 行に詰めない）", len(_rows) >= 4)
+
         # --- 本文欄の書き戻しは、読み込んだ区間にだけ効く ----------------
         # current を直接動かした直後に _commit_text が呼ばれると、**別の区間へ
         # 前の本文を上書きしていた**(この検査を書いていて見つかった)。

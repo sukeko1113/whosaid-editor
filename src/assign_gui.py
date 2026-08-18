@@ -324,8 +324,12 @@ class AssignWindow(tk.Toplevel):
         self._row_ids: list[str] = []
 
         self.title(f"話者の割当 - {Path(self.proj.audio_path).name}")
-        self.geometry("1180x760")
-        self.minsize(980, 640)
+        # 右ペインのボタン列が収まる幅にする。**既定で全部見えること**
+        # ——窓を広げないと押せないボタンがあった(実機の指摘・2026-08-18)。
+        self.geometry("1320x800")
+        # 1320 で右ペインが 587px になり、いちばん広い行(571px)が収まる。
+        # 最小もそこに合わせる——下回るとまたボタンが切れる。
+        self.minsize(1320, 660)
 
         self.var_speed = tk.StringVar(value="1.0x")
         self.var_autoplay = tk.BooleanVar(value=True)
@@ -486,25 +490,30 @@ class AssignWindow(tk.Toplevel):
                 ).pack(side="left", padx=1)
         # 機械が当てただけの時刻(✎△)を、聴いて確かめたら ✎ に上げる。
         # 「再生 → 合っていればこれを押す」で流せるようにボタンにしてある。
+        # **「区間ごとスライド」の行に置く。**時刻の行に並べると 733px 必要に
+        # なり、既定の窓幅では右端が切れた(実機の指摘・2026-08-18)。
         self.btn_confirm_time = ttk.Button(
-            row_time, text="この時刻で確認", takefocus=False,
-            command=self.confirm_time,
-        )
-        self.btn_confirm_time.pack(side="left", padx=(12, 0))
+            row_edit_time_actions := ttk.Frame(frm_time), text="この時刻で確認",
+            takefocus=False, command=self.confirm_time)
+        row_edit_time_actions.pack(side="top", anchor="w", pady=(3, 0))
+        self.btn_confirm_time.pack(side="left")
         self.btn_revert_time = ttk.Button(
-            row_time, text="元に戻す", takefocus=False, command=self.revert_time,
-        )
+            row_edit_time_actions, text="元に戻す", takefocus=False,
+            command=self.revert_time)
         self.btn_revert_time.pack(side="left", padx=(6, 0))
+        ttk.Separator(row_edit_time_actions, orient="vertical").pack(
+            side="left", fill="y", padx=10)
+        ttk.Label(row_edit_time_actions, text="区間ごとスライド:").pack(
+            side="left", padx=(0, 4))
+        for _text, _delta in (("−1", -1.0), ("−0.1", -0.1),
+                              ("+0.1", +0.1), ("+1", +1.0)):
+            ttk.Button(row_edit_time_actions, text=_text, width=5,
+                       takefocus=False,
+                       command=lambda d=_delta: self._shift_time(d)).pack(
+                side="left", padx=1)
 
         row_edit = ttk.Frame(frm_time)
         row_edit.pack(side="top", anchor="w", pady=(3, 0))
-        # 時刻のずれは区間ごと動かして直すことがほとんど。上の開始・終了は
-        # 片側だけ動かす(長さを変える)ので、区間ごとの移動は別に用意する。
-        ttk.Label(row_edit, text="区間ごとスライド:").pack(side="left", padx=(0, 4))
-        for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
-            ttk.Button(row_edit, text=text, width=5, takefocus=False,
-                       command=lambda d=delta: self._shift_time(d)).pack(side="left", padx=1)
-        ttk.Separator(row_edit, orient="vertical").pack(side="left", fill="y", padx=10)
 
         # 1 区間に 2 人の発言が順に混ざることも、同じ発言が 2 行に割れることも
         # ある。どちらも人の目と耳でしか判断できないので、明示操作で直せるようにする。
@@ -514,17 +523,23 @@ class AssignWindow(tk.Toplevel):
                    command=self.merge_with_prev).pack(side="left", padx=6)
         ttk.Button(row_edit, text="次の区間と結合", takefocus=False,
                    command=self.merge_with_next).pack(side="left")
-        ttk.Separator(row_edit, orient="vertical").pack(side="left", fill="y",
-                                                        padx=10)
+
+        # **もう 1 行に分ける。**1 行に詰めると既定の窓幅(1180)で右端が切れ、
+        # 窓を広げないとボタンが押せなかった(実機の指摘・2026-08-18)。
+        row_add = ttk.Frame(frm_time)
+        row_add.pack(side="top", anchor="w", pady=(3, 0))
         # 聞こえたのに本文に無い発話を足す。**どのエンジンも会話途中の相づちを
-        # 書けない**(6 系統の実測で、和集合でも 33 件中 14 件が拾えない)ので、
+        # 書けない**(7 系統の実測で、和集合でも 33 件中 12 件が拾えない)ので、
         # 機械が時刻と声を用意し、人が言葉を入れる。
-        ttk.Button(row_edit, text="＋この声を足す...", takefocus=False,
+        ttk.Button(row_add, text="＋この声を足す...", takefocus=False,
                    command=self.add_utterance).pack(side="left")
         self.btn_del_added = ttk.Button(
-            row_edit, text="この区間を消す", takefocus=False,
+            row_add, text="この区間を消す", takefocus=False,
             command=self.remove_added, state="disabled")
         self.btn_del_added.pack(side="left", padx=6)
+        ttk.Label(row_add, foreground="#666", text="（聞こえたのに本文に無い"
+                  "別の人の発話を、本文の位置を指して足します）").pack(
+            side="left", padx=(10, 0))
 
         frm_text = ttk.LabelFrame(right, text="この区間の発言(編集できます)")
         frm_text.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
