@@ -64,6 +64,9 @@ from .transcribe import estimate_speech_seconds
 
 
 SPEEDS = ["0.8x", "1.0x", "1.2x", "1.5x", "2.0x"]
+# 小窓で使う速さ。**相づちは短くて速いので 0.5x が要る**
+# (既定の下限 0.8x では聴き取れない、という実機の指摘・2026-08-18)。
+DIALOG_SPEEDS = ["0.5x", "0.65x", "0.8x", "1.0x", "1.2x"]
 
 # 1 区間の再生の長さ。
 #
@@ -431,6 +434,9 @@ class AssignWindow(tk.Toplevel):
         self.tree.tag_configure("unassigned", background="#FFF8E1")
         self.tree.tag_configure("bulk", background="#F1F6FB")
         self.tree.tag_configure("special", foreground="#8A8A8A")
+        # 人が足した発話。**一覧で見分けられないと、あとから消す対象を
+        # 探せない**(実機の指摘・2026-08-18)。
+        self.tree.tag_configure("added", background="#FFF3E0")
 
         right = ttk.Frame(body)
         body.add(right, weight=4)
@@ -862,8 +868,14 @@ class AssignWindow(tk.Toplevel):
         if seg.time_edited:
             time_mark = "✎ " if seg.time_reviewed else "✎△"
         time_cell = time_mark + fmt_hms(seg.start)
+        # 人が足した発話は本文の頭に印を付ける。色だけだと印刷や
+        # 色覚の条件で消えるので、文字でも分かるようにする。
+        body = seg.preview(70)
+        if self.proj.is_added_utterance(seg):
+            tags.append("added")
+            body = f"＋ {body}"
         values = (time_cell, seg.cluster_label,
-                  f"{mark}{name}" if name else "—", seg.preview(70))
+                  f"{mark}{name}" if name else "—", body)
         return values, tuple(tags)
 
     def _insert_row(self, seg) -> str:
@@ -2577,13 +2589,12 @@ class SplitDialog(tk.Toplevel):
 class AddUtteranceDialog(tk.Toplevel):
     """聞こえたのに本文に無い発話を足す小窓（相づちを足す設計書 §5）。
 
-    決めることは 3 つ:
-      - どこで言われたか（話者分離の turn 候補から選ぶ。無ければ手入力）
-      - 何と言ったか（人が打つ。**機械はここを埋められない**）
-      - 誰が言ったか（任意。選べば ✓ になる）
+    **本文を出して、入れたい場所をクリックしてもらう。**時刻を打たせる形は
+    実際に使うと成立しなかった——聴いているときの頭の中は「1504.2 秒」では
+    なく「『ながら』と『けれども』の間」だからである（2026-08-18・実機の指摘）。
 
-    turn は「誰かが話していた区間」なので、時刻と声のまとまりを機械から
-    もらえる。人が入れるのは言葉だけで済む。
+    時刻はクリック位置から文字数按分で見積もる。**目安であり実測ではない**
+    （time_edited は立てない）。話者分離の候補があれば、そちらに寄せられる。
     """
 
     def __init__(self, win: "AssignWindow", seg: Segment,
@@ -2591,122 +2602,211 @@ class AddUtteranceDialog(tk.Toplevel):
         super().__init__(win)
         self.win = win
         self.seg = seg
+        self._turns = sorted(turns, key=lambda t: (t.start, t.end))
         self.result: Optional[tuple[float, float, str, str, Optional[str]]] = None
         self.title("聞こえた発話を足す")
         self.transient(win)
         self.resizable(False, False)
 
-        pad = {"padx": 12, "pady": 6}
-        ttk.Label(self, wraplength=520, justify="left", text=(
-            f"いまの区間 {fmt_hms_frac(seg.start)}〜{fmt_hms_frac(seg.end)} の"
-            "あたりで、本文に無い発話が聞こえたときに足します。\n"
-            "**同じ人の言い淀みは、ここではなく本文欄に直接書き足してください。**"
-        )).grid(row=0, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(self, wraplength=560, justify="left", foreground="#1B5E20",
+                  text="本文を聴きながら、別の人の声が入っていた場所を"
+                       "下の本文でクリックしてください。").grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 2))
 
-        # --- どこで言われたか ---
-        box = ttk.LabelFrame(self, text="どこで言われたか")
-        box.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
+        # --- ① どこに入れるか（本文の中をクリック）---------------------
+        box = ttk.LabelFrame(self, text="この区間の本文（入れたい場所をクリック）")
+        box.grid(row=1, column=0, sticky="ew", padx=12, pady=(4, 2))
         box.columnconfigure(0, weight=1)
-        self._turns = turns
-        values = [f"{fmt_hms_frac(t.start)}〜{fmt_hms_frac(t.end)}"
-                  f"   {win._voice_label(t.speaker)}" for t in turns]
-        self.cmb = ttk.Combobox(box, values=values, state="readonly", width=44)
-        self.cmb.grid(row=0, column=0, sticky="ew", padx=8, pady=(6, 2))
-        self.cmb.bind("<<ComboboxSelected>>", self._pick_turn)
-        if values:
-            self.cmb.current(0)
-        else:
-            self.cmb.configure(state="disabled")
-            ttk.Label(box, foreground="#B26500", wraplength=500, justify="left",
-                      text="話者分離の結果がありません。時刻を手で入れてください。"
-                      ).grid(row=1, column=0, sticky="w", padx=8)
+        self.txt = tk.Text(box, height=4, wrap="word", font=("", 12))
+        self.txt.grid(row=0, column=0, sticky="ew", padx=8, pady=6)
+        self.txt.insert("1.0", seg.text or "")
+        # 読み取り専用にはしない——カーソルを動かせないと位置を選べない。
+        # 代わりに、打鍵を握りつぶして本文が変わらないようにする。
+        self.txt.bind("<Key>", self._on_key)
+        self.txt.bind("<ButtonRelease-1>", self._on_move)
+        self.txt.bind("<KeyRelease>", self._on_move)
+        self.txt.tag_configure("here", background="#FFE082")
 
-        row = ttk.Frame(box)
-        row.grid(row=2, column=0, sticky="w", padx=8, pady=(2, 8))
-        mid = round((seg.start + seg.end) / 2, 1)
-        self.var_start = tk.StringVar(value=fmt_hms_frac(mid))
-        self.var_end = tk.StringVar(value=fmt_hms_frac(mid + 0.8))
-        ttk.Label(row, text="開始:").pack(side="left")
-        ttk.Entry(row, textvariable=self.var_start, width=12).pack(side="left", padx=4)
-        ttk.Label(row, text="終了:").pack(side="left", padx=(8, 0))
-        ttk.Entry(row, textvariable=self.var_end, width=12).pack(side="left", padx=4)
-        ttk.Button(row, text="▶ ここを聴く", takefocus=False,
-                   command=self._play).pack(side="left", padx=(12, 0))
-        if turns:
-            self._pick_turn()
+        self.var_where = tk.StringVar()
+        ttk.Label(box, textvariable=self.var_where, foreground="#666",
+                  wraplength=540, justify="left").grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 6))
 
-        # --- 何と言ったか ---
-        ttk.Label(self, text="聞こえた言葉:").grid(row=2, column=0, sticky="w",
-                                                  padx=12)
+        # --- ② 何と言ったか ---------------------------------------------
+        ttk.Label(self, text="ここに入る発話（聞こえた言葉）:").grid(
+            row=2, column=0, sticky="w", padx=12, pady=(6, 0))
         self.var_text = tk.StringVar()
-        ent = ttk.Entry(self, textvariable=self.var_text, width=52)
-        ent.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12)
+        ent = ttk.Entry(self, textvariable=self.var_text, width=56)
+        ent.grid(row=3, column=0, sticky="ew", padx=12)
 
-        # --- 誰が言ったか ---
-        who = ttk.LabelFrame(self, text="誰が言ったか（選ぶと ✓ になります）")
-        who.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
-        self.var_speaker = tk.StringVar(value="")
-        names = [("（決めない）", "")] + [
-            (sp.name, sp.id) for sp in win.proj.speakers]
+        # --- ③ 誰が言ったか ---------------------------------------------
+        who = ttk.Frame(self)
+        who.grid(row=4, column=0, sticky="w", padx=12, pady=(6, 2))
+        ttk.Label(who, text="誰が:").pack(side="left")
+        names = [("（決めない）", "")] + [(sp.name, sp.id)
+                                          for sp in win.proj.speakers]
         self._sp_ids = [v for _, v in names]
         self.cmb_sp = ttk.Combobox(who, values=[n for n, _ in names],
-                                   state="readonly", width=34)
+                                   state="readonly", width=28)
         self.cmb_sp.current(0)
-        self.cmb_sp.pack(side="left", padx=8, pady=6)
-        ttk.Label(who, foreground="#666", wraplength=240, justify="left",
-                  text="いま聴いたところなので、選べば「聴いて確定」になります。"
-                  ).pack(side="left", padx=(4, 8))
+        self.cmb_sp.pack(side="left", padx=6)
+        ttk.Label(who, foreground="#666",
+                  text="選ぶと ✓（聴いて確定）になります").pack(side="left")
+
+        # --- ④ 聴く（速さ・一時停止）------------------------------------
+        play = ttk.LabelFrame(self, text="聴く")
+        play.grid(row=5, column=0, sticky="ew", padx=12, pady=(8, 2))
+        ttk.Button(play, text="▶ この辺を聴く", takefocus=False,
+                   command=self._play).pack(side="left", padx=(8, 4), pady=6)
+        self.btn_pause = ttk.Button(play, text="⏸ 一時停止", takefocus=False,
+                                    command=self._toggle_pause)
+        self.btn_pause.pack(side="left", padx=4)
+        ttk.Label(play, text="速さ:").pack(side="left", padx=(12, 2))
+        # **0.5x を足した。**相づちは短くて速いので、既定の下限 0.8x では
+        # 聴き取れないという指摘があった（2026-08-18・実機）。
+        self.var_speed = tk.StringVar(value="0.8x")
+        ttk.Combobox(play, values=DIALOG_SPEEDS, textvariable=self.var_speed,
+                     state="readonly", width=7).pack(side="left")
+        ttk.Label(play, text="前後:").pack(side="left", padx=(12, 2))
+        self.var_around = tk.StringVar(value="1.5")
+        ttk.Combobox(play, values=["0.8", "1.5", "3.0"], width=5,
+                     textvariable=self.var_around,
+                     state="readonly").pack(side="left")
+        ttk.Label(play, text="秒").pack(side="left", padx=(2, 8))
+
+        # --- ⑤ 時刻（目安。候補に寄せられる）----------------------------
+        tm = ttk.Frame(self)
+        tm.grid(row=6, column=0, sticky="w", padx=12, pady=(4, 2))
+        self.var_at = tk.StringVar()
+        ttk.Label(tm, textvariable=self.var_at,
+                  foreground="#666").pack(side="left")
+        if self._turns:
+            ttk.Label(tm, text="／ 声の候補に合わせる:").pack(side="left",
+                                                              padx=(10, 4))
+            self.cmb_turn = ttk.Combobox(
+                tm, state="readonly", width=28,
+                values=["（合わせない）"] + [
+                    f"{fmt_hms_frac(t.start)}〜{fmt_hms_frac(t.end)}  "
+                    f"{win._voice_label(t.speaker)}" for t in self._turns])
+            self.cmb_turn.current(0)
+            self.cmb_turn.pack(side="left")
+            self.cmb_turn.bind("<<ComboboxSelected>>", self._sync)
+        else:
+            self.cmb_turn = None
+            ttk.Label(tm, foreground="#B26500",
+                      text="／ 話者分離の結果がありません").pack(side="left",
+                                                                padx=(10, 0))
 
         btns = ttk.Frame(self)
-        btns.grid(row=5, column=0, columnspan=2, sticky="e", **pad)
+        btns.grid(row=7, column=0, sticky="e", padx=12, pady=(10, 12))
         ttk.Button(btns, text="入れる", command=self._ok).pack(side="left")
-        ttk.Button(btns, text="やめる", command=self._cancel).pack(side="left",
-                                                                   padx=8)
+        ttk.Button(btns, text="やめる",
+                   command=self._cancel).pack(side="left", padx=8)
         self.bind("<Escape>", lambda e: self._cancel())
+        self.txt.mark_set("insert", "1.0")
+        self._on_move()
         ent.focus_set()
         self.grab_set()
 
     # ------------------------------------------------------------------
-    def _pick_turn(self, _e=None) -> None:
-        i = self.cmb.current()
+    def _on_key(self, event):
+        """本文は変えさせない。ただし移動キーは通す（位置を選ぶため）。"""
+        if event.keysym in ("Left", "Right", "Up", "Down", "Home", "End",
+                            "Prior", "Next"):
+            return None
+        return "break"
+
+    def _cut(self) -> int:
+        """本文のどこにカーソルがあるか（文字数）。"""
+        try:
+            return len(self.txt.get("1.0", "insert"))
+        except tk.TclError:
+            return 0
+
+    def _estimate(self) -> float:
+        """クリック位置から時刻を見積もる（文字数按分）。
+
+        **目安であり実測ではない。**この製品が Gemini の時刻ドリフト対策で
+        既に使っている仮定（redistribute_times の文字数按分）と同じもの。
+        """
+        text = self.seg.text or ""
+        span = max(0.0, self.seg.end - self.seg.start)
+        if not text or span <= 0:
+            return round((self.seg.start + self.seg.end) / 2, 2)
+        return round(self.seg.start + span * (self._cut() / len(text)), 2)
+
+    def _on_move(self, _e=None) -> None:
+        """カーソルが動いたら、色と時刻の表示を追従させる。"""
+        self.txt.tag_remove("here", "1.0", "end")
+        cut = self._cut()
+        text = self.seg.text or ""
+        # 挿入位置の前後 1 文字を光らせる（どこに入るかが目で分かるように）
+        lo = max(0, cut - 1)
+        hi = min(len(text), cut + 1)
+        if hi > lo:
+            self.txt.tag_add("here", f"1.0 + {lo} chars", f"1.0 + {hi} chars")
+        if text:
+            self.var_where.set(
+                f"ここに入ります → …{text[max(0, cut - 12):cut]}"
+                f"【ここ】{text[cut:cut + 12]}…")
+        else:
+            self.var_where.set("この区間には本文がありません。")
+        self.var_at.set(f"推定の時刻: {fmt_hms_frac(self._estimate())}（目安）")
+        if self.cmb_turn is not None and self.cmb_turn.current() > 0:
+            self.cmb_turn.current(0)      # 手で動かしたら候補合わせを解除
+
+    def _sync(self, _e=None) -> None:
+        """声の候補に時刻を合わせる（本文の位置はそのまま）。"""
+        i = self.cmb_turn.current() - 1 if self.cmb_turn else -1
         if 0 <= i < len(self._turns):
             t = self._turns[i]
-            self.var_start.set(fmt_hms_frac(t.start))
-            self.var_end.set(fmt_hms_frac(t.end))
+            self.var_at.set(f"推定の時刻: {fmt_hms_frac(t.start)}"
+                            f"（{self.win._voice_label(t.speaker)} の候補）")
 
-    def _span(self) -> Optional[tuple[float, float]]:
-        try:
-            a = parse_hms(self.var_start.get())
-            b = parse_hms(self.var_end.get())
-        except Exception:
-            return None
-        return (a, b) if b > a else (a, a + 0.5)
-
-    def _play(self) -> None:
-        span = self._span()
-        if span:
-            self.win.player.play(self.win.proj.audio_path, span[0], span[1])
+    def _span(self) -> tuple[float, float]:
+        i = self.cmb_turn.current() - 1 if self.cmb_turn else -1
+        if 0 <= i < len(self._turns):
+            t = self._turns[i]
+            return (float(t.start), float(t.end))
+        at = self._estimate()
+        return (at, at + 0.8)
 
     def _cluster(self) -> str:
-        i = self.cmb.current()
+        i = self.cmb_turn.current() - 1 if self.cmb_turn else -1
         if 0 <= i < len(self._turns):
             return f"g:{self.win._voice_letter(self._turns[i].speaker)}"
         return f"{self.seg.chunk}:{PSEUDO_UNKNOWN}"
 
+    # ------------------------------------------------------------------
+    def _play(self) -> None:
+        a, b = self._span()
+        try:
+            around = float(self.var_around.get())
+        except ValueError:
+            around = 1.5
+        speed = float(self.var_speed.get().rstrip("x"))
+        self.win.player.play(self.win.proj.audio_path,
+                             max(0.0, a - around), b + around,
+                             speed=speed, pre_roll=0.0, post_roll=0.0)
+        self.btn_pause.configure(text="⏸ 一時停止")
+
+    def _toggle_pause(self) -> None:
+        p = self.win.player
+        if p.is_paused():
+            p.resume()
+            self.btn_pause.configure(text="⏸ 一時停止")
+        elif p.pause():
+            self.btn_pause.configure(text="▶ 続きから")
+
     def _ok(self) -> None:
-        span = self._span()
         text = self.var_text.get().strip()
-        if span is None:
-            messagebox.showwarning("時刻が読めません",
-                                   "開始・終了は 00:01:23.4 の形で入れてください。",
-                                   parent=self)
-            return
         if not text:
             messagebox.showwarning("言葉が空です",
                                    "聞こえた言葉を入れてください。", parent=self)
             return
+        a, b = self._span()
         sid = self._sp_ids[self.cmb_sp.current()] or None
-        self.result = (span[0], span[1], text, self._cluster(), sid)
+        self.result = (a, b, text, self._cluster(), sid)
         self._close()
 
     def _cancel(self) -> None:

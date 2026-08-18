@@ -1018,6 +1018,71 @@ def run() -> int:
               len(got) == 1 and got[0].speaker_id is None
               and got[0].reviewed is False)
 
+
+        # --- 足す小窓: 本文の位置で入れる（2026-08-18 の指摘への対応）-----
+        # 実機で「どこで入れたらいいか分からない」「本文が出ていないので
+        # 挿入は実質不可能」と言われて作り直した箇所。壊れたら落とす。
+        dseg = Segment(index=0, start=100.0, end=110.0,
+                       text="あいうえおかきくけこ", cluster="g:A", chunk=0)
+
+        class _T:                       # 話者分離の turn の代わり
+            def __init__(self, s, e, spk):
+                self.start, self.end, self.speaker = s, e, spk
+
+        dlg = assign_gui.AddUtteranceDialog(awin, dseg, [_T(104.0, 104.8, 1)])
+        dlg.withdraw()
+        dlg.update()
+        check("小窓に本文が出る",
+              dlg.txt.get("1.0", "end").strip() == "あいうえおかきくけこ")
+        check("本文は書き換えられない",
+              dlg._on_key(type("E", (), {"keysym": "a"})()) == "break")
+        check("移動キーは通す",
+              dlg._on_key(type("E", (), {"keysym": "Right"})()) is None)
+
+        # 先頭にカーソル → 区間の開始時刻
+        dlg.txt.mark_set("insert", "1.0")
+        dlg._on_move()
+        check("先頭なら区間の開始", abs(dlg._estimate() - 100.0) < 0.05)
+        # 真ん中（10 文字中 5 文字目）→ 区間の中央
+        dlg.txt.mark_set("insert", "1.0 + 5 chars")
+        dlg._on_move()
+        check("真ん中なら区間の中央（文字数按分）",
+              abs(dlg._estimate() - 105.0) < 0.05)
+        check("入る場所を文字で示す", "【ここ】" in dlg.var_where.get())
+        check("時刻は目安だと明記する", "目安" in dlg.var_at.get())
+        check("入る場所に色が付く",
+              bool(dlg.txt.tag_ranges("here")))
+
+        # 声の候補に合わせると、その turn の時刻になる
+        dlg.cmb_turn.current(1)
+        dlg._sync()
+        check("候補に合わせると turn の時刻になる",
+              dlg._span() == (104.0, 104.8))
+        check("候補に合わせたと分かる", "候補" in dlg.var_at.get())
+        dlg.txt.mark_set("insert", "1.0 + 2 chars")
+        dlg._on_move()
+        check("本文を動かすと候補合わせが外れる", dlg.cmb_turn.current() == 0)
+
+        # 速さ・一時停止
+        check("小窓で 0.5 倍が選べる", "0.5x" in assign_gui.DIALOG_SPEEDS)
+        check("一時停止のボタンがある", dlg.btn_pause is not None)
+        dlg._toggle_pause()             # 鳴っていなくても落ちない
+        check("鳴っていなくても一時停止で落ちない", True)
+
+        dlg.var_text.set("")
+        real_warn2 = assign_gui.messagebox.showwarning
+        warned2: list = []
+        assign_gui.messagebox.showwarning = lambda *a3, **k3: warned2.append(1)
+        try:
+            dlg._ok()
+        finally:
+            assign_gui.messagebox.showwarning = real_warn2
+        check("言葉が空なら入れさせない", warned2 and dlg.result is None)
+        dlg.var_text.set("はい")
+        dlg._ok()
+        check("入れると結果が返る",
+              dlg.result is not None and dlg.result[2] == "はい")
+
         awin.player.close()
         awin.destroy()
         root.destroy()
