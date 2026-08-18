@@ -51,7 +51,7 @@ from src import diarize, evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
-    short_labels, Speaker,
+    short_labels, Speaker, suggest_split, suggest_roster_rows,
     INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1249,6 +1249,65 @@ def test_short_label_only_affects_the_inline_form():
 def test_inline_legend_says_the_name_is_abbreviated():
     """略記だと書いておかないと、受け取った人が別人と思う。"""
     assert "略記" in INSERT_LEGEND[INSERT_STYLE_INLINE]
+
+
+# --- 名前と企業・役職に分ける(設計書 §11.8)--------------------------
+# ユーザーの提案。表示名という別の項目を持つと同じ情報が 2 か所になり、
+# 片方だけ直したとき食い違う。名前と役職に分けておけば表示は組み立てるだけ。
+
+def test_suggest_split_cuts_at_a_role_word():
+    """「三ツ林衆議院議員」→ 名前「三ツ林」／役職「衆議院議員」"""
+    assert suggest_split("三ツ林衆議院議員") == ("三ツ林", "衆議院議員")
+    assert suggest_split("吉沢忠一加茂暁星高校同窓会長")[0] == "吉沢忠一加茂暁星"
+
+
+def test_suggest_split_cuts_at_a_space():
+    """空白があればそこで切る（あなたの名簿の多くはこの形）"""
+    n, note = suggest_split("山本学　文科省 高等教育局私学部参事官付 企画官")
+    assert n == "山本学" and note.startswith("文科省")
+
+
+def test_suggest_split_uses_other_rows_to_find_the_organisation():
+    """**他の人の行にも出てくる並びは、個人名ではなく所属。**
+
+    「加茂暁星」が梅田さんの行にも出るので、吉沢さんの名前ではない。
+    """
+    others = ["梅田茂　加茂暁星学園理事"]
+    assert suggest_split("吉沢忠一加茂暁星高校同窓会長", others)[0] == "吉沢忠一"
+
+
+def test_suggest_split_never_eats_a_real_surname():
+    """**1 文字の「市」「村」「部」を手がかりにしない。**
+
+    使うと「田村」さんが「田」になる。役職語は 2 文字以上のものだけ。
+    """
+    assert suggest_split("田村") == ("田村", "")
+    assert suggest_split("志村賢一衆議院議員政策担当秘書")[0] == "志村賢一"
+    assert suggest_split("西村香介") == ("西村香介", "")
+
+
+def test_suggest_split_leaves_a_name_of_at_least_two_characters():
+    """削りすぎるくらいなら分けない。"""
+    assert suggest_split("市長") == ("市長", ""), "全部消してはいけない"
+
+
+def test_suggest_roster_rows_respects_lines_already_split():
+    """すでに「名前(役職)」で書いてある行は、推測で壊さない。"""
+    rows = suggest_roster_rows(chr(10).join(
+        ["佐藤太郎(株式会社ABC 部長)", "三ツ林衆議院議員"]))
+    assert rows[0] == ("佐藤太郎", "株式会社ABC 部長"), rows
+    assert rows[1] == ("三ツ林", "衆議院議員"), rows
+
+
+def test_roster_line_accepts_nested_parentheses():
+    """**役職に括弧が入れ子で出ると、行全体が名前になっていた。**
+
+    「企画官（命）学校法人経営指導室長」で実際に起きた(2026-08-18)。
+    """
+    sp = parse_roster(
+        "山本学(文科省 高等教育局私学部参事官付 企画官（命）学校法人経営指導室長)")[0]
+    assert sp.name == "山本学", sp.name
+    assert sp.note.endswith("学校法人経営指導室長"), sp.note
 
 
 def test_legend_only_when_something_was_inserted():

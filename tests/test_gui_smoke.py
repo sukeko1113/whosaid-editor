@@ -40,6 +40,7 @@ from src.assign_gui import (  # noqa: E402
     SplitDialog,
     clamp_times,
     move_edge,
+    plan_roster_rows,
     plan_roster_text,
     shift_span,
     playback_window,
@@ -549,6 +550,81 @@ def run() -> int:
         check("削除の影響件数を数えられる", plan.affected_segments > 0)
         plan.apply(proj)
         check("適用すると割当が外れる", proj.segments[0].speaker_id is None)
+
+        # --- 行が ID を持ち回る(設計書 §11.8)-----------------------------
+        # **名前の一致で引き継ぐと、名前を直しただけで割当が外れる。**
+        # 「山本学　文科省…室長」を「山本学」に縮めたときに起きる。
+        rp = Project(audio_path="r.m4a")
+        rp.speakers = parse_roster(chr(10).join(
+            ["山本学　文科省　高等教育局私学部参事官付　企画官", "西村香介"]))
+        yamamoto, nishimura = rp.speakers[0].id, rp.speakers[1].id
+        rp.segments = [Segment(index=i, start=i, end=i + 1, text="a",
+                               cluster="0:A") for i in range(3)]
+        rp.segments[0].speaker_id = yamamoto
+        rp.segments[0].reviewed = True
+        rp.segments[1].speaker_id = nishimura
+
+        # 名前を縮めて、役職を右の欄へ移す
+        pl = plan_roster_rows(rp, [
+            (yamamoto, "山本学", "文科省 高等教育局私学部参事官付 企画官"),
+            (nishimura, "西村香介", ""),
+        ])
+        check("名前を直しても誰も消えない", pl.removed == [] and pl.added == [])
+        check("名前を直しても割当は無傷", pl.affected_segments == 0)
+        pl.apply(rp)
+        check("ID が保たれる", rp.speakers[0].id == yamamoto)
+        check("確定済みの割当が残る",
+              rp.segments[0].speaker_id == yamamoto
+              and rp.segments[0].reviewed is True)
+        check("名前が短くなっている", rp.speakers[0].name == "山本学")
+        check("役職は別に持つ", rp.speakers[0].note.startswith("文科省"))
+
+        # **名前の一致だと壊れる**ことを、縮める前の器で示しておく。
+        # この道を選び直したら、この検査が落ちて気付ける。
+        was = Project(audio_path="w.m4a")
+        was.speakers = parse_roster(
+            "山本学　文科省　高等教育局私学部参事官付　企画官")
+        was.segments = [Segment(index=0, start=0, end=1, text="a",
+                                cluster="0:A")]
+        was.segments[0].speaker_id = was.speakers[0].id
+        was.segments[0].reviewed = True
+        broken = plan_roster_text(was, "山本学(文科省 高等教育局)")
+        check("名前一致だと、名前を直した人が消える扱いになる",
+              [sp.id for sp in broken.removed] == [was.speakers[0].id])
+        check("名前一致だと、確定済みの割当が巻き添えになる",
+              broken.affected_segments == 1)
+        # 同じ入力でも、行が ID を持てば無傷
+        safe = plan_roster_rows(
+            was, [(was.speakers[0].id, "山本学", "文科省 高等教育局")])
+        check("行が ID を持てば、同じ直しでも無傷",
+              safe.removed == [] and safe.affected_segments == 0)
+
+        # 並べ替えても ID は行についてくる
+        pl2 = plan_roster_rows(rp, [
+            (nishimura, "西村香介", ""),
+            (yamamoto, "山本学", "文科省"),
+        ])
+        pl2.apply(rp)
+        check("並べ替えても割当は無傷",
+              rp.segments[0].speaker_id == yamamoto
+              and rp.segments[1].speaker_id == nishimura)
+        check("並び順は入れ替わる", rp.speakers[0].id == nishimura)
+
+        # 新しい行は ID を空にする / 渡さなかった人は削除
+        pl3 = plan_roster_rows(rp, [(nishimura, "西村香介", ""), ("", "新人", "")])
+        check("新しい行に ID が振られる", pl3.added == ["新人"])
+        check("渡さなかった人は削除になる",
+              [sp.id for sp in pl3.removed] == [yamamoto])
+        check("削除の影響件数を数える", pl3.affected_segments == 1)
+        pl3.apply(rp)
+        check("削除された人の割当は外れる", rp.segments[0].speaker_id is None)
+        check("関係ない人の割当は残る", rp.segments[1].speaker_id == nishimura)
+        check("新しい ID は既存とぶつからない",
+              len({sp.id for sp in rp.speakers}) == len(rp.speakers))
+
+        # 空の名前の行は無視する(表に空行が残っていても落ちない)
+        pl4 = plan_roster_rows(rp, [(nishimura, "西村香介", ""), ("", "  ", "")])
+        check("空の行は人として数えない", len(pl4.speakers) == 1)
 
         # --- 同姓の人がいても取りこぼさない ------------------------------
         dup = Project(audio_path="x.m4a")

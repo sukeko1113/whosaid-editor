@@ -23,7 +23,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
 from .audio import audio_hashes, extract_peaks
@@ -260,6 +260,50 @@ class RosterPlan:
                 if seg.speaker_id in removed_ids:
                     seg.speaker_id = None
                     seg.reviewed = False
+
+
+def plan_roster_rows(
+    proj: Project, rows: Sequence[tuple[str, str, str]]
+) -> RosterPlan:
+    """(話者 ID, 名前, 企業・役職) の並びから変更計画を作る(まだ何も変えない)。
+
+    **ID は行が持ち回る。**名前の一致で引き継ぐと、「山本学　文科省…室長」を
+    「山本学」に直しただけで別人が入って古い方が消えたと判断され、
+    **確定済みの割当が外れる**(実データで起きうることを確認・2026-08-18)。
+    表の各行が元の ID を覚えていれば、名前を直しても並べ替えても保たれる。
+
+    新しい行は ID を空文字にする。渡されなかった ID は削除とみなす。
+    """
+    used = {sp.id for sp in proj.speakers}
+    by_id = {sp.id: sp for sp in proj.speakers}
+    new_list: list[Speaker] = []
+    added: list[str] = []
+    kept: set[str] = set()
+
+    for sid, name, note in rows:
+        name = (name or "").strip()
+        note = (note or "").strip()
+        if not name:
+            continue
+        if sid and sid in by_id and sid not in kept:
+            kept.add(sid)
+            new_list.append(Speaker(id=sid, name=name, note=note, order=0))
+        else:
+            i = 1
+            while f"sp{i:02d}" in used:
+                i += 1
+            nid = f"sp{i:02d}"
+            used.add(nid)
+            new_list.append(Speaker(id=nid, name=name, note=note, order=0))
+            added.append(name)
+
+    removed = [sp for sp in proj.speakers if sp.id not in kept]
+    for i, sp in enumerate(new_list):
+        sp.order = i
+    removed_ids = {sp.id for sp in removed}
+    affected = sum(1 for s in proj.segments if s.speaker_id in removed_ids)
+    return RosterPlan(speakers=new_list, added=added,
+                      removed=removed, affected_segments=affected)
 
 
 def plan_roster_text(proj: Project, text: str) -> RosterPlan:

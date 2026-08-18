@@ -172,12 +172,87 @@ class Speaker:
         )
 
 
+# 括弧は**最初の開きから最後の閉じまで**を取る。役職に括弧が入れ子で出る
+# (「企画官（命）学校法人経営指導室長」)ため、`[^)）]*` だと途中で切れて
+# 行全体が名前になってしまう(実データで発生・2026-08-18)。
 _ROSTER_LINE = re.compile(
     r"^\s*(?:[-*・]\s*)?"          # 行頭の箇条書き記号は無視
     r"(?P<name>[^(（:：]+?)"        # 名前
-    r"(?:[(（](?P<note1>[^)）]*)[)）])?"   # (役職)
+    r"(?:[(（](?P<note1>.*)[)）])?"        # (役職) — 入れ子を許す
     r"\s*(?:[:：]\s*(?P<note2>.*))?$"      # : 補足
 )
+
+# 役職・所属を表す語。**2 文字以上のものだけ**を使う。「市」「村」「部」の
+# ような 1 文字を入れると「田村」さんが「田」になる(実際に起きる)。
+_ROLE_WORDS = re.compile(
+    "衆議院|参議院|議員|知事|市長|町長|村長|区長|副会長|会長|理事長|理事|監事|"
+    "代表取締役|取締役|代表|社長|専務|常務|部長|課長|係長|室長|局長|次長|所長|"
+    "園長|校長|学長|教授|准教授|講師|教諭|秘書|専門官|参事官|調査官|企画官|"
+    "事務官|技官|主査|主任|委員長|委員|顧問|相談役|幹事|事務局|同窓会|"
+    "学園|学校|高校|中学校|小学校|大学|短大|会社|法人|協会|組合|事務所|"
+    "センター|文科省|厚労省|経産省|国交省|財務省|総務省|防衛省"
+)
+
+# 氏名として残す最低の長さ。これを割ってまで削らない
+_MIN_NAME_CHARS = 2
+
+
+def suggest_split(line: str, others: Sequence[str] = ()) -> tuple[str, str]:
+    """1 行の肩書つき氏名を (名前, 企業・役職) に分ける**提案**を返す。
+
+    「三ツ林衆議院議員」→ ("三ツ林", "衆議院議員")
+    「山本学　文科省 高等教育局…」→ ("山本学", "文科省 高等教育局…")
+
+    規則は 2 つ。
+      1. 空白があればそこで切る
+      2. 役職・所属の語(_ROLE_WORDS)が出てきたら、その手前まで
+      3. **他の人の行にも出てくる 3 字の並びは、個人名ではなく所属**
+         (「加茂暁星」が別の人の行にも出るなら、その人の名前ではない)
+
+    **当てにいきすぎない。**「山口京子蓮田市長」の「蓮田」は地名だが、
+    規則で取ろうとすると本物の姓を削る事故が出る(「山田町長」の「山田」が
+    姓なのか地名なのかは字面では決まらない)。**提案であって確定ではない**
+    ので、外れたぶんは人が直す。設計書 §11.8。
+
+    others には他の出席者の行(分ける前の全体)を渡す。
+    """
+    s = (line or "").strip()
+    if not s:
+        return "", ""
+    # 1. 空白
+    head = re.split(r"\s", s, maxsplit=1)[0].strip()
+    cut = len(head) if head else len(s)
+    # 2. 役職・所属の語
+    m = _ROLE_WORDS.search(s[:cut])
+    if m and m.start() >= _MIN_NAME_CHARS:
+        cut = m.start()
+    # 3. 他の人にも出てくる並び
+    for i in range(_MIN_NAME_CHARS, max(_MIN_NAME_CHARS, cut - 2)):
+        if any(s[i:i + 3] in o for o in others if o):
+            cut = i
+            break
+    name = s[:cut].strip()
+    note = s[cut:].strip()
+    if len(name) < _MIN_NAME_CHARS:      # 削りすぎたら分けない
+        return s, ""
+    return name, note
+
+
+def suggest_roster_rows(text: str) -> list[tuple[str, str]]:
+    """名簿テキスト(1 行 1 人)を [(名前, 企業・役職), …] の提案にする。
+
+    すでに「名前(役職)」の形で書かれている行はそのまま尊重し、
+    分かれていない行だけ suggest_split() にかける。
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    rows: list[tuple[str, str]] = []
+    for sp in parse_roster(text):
+        if sp.note:                       # すでに分かれている
+            rows.append((sp.name, sp.note))
+        else:
+            others = [ln for ln in lines if sp.name not in ln]
+            rows.append(suggest_split(sp.name, others))
+    return rows
 
 
 def parse_roster(text: str) -> list[Speaker]:
