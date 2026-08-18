@@ -1052,6 +1052,7 @@ class AssignWindow(tk.Toplevel):
         self._show_times()
         self.txt_body.delete("1.0", "end")
         self.txt_body.insert("1.0", seg.text)
+        self._body_index = self.current   # この欄がどの区間のものか（§_commit_text）
         self._rebuild_candidates()
         self._draw_timeline()
         # 消せるのは人が足した区間だけ。**音声認識が出した区間には削除の
@@ -1489,15 +1490,42 @@ class AssignWindow(tk.Toplevel):
     def _voice_label(self, speaker: int) -> str:
         return f"声{self._voice_letter(speaker)}"
 
-    def _ask_utterance(self, seg: Segment, turns: list):
-        """小窓を開いて (開始, 終了, 本文, まとまり, 話者) を返す。やめたら None。
+    def _added_for(self, seg: Segment) -> list[tuple[int, dict]]:
+        """この区間に足した発話を、小窓に渡す形で集める。
+
+        戻り値は (区間の index, 小窓の項目)。index は入れ替えのときに消す先。
+        「この区間のもの」は**時刻が区間の範囲に入るもの**で決める。
+        """
+        text = seg.text or ""
+        span = max(1e-6, seg.end - seg.start)
+        out: list[tuple[int, dict]] = []
+        for s in self.proj.segments:
+            if s is seg or not self.proj.is_added_utterance(s):
+                continue
+            if not (seg.start - 0.01 <= s.start <= seg.end + 0.01):
+                continue
+            cut = int(round(len(text) * (s.start - seg.start) / span))
+            out.append((s.index, {
+                "cut": max(0, min(len(text), cut)),
+                "text": s.text, "at": s.start, "end": s.end,
+                "cluster": s.cluster, "sid": s.speaker_id,
+            }))
+        out.sort(key=lambda x: (x[1]["cut"], x[1]["at"]))
+        return out
+
+    def _ask_utterance(self, seg: Segment, turns: list,
+                       existing: Optional[list[dict]] = None):
+        """小窓を開いて [(開始, 終了, 本文, まとまり, 話者), …] を返す。
+
+        **押されたのが［…にする］なら applied=True。**やめたときと
+        「全部消して確定」を区別するために要る。
 
         **画面を出す処理なので、検査では必ず差し替える。**差し替え忘れると
         応答待ちで止まる(GUI 検査で実際に止めた前例がある)。
         """
-        dlg = AddUtteranceDialog(self, seg, turns)
+        dlg = AddUtteranceDialog(self, seg, turns, existing)
         self.wait_window(dlg)
-        return dlg.result
+        return (dlg.result, dlg.applied)
 
     def add_utterance(self) -> None:
         """聞こえたのに本文に無い発話を足す。"""
@@ -1510,9 +1538,19 @@ class AssignWindow(tk.Toplevel):
                  if t.end > seg.start - listen_order.WINDOW_SECONDS
                  and t.start < seg.end + listen_order.WINDOW_SECONDS]
         turns.sort(key=lambda t: (t.start, t.end))
-        got = self._ask_utterance(seg, turns)
-        if not got:
+        prev = self._added_for(seg)
+        got, applied = self._ask_utterance(
+            seg, turns, [item for _i, item in prev])
+        if not applied:
             return
+        # **開いたときにあったものは、いったん全部消してから作り直す。**
+        # 位置も本文も話者も変えられるので、差分を追うより作り直すほうが
+        # 確実で、edit_log にも経緯が残る。index の大きい順に消す。
+        for index in sorted((i for i, _it in prev), reverse=True):
+            try:
+                self.proj.remove_added_utterance(index)
+            except ValueError:
+                pass
         # **1 回の小窓で何件でも受ける**(区間に相づちが 3 つあることは普通)。
         first = None
         for start, end, text, cluster, sid in got:
@@ -1528,12 +1566,23 @@ class AssignWindow(tk.Toplevel):
         self.suggester.refresh()
         if first is not None:
             self.current = first.index
+        else:
+            # 全部消した場合。元の区間へ戻す(見失わないように)
+            back = next((s.index for s in self.proj.segments
+                         if abs(s.start - seg.start) < 0.01
+                         and s.text == seg.text), None)
+            self.current = back if back is not None else min(
+                self.current, len(self.proj.segments) - 1)
         self.reload_tree()
         self.show_current()
         self.update_status()
-        self._set_action(
-            f"{len(got)} 件の発話を足しました。"
-            "一覧では「＋」の付いた行です。取り消しは［この区間を消す］。")
+        if got:
+            self._set_action(
+                f"この区間の足した発話を {len(got)} 件にしました。"
+                "一覧では「＋」の付いた行です。"
+                "直すときは同じ［＋この声を足す...］から。")
+        else:
+            self._set_action("この区間に足した発話を全部消しました。")
 
     def remove_added(self) -> None:
         """人が足した区間を消す。**それ以外は消せない。**"""
@@ -1604,10 +1653,23 @@ class AssignWindow(tk.Toplevel):
         )
 
     def _commit_text(self) -> None:
+        """本文欄の中身を、**その欄に読み込んだ区間へ**書き戻す。
+
+        `current` に無条件で書くと、`current` を直接動かした直後に呼ばれた
+        ときに**別の区間へ前の本文を上書きする**(検査で実際に起きた)。
+        いまの経路では goto() が必ず本文欄を更新するので実害は無かったが、
+        踏める余地は塞いでおく。
+        """
         if not self.proj.segments:
             return
+        # 本文欄がどの区間のものか分からない/食い違うなら書かない
+        loaded = getattr(self, "_body_index", None)
+        if loaded is None or not (0 <= loaded < len(self.proj.segments)):
+            return
+        if loaded != self.current:
+            return
         new = self.txt_body.get("1.0", "end").strip()
-        seg = self.proj.segments[self.current]
+        seg = self.proj.segments[loaded]
         if new != seg.text:
             seg.text = new
             seg.text_edited = True      # 再実行時に上書きされないよう印を付ける
@@ -2650,26 +2712,32 @@ class AddUtteranceDialog(tk.Toplevel):
     MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
     def __init__(self, win: "AssignWindow", seg: Segment,
-                 turns: list) -> None:
+                 turns: list, existing: Optional[list[dict]] = None) -> None:
         super().__init__(win)
         self.win = win
         self.seg = seg
         self._turns = sorted(turns, key=lambda t: (t.start, t.end))
         # 積んだ発話。{"cut": 文字位置, "text": 本文, "cluster": …, "sid": …}
-        self._items: list[dict] = []
+        # **既に足したものは最初から積んだ状態にする。**空から始めると、
+        # 位置を直したいときに入れ直すしかない(実機の指摘・2026-08-18)。
+        self._items: list[dict] = list(existing or [])
         self._map: list[int] = []      # 表示上の位置 → 本文の文字位置
         self._cut = 0                  # いま選んでいる挿入位置
         self._follow_job = None
         self._follow_span = None
         self.result: list[tuple[float, float, str, str, Optional[str]]] = []
-        self.title("聞こえた発話を足す")
+        self.applied = False          # ［…にする］を押したか(やめる と区別)
+        self._had_existing = bool(self._items)
+        self.title("聞こえた発話を足す"
+                   + (f"（いま {len(self._items)} 件）" if self._items else ""))
         self.transient(win)
         self.resizable(False, False)
 
         ttk.Label(self, wraplength=620, justify="left", foreground="#1B5E20",
                   text="① 全部聴く → ② 聞こえた場所を本文でクリック → "
-                       "③ 言葉を打って［この位置に足す］。"
-                       "何件でも積めます。最後に［まとめて入れる］。").grid(
+                       "③ 言葉を打って［この位置に足す］。何件でも積めます。"
+                       "既に足したものは①②…として出るので、"
+                       "［直す］［消す］で直せます。最後に［まとめて入れる］。").grid(
             row=0, column=0, sticky="w", padx=12, pady=(10, 4))
 
         # --- 本文（クリックで位置を決める。積んだ印がここに出る）---------
@@ -2835,7 +2903,7 @@ class AddUtteranceDialog(tk.Toplevel):
         else:
             self.lb.insert("end", "（まだありません。位置を選んで［＋ この位置に足す］）")
         self.btn_ok.configure(
-            text=f"まとめて入れる（{len(self._items)} 件）"
+            text=f"この {len(self._items)} 件にする"
             if self._items else "まとめて入れる")
         self._show_cut()
 
@@ -3043,18 +3111,22 @@ class AddUtteranceDialog(tk.Toplevel):
         # 打ちかけの 1 件があれば拾う（打って［まとめて入れる］を押す人がいる）
         if self.var_text.get().strip():
             self._add_item()
-        if not self._items:
+        if not self._items and not self._had_existing:
             messagebox.showwarning(
                 "入れるものがありません",
                 "位置を選んで言葉を打ち、［＋ この位置に足す］で積んでください。",
                 parent=self)
             return
+        # **空にして押した場合は「全部消す」。**開いたときに既にあったなら、
+        # それを消したいという意思なので通す。
         self.result = [(it["at"], it["end"], it["text"], it["cluster"],
                         it["sid"]) for it in self._items]
+        self.applied = True
         self._close()
 
     def _cancel(self) -> None:
         self.result = []
+        self.applied = False
         self._close()
 
     def _close(self) -> None:

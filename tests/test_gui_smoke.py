@@ -974,10 +974,10 @@ def run() -> int:
 
         # 小窓は差し替える(開くと応答待ちで止まる)
         real_ask_utt = awin._ask_utterance
-        awin._ask_utterance = lambda seg, turns: [
-            (14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)]
+        awin._ask_utterance = lambda seg, turns, existing=None: (
+            [(14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)], True)
         try:
-            awin.current = 1
+            awin.goto(1)
             awin.add_utterance()
         finally:
             awin._ask_utterance = real_ask_utt
@@ -1006,10 +1006,85 @@ def run() -> int:
                   not any(s.text == "はいはい" for s in ap.segments))
             check("元の 4 区間は残る", len(ap.segments) == 4)
 
+        # --- 本文欄の書き戻しは、読み込んだ区間にだけ効く ----------------
+        # current を直接動かした直後に _commit_text が呼ばれると、**別の区間へ
+        # 前の本文を上書きしていた**(この検査を書いていて見つかった)。
+        awin.goto(0)
+        before = [s.text for s in ap.segments]
+        keep_body = awin.txt_body.get("1.0", "end").strip()
+        awin.current = 1                      # 本文欄を更新せずに動かす
+        awin._commit_text()
+        check("本文欄と食い違う区間には書き戻さない",
+              [s.text for s in ap.segments] == before)
+        awin.goto(1)                          # 正しい経路なら書き戻す
+        awin.txt_body.delete("1.0", "end")
+        awin.txt_body.insert("1.0", "直した本文")
+        awin._commit_text()
+        check("読み込んだ区間には書き戻す",
+              ap.segments[1].text == "直した本文")
+        # 後の検査のために戻す。**本文欄も一緒に戻す**——欄に「直した本文」が
+        # 残っていると、次の _commit_text がまた書き戻してしまう。
+        awin.txt_body.delete("1.0", "end")
+        awin.txt_body.insert("1.0", before[1])
+        awin._commit_text()
+        check("戻せている", ap.segments[1].text == before[1])
+        _ = keep_body
+
+        # --- 足したものを開き直して直せる（2026-08-18 の指摘）------------
+        # 「修正しようとすると、最初の画面が出てきても、挿入されたものは
+        # なくなっています」。位置は小窓でしか決められないのに、開くと
+        # 空から始まるので直しようがなかった。
+        base = next(s for s in ap.segments if s.text == "発言 1。")
+        # まず 1 件足す
+        awin._ask_utterance = lambda seg, turns, existing=None: (
+            [(14.0, 14.6, "もとの", "g:B", None)], True)
+        awin.goto(base.index)
+        awin.add_utterance()
+        check("下ごしらえ: 1 件入った",
+              any(s.text == "もとの" for s in ap.segments))
+
+        # 開き直すと、その 1 件が既存として渡る
+        seen: list = []
+        awin._ask_utterance = lambda seg, turns, existing=None: (
+            seen.append(list(existing or [])),
+            ([(14.0, 14.6, "なおした", "g:B", None)], True))[1]
+        base = next(s for s in ap.segments if s.text == "発言 1。")
+        awin.goto(base.index)
+        awin.add_utterance()
+        check("開き直すと既に足したものが渡る",
+              seen and len(seen[-1]) == 1
+              and seen[-1][0]["text"] == "もとの")
+        check("位置(cut)も渡す", "cut" in seen[-1][0])
+        check("入れ替えで古いほうは消える",
+              not any(s.text == "もとの" for s in ap.segments))
+        check("新しいほうが入る",
+              any(s.text == "なおした" for s in ap.segments))
+        check("増えていない（置き換えになっている）",
+              sum(1 for s in ap.segments if ap.is_added_utterance(s)) == 1)
+
+        # 空にして確定すると全部消える
+        awin._ask_utterance = lambda seg, turns, existing=None: ([], True)
+        awin.goto(base.index)
+        awin.add_utterance()
+        check("空にして確定すると全部消える",
+              not any(ap.is_added_utterance(s) for s in ap.segments))
+
+        # やめた場合は何も変えない
+        awin._ask_utterance = lambda seg, turns, existing=None: (
+            [(14.0, 14.6, "入れない", "g:B", None)], False)
+        n_before = len(ap.segments)
+        awin.goto(base.index)
+        awin.add_utterance()
+        check("やめたら何も変わらない",
+              len(ap.segments) == n_before
+              and not any(s.text == "入れない" for s in ap.segments))
+        awin._ask_utterance = real_ask_utt
+
         # 話者を選ばなかった場合は ✓ を立てない
-        awin._ask_utterance = lambda seg, turns: [(24.0, 24.6, "うん", "g:C", None)]
+        awin._ask_utterance = lambda seg, turns, existing=None: (
+            [(24.0, 24.6, "うん", "g:C", None)], True)
         try:
-            awin.current = 2
+            awin.goto(2)
             awin.add_utterance()
         finally:
             awin._ask_utterance = real_ask_utt
