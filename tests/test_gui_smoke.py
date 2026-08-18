@@ -974,8 +974,8 @@ def run() -> int:
 
         # 小窓は差し替える(開くと応答待ちで止まる)
         real_ask_utt = awin._ask_utterance
-        awin._ask_utterance = lambda seg, turns: (
-            14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)
+        awin._ask_utterance = lambda seg, turns: [
+            (14.0, 14.6, "はいはい", "g:B", ap.speakers[0].id)]
         try:
             awin.current = 1
             awin.add_utterance()
@@ -1007,7 +1007,7 @@ def run() -> int:
             check("元の 4 区間は残る", len(ap.segments) == 4)
 
         # 話者を選ばなかった場合は ✓ を立てない
-        awin._ask_utterance = lambda seg, turns: (24.0, 24.6, "うん", "g:C", None)
+        awin._ask_utterance = lambda seg, turns: [(24.0, 24.6, "うん", "g:C", None)]
         try:
             awin.current = 2
             awin.add_utterance()
@@ -1019,13 +1019,15 @@ def run() -> int:
               and got[0].reviewed is False)
 
 
-        # --- 足す小窓: 本文の位置で入れる（2026-08-18 の指摘への対応）-----
-        # 実機で「どこで入れたらいいか分からない」「本文が出ていないので
-        # 挿入は実質不可能」と言われて作り直した箇所。壊れたら落とす。
+        # --- 足す小窓: 位置をクリックして①②③と積む（2026-08-18）--------
+        # 実機の指摘 3 件への対応。壊れたら落とす。
+        #   (1) どこで入れるか分からない → 本文を出してクリックで決める
+        #   (2) 全部聴けない → ［全部聴く］
+        #   (3) 挿入位置が分からない・複数入れられない → ①②③を本文に出して積む
         dseg = Segment(index=0, start=100.0, end=110.0,
                        text="あいうえおかきくけこ", cluster="g:A", chunk=0)
 
-        class _T:                       # 話者分離の turn の代わり
+        class _T:
             def __init__(self, s, e, spk):
                 self.start, self.end, self.speaker = s, e, spk
 
@@ -1039,32 +1041,57 @@ def run() -> int:
         check("移動キーは通す",
               dlg._on_key(type("E", (), {"keysym": "Right"})()) is None)
 
-        # 先頭にカーソル → 区間の開始時刻
+        # 位置 → 時刻（文字数按分）
         dlg.txt.mark_set("insert", "1.0")
         dlg._on_move()
         check("先頭なら区間の開始", abs(dlg._estimate() - 100.0) < 0.05)
-        # 真ん中（10 文字中 5 文字目）→ 区間の中央
         dlg.txt.mark_set("insert", "1.0 + 5 chars")
         dlg._on_move()
         check("真ん中なら区間の中央（文字数按分）",
               abs(dlg._estimate() - 105.0) < 0.05)
         check("入る場所を文字で示す", "【ここ】" in dlg.var_where.get())
         check("時刻は目安だと明記する", "目安" in dlg.var_at.get())
-        check("入る場所に色が付く",
-              bool(dlg.txt.tag_ranges("here")))
+        check("入る場所に色が付く", bool(dlg.txt.tag_ranges("here")))
 
-        # 声の候補に合わせると、その turn の時刻になる
-        dlg.cmb_turn.current(1)
-        dlg._sync()
-        check("候補に合わせると turn の時刻になる",
-              dlg._span() == (104.0, 104.8))
-        check("候補に合わせたと分かる", "候補" in dlg.var_at.get())
+        # 1 件目を積む → 本文に ① が出る
+        dlg.var_text.set("えー")
+        dlg._add_item()
+        check("積むと本文に①が出る", "①" in dlg.txt.get("1.0", "end"))
+        check("①は本文の位置に入る",
+              dlg.txt.get("1.0", "end").strip() == "あいうえお①かきくけこ")
+        check("積んだら言葉の欄は空になる", dlg.var_text.get() == "")
+        check("一覧に出る", "えー" in dlg.lb.get(0))
+
+        # 2 件目をもっと前の位置に積む → 本文の並び順で①②が振り直る
         dlg.txt.mark_set("insert", "1.0 + 2 chars")
         dlg._on_move()
-        check("本文を動かすと候補合わせが外れる", dlg.cmb_turn.current() == 0)
+        dlg.var_text.set("はい")
+        dlg.cmb_sp.current(1)
+        dlg._add_item()
+        disp = dlg.txt.get("1.0", "end").strip()
+        check("2 件目も積める", disp.count("①") + disp.count("②") == 2)
+        check("印は本文の並び順に振る", disp == "あい①うえお②かきくけこ")
+        check("一覧も本文の順に並ぶ",
+              "はい" in dlg.lb.get(0) and "えー" in dlg.lb.get(1))
+        check("何件積んだかボタンに出る", "2 件" in dlg.btn_ok.cget("text"))
 
-        # 全部聴く（位置を決めるために、まず全体を聴けること）
-        check("全部聴く手段がある", hasattr(dlg, "_play_all"))
+        # 印があってもクリック位置は本文の位置に戻せる
+        dlg.txt.mark_set("insert", "1.0 + 3 chars")   # ① の直後（表示上）
+        dlg._on_move()
+        check("印の分を差し引いて位置を取る", dlg._cut == 2)
+
+        # 消す・直す
+        dlg.lb.selection_clear(0, "end")
+        dlg.lb.selection_set(1)
+        dlg._del_item()
+        check("積んだものを消せる", len(dlg._items) == 1)
+        check("消すと本文の印も減る", "②" not in dlg.txt.get("1.0", "end"))
+        dlg.lb.selection_set(0)
+        dlg._edit_item()
+        check("直すと組み立て欄に戻る",
+              dlg.var_text.get() == "はい" and len(dlg._items) == 0)
+
+        # 全部聴く / この辺だけ
         played: list = []
         real_play = awin.player.play
         awin.player.play = lambda *a4, **k4: played.append((a4, k4))
@@ -1074,37 +1101,40 @@ def run() -> int:
                   played and played[-1][0][1] == 100.0
                   and played[-1][0][2] == 110.0)
             played.clear()
-            dlg.txt.mark_set("insert", "1.0 + 5 chars")
-            dlg._on_move()
             dlg._play()
             check("この辺だけは挿入位置の周りだけ",
                   played and played[-1][0][2] - played[-1][0][1] < 6.0)
             check("速さが再生に渡る",
-                  played[-1][1].get("speed") == float(
-                      dlg.var_speed.get().rstrip("x")))
+                  played[-1][1].get("speed") == dlg._speed())
         finally:
             awin.player.play = real_play
             dlg._stop_follow()
-
-        # 速さ・一時停止
         check("小窓で 0.5 倍が選べる", "0.5x" in assign_gui.DIALOG_SPEEDS)
-        check("一時停止のボタンがある", dlg.btn_pause is not None)
-        dlg._toggle_pause()             # 鳴っていなくても落ちない
-        check("鳴っていなくても一時停止で落ちない", True)
+        dlg._toggle_pause()      # 鳴っていなくても落ちない
 
+        # まとめて入れる
         dlg.var_text.set("")
-        real_warn2 = assign_gui.messagebox.showwarning
+        dlg._items = []
         warned2: list = []
-        assign_gui.messagebox.showwarning = lambda *a3, **k3: warned2.append(1)
+        real_warn2 = assign_gui.messagebox.showwarning
+        assign_gui.messagebox.showwarning = lambda *a5, **k5: warned2.append(1)
         try:
             dlg._ok()
         finally:
             assign_gui.messagebox.showwarning = real_warn2
-        check("言葉が空なら入れさせない", warned2 and dlg.result is None)
-        dlg.var_text.set("はい")
+        check("何も積んでいなければ入れさせない",
+              warned2 and dlg.result == [])
+        dlg.txt.mark_set("insert", "1.0 + 1 chars")
+        dlg._on_move()
+        dlg.var_text.set("うん")
+        dlg._add_item()
+        dlg.txt.mark_set("insert", "1.0 + 6 chars")
+        dlg._on_move()
+        dlg.var_text.set("ええ")     # 打ちかけのまま押しても拾う
         dlg._ok()
-        check("入れると結果が返る",
-              dlg.result is not None and dlg.result[2] == "はい")
+        check("まとめて複数件返す", len(dlg.result) == 2)
+        check("打ちかけの 1 件も拾う",
+              any(r[2] == "ええ" for r in dlg.result))
 
 
         # --- 時刻へ飛ぶ（2026-08-18 の指摘への対応）----------------------
