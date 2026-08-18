@@ -416,6 +416,19 @@ class AssignWindow(tk.Toplevel):
             state="normal" if self._listen_hints else "disabled")
         self.chk_listen.pack(side="left", padx=(16, 0))
 
+        # 時刻へ飛ぶ。**700 区間をスクロールで探すのは現実的でない**
+        # (実機の指摘・2026-08-18)。逐語正解の道具には既にあった機能で、
+        # 本体に無いのは抜けだった。
+        jump = ttk.Frame(filt)
+        jump.pack(side="right")
+        ttk.Label(jump, text="時刻へ飛ぶ:").pack(side="left")
+        self.var_jump = tk.StringVar()
+        ent_jump = ttk.Entry(jump, textvariable=self.var_jump, width=11)
+        ent_jump.pack(side="left", padx=4)
+        ent_jump.bind("<Return>", lambda e: self.jump_to_time())
+        ttk.Button(jump, text="→", width=3, takefocus=False,
+                   command=self.jump_to_time).pack(side="left")
+
         cols = ("time", "cluster", "speaker", "text")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("time", text="時刻")
@@ -966,6 +979,36 @@ class AssignWindow(tk.Toplevel):
         self.show_current()
         if self.var_autoplay.get():
             self.play_current()
+
+    def jump_to_time(self) -> None:
+        """入力された時刻に一番近い区間へ飛ぶ。
+
+        「25:02」「1502」「00:25:02.8」のどれでも受ける(parse_hms が吸収する)。
+        **絞り込みで隠れていても飛ぶ**——探しに来た区間が出ていないと意味が
+        ないので、必要なら絞り込みを「すべて表示」へ戻す。
+        """
+        raw = self.var_jump.get().strip()
+        if not raw or not self.proj.segments:
+            return
+        try:
+            at = parse_hms(raw)
+        except Exception:
+            self._set_action(
+                f"時刻が読めません: {raw}"
+                "（00:25:02 / 25:02 / 1502 のどれかで入れてください）")
+            return
+        # その時刻を含む区間があればそれ、無ければ一番近いもの
+        hit = next((s for s in self.proj.segments if s.start <= at < s.end), None)
+        if hit is None:
+            hit = min(self.proj.segments, key=lambda s: abs(s.start - at))
+        if hit.index not in self._visible_indexes():
+            self.var_filter.set(FILTER_ALL)
+            self.var_listen_order.set(False)
+            self.reload_tree()
+            self._set_action("絞り込みを「すべて表示」に戻して飛びました。")
+        self.goto(hit.index)
+        self._set_action(
+            f"{fmt_hms_frac(at)} → {fmt_hms(hit.start)} の区間へ飛びました。")
 
     def move(self, delta: int) -> None:
         """一覧上で delta 件ぶん移動する。

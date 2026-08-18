@@ -1083,6 +1083,60 @@ def run() -> int:
         check("入れると結果が返る",
               dlg.result is not None and dlg.result[2] == "はい")
 
+
+        # --- 時刻へ飛ぶ（2026-08-18 の指摘への対応）----------------------
+        # 「聴く順にすると時間順でないので探せない」。700 区間をスクロールで
+        # 探すのは現実的でない。逐語正解の道具にはあった機能で、本体に
+        # 無いのは抜けだった。
+        jp = Project(audio_path=str(tmp / "meeting.m4a"),
+                     duration=3600.0, chunk_seconds=600)
+        jp.speakers = parse_roster("佐藤\n田中")
+        jp.segments = [
+            Segment(index=i, start=1490.0 + i * 6.0, end=1490.0 + i * 6.0 + 5.0,
+                    text=f"発言 {i}。", cluster="g:A", chunk=0)
+            for i in range(6)
+        ]
+        jp.json_path = str(tmp / "jump.speakers.json")
+        jp.save()
+        jwin = AssignWindow(root, jp)
+        jwin.var_autoplay.set(False)
+        jwin.update()
+
+        jwin.var_jump.set("25:02")          # 1502 秒 = 3 番目の区間の先頭
+        jwin.jump_to_time()
+        check("分:秒 で飛べる", jp.segments[jwin.current].start == 1502.0)
+
+        jwin.var_jump.set("00:25:20")       # 1520 秒 = 6 番目
+        jwin.jump_to_time()
+        check("時:分:秒 でも飛べる", jp.segments[jwin.current].start == 1520.0)
+
+        jwin.var_jump.set("1508")           # 秒だけでも
+        jwin.jump_to_time()
+        check("秒だけでも飛べる", jp.segments[jwin.current].start == 1508.0)
+
+        jwin.var_jump.set("9999")           # どの区間にも入らない → 一番近い
+        jwin.jump_to_time()
+        check("どの区間にも入らなければ一番近くへ",
+              jp.segments[jwin.current].start == 1520.0)
+
+        jwin.var_jump.set("あいうえお")
+        jwin.jump_to_time()
+        check("読めない時刻は知らせるだけ（落ちない）",
+              "読めません" in jwin.var_action.get())
+
+        # 絞り込みで隠れている区間にも飛ぶ（探しに来たのに出ないのは困る）
+        jp.segments[0].speaker_id = jp.speakers[0].id
+        jp.segments[0].reviewed = True
+        jwin.var_filter.set(FILTER_UNASSIGNED)
+        jwin.reload_tree()
+        jwin.var_jump.set("24:50")          # 1490 秒 = 確定済みの 0 番目
+        jwin.jump_to_time()
+        check("絞り込みで隠れていても飛ぶ", jwin.current == 0)
+        check("絞り込みを戻したと知らせる",
+              jwin.var_filter.get() == FILTER_ALL)
+        jwin.player.close()
+        jwin.destroy()
+
         awin.player.close()
         awin.destroy()
         root.destroy()
