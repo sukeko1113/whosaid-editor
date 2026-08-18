@@ -23,6 +23,26 @@ SCHEMA_VERSION = 5
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
 
+# 人が足した相づちを出力にどう書くか(設計書 §11)。データは 1 つのまま、
+# 出し方だけを選ぶ。標準の表記法を調べた結果、BTSJ(基本的な文字化の原則・
+# 宇佐美まゆみ 2019)にちょうどこの規定があったので、それに従う。
+INSERT_STYLE_LINE = "line"       # 行を分ける。続く行は末尾 ,, でつなぐ(BTSJ 2.3.2)
+INSERT_STYLE_INLINE = "inline"   # 行に埋め込む。(山本：はい) の形(BTSJ 3.2.3)
+INSERT_STYLES = (INSERT_STYLE_LINE, INSERT_STYLE_INLINE)
+
+# BTSJ 2.3.2 の「発話文が終わっていない」印。独自記号を作ると外部に説明できない
+CONTINUE_MARK = ",,"
+
+# 記号だけ出しても受け取った人が読めないので、差し込みがあるときだけ添える
+INSERT_LEGEND = {
+    INSERT_STYLE_LINE:
+        f"凡例: 発言の末尾の「{CONTINUE_MARK}」は、その発言が下の行に続いていることを"
+        "示します(BTSJ 2.3.2 に準拠)。間の行は、そこに重なって入った別の人の発言です。",
+    INSERT_STYLE_INLINE:
+        "凡例: 本文中の「(氏名：…)」は、その位置に重なって入った別の人の発言です"
+        "(BTSJ 3.2.3 に準拠)。",
+}
+
 # 特別扱いの話者 ID(名簿の人物ではない)
 SPECIAL_UNKNOWN = "__unknown__"
 SPECIAL_MULTI = "__multi__"
@@ -841,65 +861,126 @@ class Project:
 # Word 出力
 # ----------------------------------------------------------------------
 
-def _merge_runs(
-    proj: Project,
-    merge_consecutive: bool = True,
-    drop_noise: bool = True,
-) -> list[tuple[float, Optional[str], str]]:
-    """(開始秒, 話者ID, 本文) の並びを作る。
-    merge_consecutive=True なら、同一話者の連続区間を 1 段落にまとめる。
-    drop_noise=True なら「発言なし・雑音」と印を付けた区間は出力しない。
+def _insert_cuts(proj: Project) -> dict[float, list[tuple[int, float]]]:
+    """「どの区間の、本文の何文字目に、どの追加発話が割り込んだか」を集める。
+
+    割り込み位置は add_utterance が edit_log に残している(区間そのものは
+    割らない。割ると、直すときに元の本文を復元できない → 設計書 §5.0.5)。
+    消された追加発話は取り除く。
     """
-    # **人が足した発話は、割り込んだ位置で元の本文に差し込む。**
-    # 区間そのものは割らない(割ると、直すときに元の本文を復元できない)。
-    # 割り込み位置は add_utterance が edit_log に残している。
-    # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
-    # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
     cuts: dict[float, list[tuple[int, float]]] = {}
     for rec in proj.edit_log:
-        if rec.get("op") == "add_utterance" and rec.get("cut") is not None                 and rec.get("parent_orig") is not None:
+        if (rec.get("op") == "add_utterance" and rec.get("cut") is not None
+                and rec.get("parent_orig") is not None):
             cuts.setdefault(round(float(rec["parent_orig"]), 3), []).append(
                 (int(rec["cut"]), round(float(rec["orig_start"]), 3)))
         elif rec.get("op") == "remove_added_utterance":
             key = round(float(rec.get("orig_start", -1)), 3)
             for lst in cuts.values():
                 lst[:] = [c for c in lst if c[1] != key]
+    return cuts
+
+
+def has_inserted_utterances(proj: Project) -> bool:
+    """出力の本文に差し込まれる追加発話があるか(凡例を出すかの判断に使う)"""
+    added = {round(float(s.orig_start), 3)
+             for s in proj.segments if proj.is_added_utterance(s)}
+    return any(key in added
+               for lst in _insert_cuts(proj).values() for _cut, key in lst)
+
+
+def _merge_runs(
+    proj: Project,
+    merge_consecutive: bool = True,
+    drop_noise: bool = True,
+    insert_style: str = INSERT_STYLE_LINE,
+) -> list[tuple[float, Optional[str], str, bool]]:
+    """(開始秒, 話者ID, 本文, 続きか) の並びを作る。
+
+    merge_consecutive=True なら、同一話者の連続区間を 1 段落にまとめる。
+    drop_noise=True なら「発言なし・雑音」と印を付けた区間は出力しない。
+    insert_style は人が足した相づちの書き方(設計書 §11)。
+      INSERT_STYLE_LINE   … 行を分け、割られた前半の末尾に ,, を付ける
+      INSERT_STYLE_INLINE … 元の本文の中に (氏名：本文) の形で埋め込む
+
+    「続きか」が True の要素は、**割られた発言の後半**である。時刻を書いては
+    いけない。前半と同じ開始時刻しか持っておらず、そのまま出すと時刻が
+    戻って見える。**後半の本当の開始時刻は測っていないので書かない**
+    (測っていないものを書けば記録として嘘になる → 設計書 §11.3)。
+    """
+    # **人が足した発話は、割り込んだ位置で元の本文に差し込む。**
+    # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
+    # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
+    cuts = _insert_cuts(proj)
     added_by_key = {round(float(s.orig_start), 3): s
                     for s in proj.segments if proj.is_added_utterance(s)}
+    inline = insert_style == INSERT_STYLE_INLINE
 
-    def pieces(seg: Segment) -> list[Segment]:
-        """区間を、割り込みの位置で切った断片に分ける（出力のためだけ）。"""
-        marks = sorted(
+    def marks_for(seg: Segment) -> list[tuple[int, float]]:
+        return sorted(
             (c for c in cuts.get(round(float(seg.orig_start), 3), [])
              if c[1] in added_by_key),
             key=lambda c: c[0])
+
+    def label_of(seg: Segment) -> str:
+        sp = proj.speaker(seg.speaker_id)
+        return sp.name if sp else UNKNOWN_LABEL
+
+    def pieces(seg: Segment) -> list[tuple[Segment, bool, bool]]:
+        """区間を割り込みの位置で切った断片に分ける(出力のためだけ)。
+
+        返すのは (断片, 続きか, 閉じたか)。「閉じた」は末尾に ,, を付けた
+        断片で、後ろに何も足してはいけない(足すと ,, が文中に埋もれ、
+        そこで割り込まれたことが読み取れなくなる)。
+        inline のときは切らず、本文に埋め込んだ 1 つの断片にする。
+        """
+        marks = marks_for(seg)
         if not marks:
-            return [seg]
-        out: list[Segment] = []
-        prev = 0
+            return [(seg, False, False)]
+        if inline:
+            out, prev = [], 0
+            for cut, key in marks:
+                cut = max(0, min(len(seg.text), cut))
+                add = added_by_key[key]
+                if drop_noise and add.speaker_id == SPECIAL_NOISE:
+                    continue
+                body = add.text.strip()
+                if not body:
+                    continue
+                out.append(seg.text[prev:cut])
+                out.append(f"({label_of(add)}：{body})")
+                prev = cut
+            out.append(seg.text[prev:])
+            return [(replace(seg, text="".join(out)), False, False)]
+        out2: list[tuple[Segment, bool, bool]] = []
+        prev, cont = 0, False
         for cut, key in marks:
             cut = max(0, min(len(seg.text), cut))
             head = seg.text[prev:cut]
             if head.strip():
-                out.append(replace(seg, text=head))
-            out.append(added_by_key[key])
+                # 下の行に続くことを示す(BTSJ 2.3.2)。ここで閉じる
+                out2.append(
+                    (replace(seg, text=head.rstrip() + CONTINUE_MARK), cont, True))
+                cont = True
+            out2.append((added_by_key[key], False, False))
             prev = cut
         tail = seg.text[prev:]
         if tail.strip():
-            out.append(replace(seg, text=tail))
-        return out
+            out2.append((replace(seg, text=tail), cont, False))
+        return out2
 
-    ordered: list[Segment] = []
+    ordered: list[tuple[Segment, bool, bool]] = []
     for seg in proj.segments:
         if proj.is_added_utterance(seg):
-            # 差し込み先で出すので、単独では出さない（先が無ければ出す）
+            # 差し込み先で出すので、単独では出さない(先が無ければ出す)
             key = round(float(seg.orig_start), 3)
             if any(key in [k for _c, k in v] for v in cuts.values()):
                 continue
         ordered.extend(pieces(seg))
 
-    runs: list[tuple[float, Optional[str], list[str]]] = []
-    for seg in ordered:
+    runs: list[tuple[float, Optional[str], list[str], bool]] = []
+    closed = False          # 直前の段落が ,, で閉じられたか
+    for seg, cont, shut in ordered:
         text = seg.text.strip()
         if not text:
             continue
@@ -910,12 +991,15 @@ def _merge_runs(
             and runs
             and runs[-1][1] == seg.speaker_id
             and seg.speaker_id is not None
+            and not cont          # 割られた後半は、前半と同じ段落に戻さない
+            and not closed        # ,, で閉じた段落の後ろにも足さない
         ):
             runs[-1][2].append(text)
         else:
-            runs.append((seg.start, seg.speaker_id, [text]))
+            runs.append((seg.start, seg.speaker_id, [text], cont))
+        closed = shut
     # 日本語なので連結時に空白を挟まない
-    return [(start, sid, "".join(parts)) for start, sid, parts in runs]
+    return [(start, sid, "".join(parts), cont) for start, sid, parts, cont in runs]
 
 
 def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
@@ -994,11 +1078,13 @@ def write_docx(
     drop_noise: bool = True,
     include_verification: bool = True,
     revision: Optional[int] = None,
+    insert_style: str = INSERT_STYLE_LINE,
 ) -> Path:
     """割当結果を Word ファイルに書き出す。
 
     include_verification: 末尾に検証要約(元音声・SHA-256・処理経路・版・
     確認状態)を付ける。revision はこの出力の版番号(省略時は記録済みの値)。
+    insert_style: 人が足した相づちの書き方(設計書 §11)。
     """
     from docx import Document
     from docx.shared import Pt, RGBColor
@@ -1026,6 +1112,13 @@ def write_docx(
         head.bold = True
         p.add_run("、".join(sp.display for sp in proj.speakers))
 
+    # 記号だけ出しても受け取った人が読めない。差し込みがあるときだけ添える
+    if has_inserted_utterances(proj):
+        p = doc.add_paragraph()
+        run = p.add_run(INSERT_LEGEND[insert_style])
+        run.italic = True
+        run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+
     if include_note:
         p = doc.add_paragraph()
         run = p.add_run(build_note(proj))
@@ -1033,9 +1126,11 @@ def write_docx(
         run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
         doc.add_paragraph()
 
-    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
+    for start, sid, text, cont in _merge_runs(
+            proj, merge_consecutive, drop_noise, insert_style):
         p = doc.add_paragraph()
-        if with_timestamps:
+        # 割られた発言の後半には時刻を書かない(測っていない → 設計書 §11.3)
+        if with_timestamps and not cont:
             ts = p.add_run(f"[{fmt_hms(start)}] ")
             ts.bold = True
         sp = proj.speaker(sid)
@@ -1074,12 +1169,19 @@ def write_text(
     output_path: Path | str,
     merge_consecutive: bool = True,
     drop_noise: bool = True,
+    insert_style: str = INSERT_STYLE_LINE,
 ) -> Path:
     """プレーンテキスト出力(自分のテンプレートに貼り込む場合や、差分取り用)"""
     output_path = Path(output_path)
     lines = []
-    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
+    if has_inserted_utterances(proj):
+        lines.append(INSERT_LEGEND[insert_style])
+        lines.append("")
+    for start, sid, text, cont in _merge_runs(
+            proj, merge_consecutive, drop_noise, insert_style):
         sp = proj.speaker(sid)
-        lines.append(f"[{fmt_hms(start)}] 【{sp.name if sp else UNKNOWN_LABEL}】 {text}")
+        # 後半には時刻を書かない。桁だけ空けて縦を揃える(設計書 §11.3)
+        head = " " * (len(fmt_hms(start)) + 3) if cont else f"[{fmt_hms(start)}] "
+        lines.append(f"{head}【{sp.name if sp else UNKNOWN_LABEL}】 {text}")
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path

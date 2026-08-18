@@ -49,7 +49,9 @@ from src.transcribe import (  # noqa: E402
 from src.align import AlignUnavailable  # noqa: E402
 from src import diarize, evaluate  # noqa: E402
 from src.local_asr import LocalTranscriber  # noqa: E402
-from src.segments import _merge_runs  # noqa: E402
+from src.segments import (  # noqa: E402
+    _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
+    INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
     Utterance,
@@ -1083,12 +1085,12 @@ def test_word_output_puts_the_added_one_inside_the_text():
     base = proj.segments[1]
     _add_at(proj, base, 3, 103.0, "はい", "sp02")
     _add_at(proj, base, 7, 107.0, "ええ", "sp02")
-    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
-    assert "ながら" in bodies, bodies
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
     assert "はい" in bodies and "ええ" in bodies, bodies
     assert "はいええ" not in "".join(bodies), "相づちがひとまとまりになっている"
     # 元の話者の断片が、相づちを挟んで前後に出る
-    assert bodies.index("はい") == bodies.index("ながら") + 1
+    assert bodies.index("はい") == bodies.index("ながら" + CONTINUE_MARK) + 1
     assert bodies.index("ええ") > bodies.index("はい")
 
 
@@ -1096,7 +1098,7 @@ def test_word_output_does_not_duplicate_the_added_one():
     """差し込んだものを、単独でももう一度出さない。"""
     proj = _base_for_insert()
     _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
-    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
     assert sum(1 for b in bodies if b == "はい") == 1, bodies
 
 
@@ -1104,7 +1106,7 @@ def test_word_output_keeps_added_ones_without_a_cut():
     """位置を持たない足し方（データ層の直呼び）でも消えない。"""
     proj = _base_for_insert()
     proj.add_utterance(103.0, 103.6, "うん", "g:D")
-    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
     assert "うん" in "".join(bodies)
 
 
@@ -1113,9 +1115,136 @@ def test_word_output_forgets_removed_ones():
     proj = _base_for_insert()
     added = _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
     proj.remove_added_utterance(added.index)
-    bodies = [text for _s, _sid, text in _merge_runs(proj, True)]
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
     assert "はい" not in "".join(bodies)
     assert "ながらけれどもそれで" in bodies, bodies
+
+
+# --- 出力の表記法(設計書 §11)------------------------------------------
+# 標準を調べたら BTSJ(基本的な文字化の原則)に規定があった。データは 1 つの
+# まま、出し方だけを 2 通りから選ぶ。壊れたら落とす。
+
+def test_line_style_marks_that_the_utterance_continues():
+    """**割られた前半の末尾に ,, を付ける(BTSJ 2.3.2)。**
+
+    これが無いと、読む人は「1 つの発言が割り込まれた」のか「同じ人が 2 回
+    別々に発言した」のか区別できない。記録としての欠陥になる。
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    bodies = [r[2] for r in runs]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
+    assert "けれどもそれで" in bodies, bodies        # 後半には付けない
+    assert not any(b.endswith(CONTINUE_MARK) for b in bodies if b == "はい")
+
+
+def test_line_style_does_not_put_a_time_on_the_second_half():
+    """**割られた後半に時刻を書かない(設計書 §11.3)。**
+
+    後半は前半と同じ開始時刻しか持っておらず、そのまま出すと時刻が戻って
+    見える。**測っていないものを書けば記録として嘘になる。**
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    by_text = {r[2]: r for r in runs}
+    assert by_text["ながら" + CONTINUE_MARK][3] is False   # 前半は時刻を出す
+    assert by_text["けれどもそれで"][3] is True            # 後半は出さない
+    assert by_text["はい"][3] is False                     # 相づちは出す
+
+
+def test_line_style_keeps_the_two_halves_in_separate_paragraphs():
+    """後半を、前半と同じ段落にまとめ直さない(まとめると ,, が文中に埋もれる)"""
+    proj = _base_for_insert()
+    # 相づちを、割られた前後と同じ話者にする（まとめの条件を踏ませる）
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", proj.segments[1].speaker_id)
+    bodies = [r[2] for r in _merge_runs(proj, True, True, INSERT_STYLE_LINE)]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
+    assert "けれどもそれで" in bodies, bodies
+
+
+def test_inline_style_puts_the_backchannel_inside_the_text():
+    """**行に埋め込む形(BTSJ 3.2.3 例49)。**
+
+    多人数の会議なので、BTSJ と違って氏名を入れる(誰が言ったかの記録が
+    製品価値そのものなので、ここは譲れない)。
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    _add_at(proj, proj.segments[1], 7, 107.0, "ええ", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_INLINE)
+    bodies = [r[2] for r in runs]
+    joined = "".join(bodies)
+    assert "ながら(山本：はい)けれども(山本：ええ)それで" in joined, bodies
+    assert not any(b == "はい" for b in bodies), "単独でも出してしまっている"
+    assert all(r[3] is False for r in runs), "埋め込みでは後半という概念が無い"
+
+
+def test_inline_style_uses_the_unknown_label_when_not_assigned():
+    """話者が決まっていなくても落ちない(名前の代わりに既定の呼び名)"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", None)
+    joined = "".join(r[2] for r in _merge_runs(proj, True, True, INSERT_STYLE_INLINE))
+    assert f"({UNKNOWN_LABEL}：はい)" in joined, joined
+
+
+def test_both_styles_agree_on_what_was_said():
+    """**どちらで出しても、言葉そのものは同じ。**出し方だけが違う。"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+
+    def words(style):
+        joined = "".join(r[2] for r in _merge_runs(proj, True, True, style))
+        for ch in "()（）：,山本":
+            joined = joined.replace(ch, "")
+        return joined
+    assert words(INSERT_STYLE_LINE) == words(INSERT_STYLE_INLINE)
+
+
+def test_legend_only_when_something_was_inserted():
+    """凡例は使われたときだけ。無関係な凡例は記録を汚す。"""
+    proj = _base_for_insert()
+    assert has_inserted_utterances(proj) is False
+    added = _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    assert has_inserted_utterances(proj) is True
+    proj.remove_added_utterance(added.index)
+    assert has_inserted_utterances(proj) is False, "消したのに凡例が出る"
+
+
+def test_legend_without_a_cut_is_not_shown():
+    """位置を持たない足し方は本文に差し込まれないので、凡例も要らない。"""
+    proj = _base_for_insert()
+    proj.add_utterance(103.0, 103.6, "うん", "g:D")
+    assert has_inserted_utterances(proj) is False
+
+
+def test_legend_explains_each_style():
+    """記号だけ出しても受け取った人が読めない。両方に説明がある。"""
+    assert CONTINUE_MARK in INSERT_LEGEND[INSERT_STYLE_LINE]
+    assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_LINE]
+    assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_INLINE]
+
+
+def test_write_text_carries_the_style(tmp_path=None):
+    """テキスト出力にも同じ選択が効く(凡例・,,・後半の時刻なし)。"""
+    import tempfile
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    with tempfile.TemporaryDirectory() as d:
+        out = write_text(proj, Path(d) / "a.txt", insert_style=INSERT_STYLE_LINE)
+        body = out.read_text(encoding="utf-8")
+        assert INSERT_LEGEND[INSERT_STYLE_LINE] in body
+        assert "ながら" + CONTINUE_MARK in body
+        # 後半の行は時刻の桁を空ける（[ で始まらない）
+        tail = [ln for ln in body.splitlines() if "けれどもそれで" in ln][0]
+        assert not tail.lstrip().startswith("["), tail
+        assert tail.startswith(" "), tail
+
+        out2 = write_text(proj, Path(d) / "b.txt", insert_style=INSERT_STYLE_INLINE)
+        body2 = out2.read_text(encoding="utf-8")
+        assert "(山本：はい)" in body2, body2
+        assert CONTINUE_MARK not in body2, body2
 
 
 def test_remove_added_utterance_only_removes_added_ones():
