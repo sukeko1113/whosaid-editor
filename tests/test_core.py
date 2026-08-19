@@ -8,8 +8,10 @@ GUI・Gemini API・ffmpeg には依存しない。
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,6 +44,23 @@ from src.transcribe import (  # noqa: E402
     build_prompt,
     normalize_cluster_label,
     parse_segments,
+    parse_utterances,
+)
+from src.align import AlignUnavailable  # noqa: E402
+from src import diarize, evaluate  # noqa: E402
+from src.local_asr import LocalTranscriber  # noqa: E402
+from src.segments import (  # noqa: E402
+    _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
+    short_labels, Speaker, suggest_split, suggest_roster_rows,
+    speaker_label, build_log_summary, fmt_log_at, LOG_LABELS,
+    build_verification,
+    INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
+from src.segments import (  # noqa: E402
+    PSEUDO_UNKNOWN,
+    Utterance,
+    assign_speaker_clusters,
+    merge_same_speaker,
+    utterances_to_segments,
 )
 
 
@@ -453,6 +472,108 @@ def test_build_prompt_cluster_only_has_no_names():
     assert "名前や役職は絶対に書かない" in p
 
 
+def test_verbatim_prompt_does_not_absorb_backchannels():
+    """逐語では相づちを前の行に含めさせない。
+
+    **「一切要約・整文しない」と正面から矛盾する指示だった。**しかも相づちは
+    消えるのではなく前の話者の行に混ざるので、「誰が言ったか」の記録としては
+    消えるより悪い（別人の発言として残る）。
+    CLAUDE.md の原則:「短い相づちの自動削除・自動重複除去はしない」。
+    """
+    p = build_prompt(True, True, verbatim=True)
+    assert "前の発言と同じ行に含めてよい" not in p
+    assert "独立した行" in p
+
+
+def test_verbatim_prompt_limits_line_length():
+    """同じ話者が続いても行を分けさせる。
+
+    区切りが話者交代だけだと 1 区間が 112 秒に達し（実測）、**その区間には
+    話者を割り当てられない**——間に何人も話しているため。
+    """
+    p = build_prompt(True, True, verbatim=True)
+    assert "20 秒" in p
+
+
+def test_verbatim_example_shows_short_lines():
+    """例は指示より強く効く。相づちが独立した行になっている例を見せる。"""
+    p = build_prompt(True, True, verbatim=True)
+    assert "[00:08] 【発言者B】 はい。" in p
+
+
+def test_cleanup_prompt_keeps_the_old_rule():
+    """整文モード（既定）は従来どおり。手数を減らすための指示なので残す。"""
+    p = build_prompt(True, True, verbatim=False)
+    assert "前の発言と同じ行に含めてよい" in p
+    assert "20 秒" not in p
+
+
+def _long_turn(lines: int = 19) -> str:
+    """同じ話者が 6 秒おきに話し続ける出力。実データと同じ形。"""
+    out = ["[00:00] 【A】 よろしくお願いいたします。",
+           "[00:05] 【B】 はい。",
+           "[00:06] 【A】 はい、以上。"]
+    for i in range(lines - 3):
+        s = 7 + i * 6
+        out.append(f"[{s//60:02d}:{s%60:02d}] 【C】 えー、あの、それでですね、続きの話をします。")
+    return "\n".join(out)
+
+
+def test_verbatim_does_not_merge_a_turn_into_one_block():
+    """逐語では、同じ人が話し続けても 1 区間に潰さない。
+
+    **Gemini は 5〜8 秒ごとに出しているのに、後処理が 112 秒の塊にしていた**
+    （実測）。その長さの区間には話者を割り当てられない——間に何人も話すため。
+    """
+    u = parse_utterances(_long_turn(), chunk_seconds=103.0, verbatim=True)
+    assert len(u) > 6, f"潰れている: {len(u)} 区間"
+    # **最後の区間は除く。**「区間の終わりは次の区間の開始、最後だけチャンク
+    # 末尾」という別の規則で伸びるので、連結の上限とは無関係に長くなる。
+    assert max(x.rel_end - x.rel_start for x in u[:-1]) <= 21.0
+
+
+def test_cleanup_still_merges_long_turns():
+    """整文モード（既定）は従来どおり連結する。
+
+    52 分の音声で 600 区間を超えると割当が現実的でなくなる、という判断は
+    そのまま残す。
+    """
+    u = parse_utterances(_long_turn(), chunk_seconds=103.0, verbatim=False)
+    assert max(x.rel_end - x.rel_start for x in u) > 60.0
+
+
+def test_verbatim_still_joins_fragments():
+    """断片の連結は逐語でも効く。1 文が数行に割れるのは読みづらい。"""
+    text = ("[00:00] 【A】 求めるものは、\n"
+            "[00:02] 【A】 工程表、\n"
+            "[00:04] 【A】 えー、財源計画、\n"
+            "[00:06] 【A】 年度別資金繰り計画です。")
+    u = parse_utterances(text, chunk_seconds=30.0, verbatim=True)
+    assert len(u) == 1, f"断片が連結されていない: {len(u)} 区間"
+
+
+def test_verbatim_keeps_another_speaker_separate():
+    """別の人の相づちは、逐語でも整文でも連結しない（元からの挙動）。"""
+    text = "[00:00] 【A】 そうですね。\n[00:02] 【B】 はい。\n[00:03] 【A】 それで、"
+    for vb in (True, False):
+        u = parse_utterances(text, chunk_seconds=30.0, verbatim=vb)
+        assert len(u) == 3, f"verbatim={vb} で {len(u)} 区間"
+
+
+def test_verbatim_cache_key_carries_the_prompt_version():
+    """逐語のキャッシュキーにプロンプトの版が入る。
+
+    **無いと、指示を変えても古い転写を使い回す。**CLAUDE.md:
+    「どれかを欠くと古い転写の使い回し事故になる」。
+    """
+    from src.pipeline import VERBATIM_PROMPT_VER, _cache_suffix
+    now = _cache_suffix(True, True, True, "", 10, "abc")
+    assert f"vb{VERBATIM_PROMPT_VER}" in now
+    assert ".vb." not in now            # 版なしの古い形と衝突しない
+    # 逐語でなければ版は付かない
+    assert "vb" not in _cache_suffix(True, True, False, "", 10, "abc")
+
+
 # ======================================================================
 # 候補の学習・並べ替え
 # ======================================================================
@@ -848,6 +969,782 @@ def _splittable() -> Project:
     return proj
 
 
+# ======================================================================
+# 相づちを足す(設計書 claude_相づちを足す_設計書.md)
+# ======================================================================
+
+def test_add_utterance_inserts_in_time_order():
+    """時間順の正しい位置に入り、番号が振り直される。"""
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はいはい", cluster="g:B")
+    assert len(proj.segments) == 4
+    assert [s.index for s in proj.segments] == [0, 1, 2, 3]
+    assert proj.segments[2] is seg                    # 100〜110 の次
+    assert (seg.start, seg.end, seg.text) == (105.0, 105.8, "はいはい")
+    assert seg.cluster == "g:B"
+
+
+def test_add_utterance_does_not_assign_a_speaker():
+    """話者は付けずに返す。**機械が ✓ を立てる経路は作らない。**
+
+    話者を付けるのは呼び出し側の通常の割当操作で、そのときの ✓/△ は
+    既存の意味論に従う。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "うん")
+    assert seg.speaker_id is None
+    assert seg.reviewed is False
+
+
+def test_add_utterance_marks_text_edited_not_time_edited():
+    """本文は人が打った(text_edited)。時刻は turn 由来の機械値。
+
+    time_edited を立てると、再実行の引き継ぎで「旧側が正しい」枝に入り、
+    **他の区間を置き換えて消す**(設計書 §4)。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "ええ")
+    assert seg.text_edited is True
+    assert seg.time_edited is False
+
+
+def test_add_utterance_allows_overlap():
+    """既存区間と時間的に重なってよい。**相づちは重なるのが本性。**"""
+    proj = _splittable()
+    seg = proj.add_utterance(102.0, 103.0, "はい")     # 100〜110 の内側
+    assert len(proj.segments) == 4
+    others = [s for s in proj.segments if s is not seg]
+    assert any(s.start < seg.start and s.end > seg.end for s in others)
+
+
+def test_add_utterance_rejects_empty_text():
+    proj = _splittable()
+    try:
+        proj.add_utterance(105.0, 105.8, "   ")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("空の本文を受け付けてしまった")
+
+
+def test_add_utterance_records_the_key_in_edit_log():
+    """識別は edit_log。**スキーマ(区間のフラグ)を増やさない。**"""
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    rec = [r for r in proj.edit_log if r.get("op") == "add_utterance"]
+    assert len(rec) == 1
+    assert rec[0]["orig_start"] == seg.orig_start
+    assert rec[0]["actor"] == "user"
+    assert proj.added_utterance_keys() == {round(seg.orig_start, 3)}
+    assert proj.is_added_utterance(seg) is True
+    assert proj.is_added_utterance(proj.segments[0]) is False
+
+
+def _base_for_insert() -> Project:
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("西村" + chr(10) + "山本")
+    proj.segments = [
+        Segment(index=0, start=90.0, end=100.0, text="前の発言", cluster="g:A"),
+        Segment(index=1, start=100.0, end=110.0,
+                text="ながらけれどもそれで", cluster="g:B",
+                speaker_id="sp01", reviewed=True),
+        Segment(index=2, start=110.0, end=120.0, text="次の発言", cluster="g:C"),
+    ]
+    return proj
+
+
+def _add_at(proj, base, cut, at, text, sid=None):
+    seg = proj.add_utterance(at, at + 0.6, text, "g:D",
+                             cut=cut, parent_orig=base.orig_start)
+    seg.speaker_id = sid
+    seg.reviewed = bool(sid)
+    return seg
+
+
+def test_added_utterance_records_where_it_cut_in():
+    """**どの区間の本文の、どこに割り込んだかを残す。**
+
+    区間は割らない(割ると、直すときに元の本文を復元できない)。
+    代わりにこれを覚えておき、Word に出すときだけ差し込む。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    rec = [r for r in proj.edit_log if r.get("op") == "add_utterance"][0]
+    assert rec["cut"] == 3
+    assert rec["parent_orig"] == base.orig_start
+    # 元の区間はそのまま（割れていない）
+    assert proj.segments[1].text == "ながらけれどもそれで"
+
+
+def test_word_output_puts_the_added_one_inside_the_text():
+    """**Word 出力が読んだとおりの順になる。**これが cut を残す理由そのもの。
+
+    割り込み位置で本文を切り、その間に足した発話を挟む。やらないと
+    「長い発言 → 相づち」の順になり、しかも同じ話者の相づちが 1 段落に
+    まとまる（実機で「あ、はいはいはいええはいはい」になった）。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    _add_at(proj, base, 7, 107.0, "ええ", "sp02")
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
+    assert "はい" in bodies and "ええ" in bodies, bodies
+    assert "はいええ" not in "".join(bodies), "相づちがひとまとまりになっている"
+    # 元の話者の断片が、相づちを挟んで前後に出る
+    assert bodies.index("はい") == bodies.index("ながら" + CONTINUE_MARK) + 1
+    assert bodies.index("ええ") > bodies.index("はい")
+
+
+def test_word_output_does_not_duplicate_the_added_one():
+    """差し込んだものを、単独でももう一度出さない。"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert sum(1 for b in bodies if b == "はい") == 1, bodies
+
+
+def test_word_output_keeps_added_ones_without_a_cut():
+    """位置を持たない足し方（データ層の直呼び）でも消えない。"""
+    proj = _base_for_insert()
+    proj.add_utterance(103.0, 103.6, "うん", "g:D")
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert "うん" in "".join(bodies)
+
+
+def test_word_output_forgets_removed_ones():
+    """消した発話は差し込まれない。"""
+    proj = _base_for_insert()
+    added = _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    proj.remove_added_utterance(added.index)
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert "はい" not in "".join(bodies)
+    assert "ながらけれどもそれで" in bodies, bodies
+
+
+# --- 出力の表記法(設計書 §11)------------------------------------------
+# 標準を調べたら BTSJ(基本的な文字化の原則)に規定があった。データは 1 つの
+# まま、出し方だけを 2 通りから選ぶ。壊れたら落とす。
+
+def test_line_style_marks_that_the_utterance_continues():
+    """**割られた前半の末尾に ,, を付ける(BTSJ 2.3.2)。**
+
+    これが無いと、読む人は「1 つの発言が割り込まれた」のか「同じ人が 2 回
+    別々に発言した」のか区別できない。記録としての欠陥になる。
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    bodies = [r[2] for r in runs]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
+    assert "けれどもそれで" in bodies, bodies        # 後半には付けない
+    assert not any(b.endswith(CONTINUE_MARK) for b in bodies if b == "はい")
+
+
+def test_line_style_does_not_put_a_time_on_the_second_half():
+    """**割られた後半に時刻を書かない(設計書 §11.3)。**
+
+    後半は前半と同じ開始時刻しか持っておらず、そのまま出すと時刻が戻って
+    見える。**測っていないものを書けば記録として嘘になる。**
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    by_text = {r[2]: r for r in runs}
+    assert by_text["ながら" + CONTINUE_MARK][3] is False   # 前半は時刻を出す
+    assert by_text["けれどもそれで"][3] is True            # 後半は出さない
+    assert by_text["はい"][3] is False                     # 相づちは出す
+
+
+def test_line_style_keeps_the_two_halves_in_separate_paragraphs():
+    """後半を、前半と同じ段落にまとめ直さない(まとめると ,, が文中に埋もれる)"""
+    proj = _base_for_insert()
+    # 相づちを、割られた前後と同じ話者にする（まとめの条件を踏ませる）
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", proj.segments[1].speaker_id)
+    bodies = [r[2] for r in _merge_runs(proj, True, True, INSERT_STYLE_LINE)]
+    assert "ながら" + CONTINUE_MARK in bodies, bodies
+    assert "けれどもそれで" in bodies, bodies
+
+
+def test_inline_style_puts_the_backchannel_inside_the_text():
+    """**行に埋め込む形(BTSJ 3.2.3 例49)。**
+
+    多人数の会議なので、BTSJ と違って氏名を入れる(誰が言ったかの記録が
+    製品価値そのものなので、ここは譲れない)。
+    """
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    _add_at(proj, proj.segments[1], 7, 107.0, "ええ", "sp02")
+    runs = _merge_runs(proj, True, True, INSERT_STYLE_INLINE)
+    bodies = [r[2] for r in runs]
+    joined = "".join(bodies)
+    assert "ながら(山本：はい)けれども(山本：ええ)それで" in joined, bodies
+    assert not any(b == "はい" for b in bodies), "単独でも出してしまっている"
+    assert all(r[3] is False for r in runs), "埋め込みでは後半という概念が無い"
+
+
+def test_inline_style_uses_the_unknown_label_when_not_assigned():
+    """話者が決まっていなくても落ちない(名前の代わりに既定の呼び名)"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", None)
+    joined = "".join(r[2] for r in _merge_runs(proj, True, True, INSERT_STYLE_INLINE))
+    assert f"({UNKNOWN_LABEL}：はい)" in joined, joined
+
+
+def test_both_styles_agree_on_what_was_said():
+    """**どちらで出しても、言葉そのものは同じ。**出し方だけが違う。"""
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+
+    def words(style):
+        joined = "".join(r[2] for r in _merge_runs(proj, True, True, style))
+        for ch in "()（）：,山本":
+            joined = joined.replace(ch, "")
+        return joined
+    assert words(INSERT_STYLE_LINE) == words(INSERT_STYLE_INLINE)
+
+
+def test_short_label_cuts_at_the_first_space():
+    """**長い肩書に相づちが埋もれるのを避ける(設計書 §11.7)。**
+
+    実データで、6 字の相づちが 40 字の肩書に埋もれた。
+    """
+    sps = parse_roster(chr(10).join(
+        ["山本学　文科省 高等教育局私学部参事官付 企画官", "西村香介"]))
+    got = short_labels(sps)
+    assert got[sps[0].id] == "山本学", got
+    assert got[sps[1].id] == "西村香介", "空白が無ければそのまま"
+
+
+def test_short_label_keeps_the_full_name_when_it_would_collide():
+    """**短くしてかぶるなら短くしない。**取り違えは読みやすさより重い。"""
+    sps = [Speaker(id="a", name="山本 学"), Speaker(id="b", name="山本 花子")]
+    got = short_labels(sps)
+    assert got["a"] == "山本 学" and got["b"] == "山本 花子", got
+
+
+def test_short_label_avoids_colliding_with_someone_elses_full_name():
+    """「山本」と「山本学　…」が並ぶとき、短くすると別人と読める。"""
+    sps = [Speaker(id="a", name="山本学　文科省"), Speaker(id="b", name="山本学")]
+    got = short_labels(sps)
+    assert got["a"] == "山本学　文科省", got
+
+
+def test_short_label_only_affects_the_inline_form():
+    """**記録は書き換えない。**【 】と出席者一覧は全名のまま。"""
+    proj = _base_for_insert()
+    proj.speakers[0].name = "佐藤　△△株式会社　代表取締役"
+    proj.speakers[1].name = "山本　□□省　企画官"
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+
+    inline = _merge_runs(proj, True, True, INSERT_STYLE_INLINE)
+    assert "(山本：はい)" in "".join(r[2] for r in inline)
+
+    # 行を分ける形では短くしない（そこは話者そのものの表示なので）
+    line = _merge_runs(proj, True, True, INSERT_STYLE_LINE)
+    sid = proj.speakers[1].id
+    assert any(r[1] == sid and r[2] == "はい" for r in line), line
+    assert proj.speakers[1].name == "山本　□□省　企画官", "名簿を書き換えている"
+
+
+def test_inline_legend_says_the_name_is_abbreviated():
+    """略記だと書いておかないと、受け取った人が別人と思う。"""
+    assert "略記" in INSERT_LEGEND[INSERT_STYLE_INLINE]
+
+
+# --- 名前と企業・役職に分ける(設計書 §11.8)--------------------------
+# ユーザーの提案。表示名という別の項目を持つと同じ情報が 2 か所になり、
+# 片方だけ直したとき食い違う。名前と役職に分けておけば表示は組み立てるだけ。
+
+def test_suggest_split_cuts_at_a_role_word():
+    """「三ツ林衆議院議員」→ 名前「三ツ林」／役職「衆議院議員」"""
+    assert suggest_split("三ツ林衆議院議員") == ("三ツ林", "衆議院議員")
+    assert suggest_split("吉沢忠一加茂暁星高校同窓会長")[0] == "吉沢忠一加茂暁星"
+
+
+def test_suggest_split_cuts_at_a_space():
+    """空白があればそこで切る（あなたの名簿の多くはこの形）"""
+    n, note = suggest_split("山本学　文科省 高等教育局私学部参事官付 企画官")
+    assert n == "山本学" and note.startswith("文科省")
+
+
+def test_suggest_split_uses_other_rows_to_find_the_organisation():
+    """**他の人の行にも出てくる並びは、個人名ではなく所属。**
+
+    「加茂暁星」が梅田さんの行にも出るので、吉沢さんの名前ではない。
+    """
+    others = ["梅田茂　加茂暁星学園理事"]
+    assert suggest_split("吉沢忠一加茂暁星高校同窓会長", others)[0] == "吉沢忠一"
+
+
+def test_suggest_split_never_eats_a_real_surname():
+    """**1 文字の「市」「村」「部」を手がかりにしない。**
+
+    使うと「田村」さんが「田」になる。役職語は 2 文字以上のものだけ。
+    """
+    assert suggest_split("田村") == ("田村", "")
+    assert suggest_split("志村賢一衆議院議員政策担当秘書")[0] == "志村賢一"
+    assert suggest_split("西村香介") == ("西村香介", "")
+
+
+def test_suggest_split_leaves_a_name_of_at_least_two_characters():
+    """削りすぎるくらいなら分けない。"""
+    assert suggest_split("市長") == ("市長", ""), "全部消してはいけない"
+
+
+def test_suggest_roster_rows_respects_lines_already_split():
+    """すでに「名前(役職)」で書いてある行は、推測で壊さない。"""
+    rows = suggest_roster_rows(chr(10).join(
+        ["佐藤太郎(株式会社ABC 部長)", "三ツ林衆議院議員"]))
+    assert rows[0] == ("佐藤太郎", "株式会社ABC 部長"), rows
+    assert rows[1] == ("三ツ林", "衆議院議員"), rows
+
+
+def test_roster_line_accepts_nested_parentheses():
+    """**役職に括弧が入れ子で出ると、行全体が名前になっていた。**
+
+    「企画官（命）学校法人経営指導室長」で実際に起きた(2026-08-18)。
+    """
+    sp = parse_roster(
+        "山本学(文科省 高等教育局私学部参事官付 企画官（命）学校法人経営指導室長)")[0]
+    assert sp.name == "山本学", sp.name
+    assert sp.note.endswith("学校法人経営指導室長"), sp.note
+
+
+def test_speaker_label_can_add_the_role():
+    """本文の【 】に役職も入れるかを選べる(設計書 §11.8)。"""
+    proj = _base_for_insert()
+    proj.speakers[0].name = "山本学"
+    proj.speakers[0].note = "文科省 高等教育局私学部参事官付 企画官"
+    sid = proj.speakers[0].id
+    assert speaker_label(proj, sid, False) == "山本学"
+    assert speaker_label(proj, sid, True).startswith("山本学(文科省")
+    assert speaker_label(proj, None, True) == UNKNOWN_LABEL
+
+
+def test_inline_form_never_adds_the_role(tmp_path=None):
+    """**埋め込みの ( ) は常に名前だけ。**本文の中なので長いと意味がない。"""
+    import tempfile
+    proj = _base_for_insert()
+    proj.speakers[1].name = "山本学"
+    proj.speakers[1].note = "文科省 高等教育局私学部参事官付 企画官"
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", proj.speakers[1].id)
+    with tempfile.TemporaryDirectory() as d:
+        out = write_text(proj, Path(d) / "a.txt",
+                         insert_style=INSERT_STYLE_INLINE, with_role=True)
+        body = out.read_text(encoding="utf-8")
+    assert "(山本学：はい)" in body, body
+    assert "(山本学(文科省" not in body, "埋め込みに役職が入っている"
+    assert "【山本学(文科省" in body or "山本学" in body
+
+
+def test_short_time_drops_the_leading_hours():
+    """候補の選択肢に出す短い時刻(設計書 §10.3.2)。
+
+    HH:MM:SS だと幅に収まらず「00:00:29 声!」と切れた(実機・2026-08-19)。
+    **1 時間を超えたら時も出す**——落とすと別の場所と区別できない。
+    """
+    from src.assign_gui import fmt_short_time
+    assert fmt_short_time(29) == "0:29"
+    assert fmt_short_time(1504) == "25:04"
+    assert fmt_short_time(3600) == "1:00:00"
+    assert fmt_short_time(3930) == "1:05:30"
+    assert fmt_short_time(-1) == "0:00", "負でも落ちない"
+    # 選択肢の幅(11 文字)に収まること。「1:05:30 声B」で 11 文字
+    assert len(fmt_short_time(3930) + " 声B") <= 11
+
+
+# --- 編集履歴（設計書 §12）--------------------------------------------
+# 事業計画 v29 で差別化はこの一点に絞られた
+#   「どこまで人が原音で確認したかを成果物に残せるか」
+
+def _logged():
+    """履歴の検査用。**割当を空に戻してから始める。**
+
+    _base_for_insert() は 1 区間を割当済みにしてあり、そのままだと
+    「変わらないものは記録しない」規則に当たって記録が出ない。
+    """
+    proj = _base_for_insert()
+    for s in proj.segments:
+        s.speaker_id, s.reviewed = None, False
+    proj.edit_log.clear()
+    return proj
+
+
+def test_nothing_is_recorded_when_nothing_changed():
+    """**変わらないものは記録しない。**履歴が水増しされると読めなくなる。
+
+    _base_for_insert() が 1 区間を割当済みにしているので、そのまま同じ話者を
+    当てても記録は出ない（この規則を実際に踏んで気付いた・2026-08-19）。
+    """
+    proj = _base_for_insert()
+    proj.edit_log.clear()
+    assert proj.segments[1].speaker_id == "sp01"
+    proj.assign_speaker(1, "sp01")
+    proj.apply_speaker_to([1], "sp01", heard_index=1)
+    proj.edit_text(1, proj.segments[1].text)
+    assert proj.edit_log == [], proj.edit_log
+
+
+def test_assign_is_recorded_with_the_previous_value():
+    """**before を残す。**「機械が何と言い、人が何に直したか」が要る。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "assign"
+    assert rec["before"] is None and rec["after"] == sid
+    assert rec["reviewed"] is True
+    assert rec["actor"] == "user"
+    assert proj.segments[1].speaker_id == sid
+
+
+def test_assign_does_not_record_a_no_op():
+    """変わっていないなら記録しない（履歴が水増しされる）。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    n = len(proj.edit_log)
+    proj.assign_speaker(1, sid)
+    assert len(proj.edit_log) == n
+
+
+def test_bulk_apply_is_one_record_not_one_per_segment():
+    """**記録するのは人の判断。**一括適用は 50 区間変えても判断は 1 回。
+
+    区間ごとに 1 件ずつ残すと実データで 95KB になり(実測 2026-08-19)、
+    しかも「何回判断したか」が読み取れなくなる。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.apply_speaker_to([0, 1, 2], sid, heard_index=1)
+    assert len(proj.edit_log) == 1
+    rec = proj.edit_log[0]
+    assert rec["op"] == "assign_bulk" and rec["count"] == 3
+    assert len(rec["heard"]) == 1 and len(rec["bulk"]) == 2
+
+
+def test_bulk_apply_keeps_the_reviewed_distinction():
+    """**聴いた 1 区間だけ ✓。**残りは △（機械の結果を当てただけ）。
+
+    この区別が製品価値そのもの（CLAUDE.md）。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.apply_speaker_to([0, 1, 2], sid, heard_index=1)
+    assert proj.segments[1].reviewed is True
+    assert proj.segments[0].reviewed is False
+    assert proj.segments[2].reviewed is False
+    # 記録の側でも区別できる
+    rec = proj.edit_log[0]
+    from src.segments import segment_key
+    assert rec["heard"] == [list(segment_key(proj.segments[1]))]
+
+
+def test_undo_is_recorded_too():
+    """**取り消したことも残す。**消すと「当てたが戻した」経緯が読めない。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    snap = [(1, proj.segments[1].speaker_id, proj.segments[1].reviewed)]
+    proj.assign_speaker(1, sid)
+    proj.restore_assignments(snap)
+    assert proj.segments[1].speaker_id is None
+    assert [r["op"] for r in proj.edit_log] == ["assign", "undo_assign"]
+
+
+def test_undo_ignores_indexes_that_no_longer_exist():
+    """分割・結合のあとでも落ちない（戻せないぶんは触らない）。"""
+    proj = _logged()
+    proj.restore_assignments([(999, "sp01", True)])
+    assert proj.edit_log == []
+
+
+def test_text_edit_keeps_both_sides():
+    proj = _logged()
+    before = proj.segments[1].text
+    assert proj.edit_text(1, "直しました") is True
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "edit_text"
+    assert rec["before"] == before and rec["after"] == "直しました"
+    assert proj.segments[1].text_edited is True, "再実行で上書きされてしまう"
+    assert proj.edit_text(1, "直しました") is False, "同じ内容で記録している"
+
+
+def test_time_edit_records_before_and_after():
+    proj = _logged()
+    seg = proj.segments[1]
+    b = [round(seg.start, 3), round(seg.end, 3)]
+    assert proj.edit_time(1, seg.start + 0.5, seg.end, reviewed=True) is True
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "edit_time"
+    assert rec["before"] == b and rec["after"][0] == round(b[0] + 0.5, 3)
+    assert rec["reviewed"] is True
+
+
+def test_time_edit_records_a_confirmation_without_a_change():
+    """値が同じでも ✎△ → ✎ は変化。**確認したことが履歴の中身。**"""
+    proj = _logged()
+    seg = proj.segments[1]
+    assert proj.edit_time(1, seg.start, seg.end, reviewed=True) is True
+    assert proj.edit_log[-1]["reviewed"] is True
+
+
+def test_log_uses_the_segment_key_not_index():
+    """**鍵は (orig_start, start) の組。**
+
+    `index` は分割・結合・再実行で振り直る。**`orig_start` だけでも足りない**
+    ——分割した 2 つが同じ値を持つため(設計書 §10.3.4)。
+    """
+    from src.segments import segment_key
+    proj = _logged()
+    key = list(segment_key(proj.segments[1]))
+    proj.assign_speaker(1, proj.speakers[0].id)
+    proj.segments[1].index = 99
+    assert proj.edit_log[-1]["segment"] == key
+    assert "orig_start" not in proj.edit_log[-1], "古い形が残っている"
+
+
+def test_split_halves_get_different_log_keys():
+    """分割した 2 つの記録が、どちらのものか区別できること。"""
+    from src.segments import segment_key
+    proj = _logged()
+    head, tail = proj.split_segment(1, 105.0, 5)
+    proj.edit_log.clear()
+    proj.assign_speaker(head.index, proj.speakers[0].id)
+    proj.assign_speaker(tail.index, proj.speakers[1].id)
+    a, b = proj.edit_log[0]["segment"], proj.edit_log[1]["segment"]
+    assert a[0] == b[0], "前提: 分割は orig_start を共有する"
+    assert a != b, "**記録がどちらの区間か区別できていない**"
+
+
+def test_verification_summary_shows_the_edit_history():
+    """**検証要約に履歴の行を出す。**差別化はこの一点(事業計画 v29)。"""
+    proj = _logged()
+    proj.apply_speaker_to([0, 1], proj.speakers[0].id, heard_index=1)
+    proj.edit_text(1, "直しました")
+    rows = dict(build_verification(proj, 1))
+    assert "編集の履歴" in rows
+    body = rows["編集の履歴"]
+    assert "全 2 件" in body
+    assert "話者(まとめて) 1" in body and "本文 1" in body
+    assert "最終" in body, "**いつまで手を入れたかが分からない**"
+
+
+def test_summary_says_so_when_there_is_no_history():
+    """古い作業ファイルには履歴が無い。**黙って空欄にしない。**"""
+    assert build_log_summary(Project(audio_path="x.m4a")) == "記録なし"
+
+
+def test_summary_does_not_hide_an_unknown_operation():
+    """**知らない op も名前のまま出す。**畳むと履歴から消えたように見える。"""
+    proj = _logged()
+    proj._log("brand_new_op", orig_start=1.0)
+    assert "brand_new_op 1" in build_log_summary(proj)
+
+
+def test_log_labels_cover_every_op_we_write():
+    """記録する op には日本語名を用意しておく（生の英語を出さない）。"""
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "segments.py").read_text(encoding="utf-8")
+    ops = set(re.findall(r'_log\(\s*"([a-z_]+)"', src))
+    ops |= set(re.findall(r'"op": "([a-z_]+)"', src))
+    missing = sorted(ops - set(LOG_LABELS))
+    assert missing == [], f"日本語名が無い op: {missing}"
+
+
+def test_log_time_is_shown_in_local_time():
+    """UTC で持ち、表示は手元の時刻に直す（読む人は現地時刻で読む）。"""
+    assert fmt_log_at("") == ""
+    got = fmt_log_at("2026-08-19T05:03:40+00:00")
+    assert len(got) == 16 and got.startswith("2026-08-19"), got
+    assert fmt_log_at("こわれている") == "こわれている", "落ちてはいけない"
+
+
+def test_gui_never_writes_the_fields_directly():
+    """**画面から直接の書き換えを禁じる。**
+
+    seg.speaker_id = … と画面で書くと編集履歴を素通りする。経路が増える
+    たびに記録し忘れるので、Project のメソッドを必ず通す(設計書 §1.3)。
+    **この検査は、うっかり直接書いたときに落ちるためにある。**
+    """
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "assign_gui.py").read_text(encoding="utf-8")
+    banned = re.compile(
+        r"^\s*\w+\.(speaker_id|reviewed|text_edited|time_edited|"
+        r"time_reviewed)\s*=\s*(?!=)", re.M)
+    hits = [m.group(0).strip() for m in banned.finditer(src)]
+    assert hits == [], f"画面が直接書いている: {hits}"
+
+
+def test_bulk_times_are_one_record():
+    """時刻のまとめて適用も 1 件（百件の判断ではない）。"""
+    proj = _logged()
+    n = proj.apply_times_to(
+        [(0, 90.5, 100.0), (2, 110.5, 120.0)], reviewed=False)
+    assert n == 2
+    assert len(proj.edit_log) == 1
+    rec = proj.edit_log[0]
+    assert rec["op"] == "apply_times_bulk" and rec["count"] == 2
+    assert rec["reviewed"] is False, "**まとめて当てただけは ✎△**"
+    assert proj.segments[0].time_reviewed is False
+
+
+def test_revert_time_is_recorded():
+    proj = _logged()
+    proj.edit_time(1, 101.0, 111.0, reviewed=True)
+    assert proj.revert_time(1) is True
+    assert proj.edit_log[-1]["op"] == "revert_time"
+    assert proj.segments[1].time_edited is False
+    assert proj.revert_time(1) is False, "直っていないのに戻している"
+
+
+def test_undo_times_is_recorded():
+    """**戻したことも残す。**"""
+    proj = _logged()
+    snap = [(1, proj.segments[1].start, proj.segments[1].end, False, False)]
+    proj.edit_time(1, 101.0, 111.0, reviewed=True)
+    assert proj.restore_times(snap) == 1
+    assert proj.edit_log[-1]["op"] == "undo_times"
+    assert proj.segments[1].time_edited is False
+
+
+def test_clearing_a_removed_speaker_is_recorded():
+    """名簿から人を消して割当が外れた経緯も残す。
+
+    あとから読む人にとって「誰の発言か分からなくなった理由」がこれ。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    assert proj.clear_speakers([sid]) == 1
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "clear_speakers" and rec["removed"] == [sid]
+    assert proj.segments[1].speaker_id is None
+    assert proj.segments[1].reviewed is False
+
+
+def test_added_speaker_is_marked_heard():
+    """足した発話に選んだ話者は ✓（いま聴いた直後に人が選んだ）。"""
+    proj = _logged()
+    seg = proj.add_utterance(103.0, 103.6, "はい", "g:D")
+    proj.set_added_speaker(seg.index, proj.speakers[1].id)
+    assert seg.reviewed is True
+    assert proj.edit_log[-1]["op"] == "assign"
+    assert proj.edit_log[-1]["reviewed"] is True
+
+
+def test_log_counts_and_last_time():
+    proj = _logged()
+    proj.assign_speaker(1, proj.speakers[0].id)
+    proj.edit_text(1, "直しました")
+    counts = proj.log_counts()
+    assert counts["assign"] == 1 and counts["edit_text"] == 1
+    assert proj.log_last_at().startswith("20"), proj.log_last_at()
+    assert Project(audio_path="x.m4a").log_last_at() == ""
+
+
+def test_log_survives_save_and_load(tmp_path=None):
+    """履歴が保存され、読み直しても残る（成果物に出す前提）。"""
+    import tempfile
+    proj = _logged()
+    proj.assign_speaker(1, proj.speakers[0].id)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.speakers.json"
+        proj.json_path = str(path)
+        proj.save()
+        again = Project.load(str(path))
+    assert [r["op"] for r in again.edit_log] == ["assign"]
+    assert again.edit_log[0]["before"] is None
+
+
+def test_legend_only_when_something_was_inserted():
+    """凡例は使われたときだけ。無関係な凡例は記録を汚す。"""
+    proj = _base_for_insert()
+    assert has_inserted_utterances(proj) is False
+    added = _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    assert has_inserted_utterances(proj) is True
+    proj.remove_added_utterance(added.index)
+    assert has_inserted_utterances(proj) is False, "消したのに凡例が出る"
+
+
+def test_legend_without_a_cut_is_not_shown():
+    """位置を持たない足し方は本文に差し込まれないので、凡例も要らない。"""
+    proj = _base_for_insert()
+    proj.add_utterance(103.0, 103.6, "うん", "g:D")
+    assert has_inserted_utterances(proj) is False
+
+
+def test_legend_explains_each_style():
+    """記号だけ出しても受け取った人が読めない。両方に説明がある。"""
+    assert CONTINUE_MARK in INSERT_LEGEND[INSERT_STYLE_LINE]
+    assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_LINE]
+    assert "BTSJ" in INSERT_LEGEND[INSERT_STYLE_INLINE]
+    # 検証要約に「凡例」という項目があるので、見出しをそれと重ねない
+    assert not any(v.startswith("凡例") for v in INSERT_LEGEND.values())
+
+
+def test_write_text_carries_the_style(tmp_path=None):
+    """テキスト出力にも同じ選択が効く(凡例・,,・後半の時刻なし)。"""
+    import tempfile
+    proj = _base_for_insert()
+    _add_at(proj, proj.segments[1], 3, 103.0, "はい", "sp02")
+    with tempfile.TemporaryDirectory() as d:
+        out = write_text(proj, Path(d) / "a.txt", insert_style=INSERT_STYLE_LINE)
+        body = out.read_text(encoding="utf-8")
+        assert INSERT_LEGEND[INSERT_STYLE_LINE] in body
+        assert "ながら" + CONTINUE_MARK in body
+        # 後半の行は時刻の桁を空ける（[ で始まらない）
+        tail = [ln for ln in body.splitlines() if "けれどもそれで" in ln][0]
+        assert not tail.lstrip().startswith("["), tail
+        assert tail.startswith(" "), tail
+
+        out2 = write_text(proj, Path(d) / "b.txt", insert_style=INSERT_STYLE_INLINE)
+        body2 = out2.read_text(encoding="utf-8")
+        assert "(山本：はい)" in body2, body2
+        assert CONTINUE_MARK not in body2, body2
+
+
+def test_remove_added_utterance_only_removes_added_ones():
+    """**音声認識が出した区間には削除の入口を作らない。**
+
+    短い相づちの自動削除をしない原則(CLAUDE.md)はそのまま。
+    """
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    try:
+        proj.remove_added_utterance(0)               # ASR 由来の区間
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("ASR の区間を消せてしまった")
+    proj.remove_added_utterance(seg.index)
+    assert len(proj.segments) == 3
+    assert [s.index for s in proj.segments] == [0, 1, 2]
+    # 消したら鍵も落ちる(再実行の引き継ぎが古い鍵を掴まないように)
+    assert proj.added_utterance_keys() == set()
+
+
+def test_added_keys_survive_save_and_load(tmp_path=None):
+    """保存して読み直しても、人が足した区間だと分かる。
+
+    edit_log は本体 JSON に入り、再実行でも引き継がれる。
+    """
+    import tempfile
+    proj = _splittable()
+    seg = proj.add_utterance(105.0, 105.8, "はい")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.speakers.json"
+        proj.json_path = str(p)
+        proj.save()
+        again = Project.load(p)
+    assert again.added_utterance_keys() == {round(seg.orig_start, 3)}
+    got = [s for s in again.segments if s.text == "はい"]
+    assert len(got) == 1 and again.is_added_utterance(got[0]) is True
+
+
 def test_split_segment_basics():
     proj = _splittable()
     head, tail = proj.split_segment(1, 105.0, len("そうですね"))
@@ -1040,9 +1937,55 @@ def test_write_docx_verification_summary():
     assert "cd" * 32 in text
     assert "クラウド / gemini-2.5-flash" in text
     assert "revision 3" in text
-    assert "聴いて確定 1" in text and "まとめて適用 1" in text
-    assert "聴いて確認 1" in text                  # 時刻の ✎
+    assert "聴いて確定 1 区間" in text and "まとめて適用 1 区間" in text
+    assert "聴いて確認 1 区間" in text              # 時刻の ✎
+    assert "凡例" in text and "区間の数です" in text
     assert "保証するものではありません" in text
+
+
+def test_verification_never_reads_as_a_fraction():
+    """内訳を「/」で区切らない。分数に見えて読み違えられる。
+
+    実出力で「時刻の修正: 聴いて確認 41 / 適用のみ 40」となり、41 が 40 を
+    超える分数に見えた(事業計画 v29 §5)。検証要約は確認の履歴そのものなので、
+    読み違えられる表示はそれ自体が信用を損なう。分母(全区間数)を明示する。
+    """
+    from src.segments import build_verification
+
+    proj = _make_project()
+    for i, s in enumerate(proj.segments):
+        s.time_edited = True
+        s.time_reviewed = i % 2 == 0          # 半々にして両方 0 でなくする
+    rows = dict(build_verification(proj, 1))
+
+    total = proj.total_count
+    for key in ("話者の確認", "時刻の修正"):
+        value = rows[key]
+        # 数と数の間に「/」が来ないこと(処理経路の「/」は別の行なので無関係)
+        assert " / " not in value, f"{key} が分数に見える: {value}"
+        assert f"全 {total} 区間" in value, f"{key} に分母がない: {value}"
+
+
+def test_verification_counts_add_up():
+    """内訳の合計が分母を超えない(超えたら数え方が壊れている)。"""
+    from src.segments import build_verification
+
+    proj = _make_project()
+    proj.segments[0].speaker_id = proj.speakers[0].id
+    proj.segments[0].reviewed = True
+    proj.segments[1].speaker_id = proj.speakers[0].id
+    for s in proj.segments[:2]:
+        s.time_edited = True
+    proj.segments[0].time_reviewed = True
+
+    rows = dict(build_verification(proj, 1))
+    nums = [int(x) for x in re.findall(r"(\d+) 区間", rows["話者の確認"])]
+    total, breakdown = nums[0], nums[1:]
+    assert sum(breakdown) == total
+    t_nums = [int(x) for x in re.findall(r"(\d+) 区間", rows["時刻の修正"])]
+    assert t_nums[0] == proj.total_count          # 分母は全区間
+    assert t_nums[1] == t_nums[2] + t_nums[3]     # 直した数 = 確認 + 適用のみ
+    assert t_nums[1] <= t_nums[0]                 # 分子は分母を超えない
 
 
 def test_write_docx_verification_can_be_omitted():
@@ -1116,6 +2059,133 @@ def _carry(old_segments, new_segments):
     old.segments = old_segments
     logs: list[str] = []
     return _carry_over_assignments(old, new_segments, logs.append), logs
+
+
+def test_carry_over_does_not_lose_a_neighbour_to_a_greedy_match():
+    """**発言が黙って消えないこと。**実データで 2 件失われていた。
+
+    突き合わせが「新しい区間の順に、許容 2 秒以内なら当てる」貪欲だったため、
+    **本当の相手より手前の区間に先に当たっていた。**当たった区間は旧区間で
+    置き換えられて消え、本当の相手は「使用済み」で当たらず残る——
+    **欠落と重複が同じ 1 つの原因から出ていた**(2026-08-19・§10.3.5)。
+
+    実データの形をそのまま写してある(ずれ 1.70 秒)。
+    """
+    old = [
+        Segment(index=0, start=2110.50, end=2132.30, text="そこが県さんが",
+                cluster="0:A", speaker_id="sp01", reviewed=True,
+                time_edited=True, orig_start=2110.51, orig_end=2132.29),
+    ]
+    new = [
+        Segment(index=0, start=2108.81, end=2110.51,
+                text="そういうのがあるんですよ", cluster="0:A"),
+        Segment(index=1, start=2110.51, end=2132.29, text="そこが県さんが",
+                cluster="0:A"),
+    ]
+    result, _ = _carry(old, new)
+    texts = [s.text for s in result]
+    assert "そういうのがあるんですよ" in texts, texts
+    assert len(result) == 2, texts
+    assert result[1].speaker_id == "sp01", "人の割当が別の区間に付いた"
+
+
+def test_carry_over_matches_the_closest_one():
+    """**いちばん近いもの同士で当てる。**手前から順に当てない。"""
+    old = [
+        Segment(index=0, start=105.0, end=115.0, text="あ", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=105.0, orig_end=115.0),
+    ]
+    new = [
+        Segment(index=0, start=103.5, end=105.0, text="手前", cluster="0:A"),
+        Segment(index=1, start=105.0, end=115.0, text="あ", cluster="0:A"),
+        Segment(index=2, start=115.0, end=120.0, text="次", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["手前", "あ", "次"], [
+        s.text for s in result]
+    assert result[1].speaker_id == "sp01"
+
+
+def test_carry_over_does_not_duplicate_at_the_exact_start():
+    """**区間が二重にならない（再実行の取り込みの境界）。**
+
+    実データで、まったく同じ本文・同じ時刻の区間が 2 組できていた
+    （2026-08-19 に実機の指摘から発見。設計書 §10.3.5）。原因は取り込み
+    判定が `lo < start < hi` と両端を含まなかったこと。**開始が
+    ちょうど lo と同じ再生成区間が取り込まれず、そのまま残っていた。**
+
+    1 つ目は照合で使われて `used` に入るので、2 つ目はどの家族にも
+    当たらず、素通りする。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=120.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=100.0, end=120.0, text="本文", cluster="0:A"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 1, [
+        (s.start, s.speaker_id, s.text) for s in result]
+    assert result[0].speaker_id == "sp01", "人の割当が残っていない"
+
+
+def test_carry_over_does_not_swallow_the_next_segment():
+    """**終わりの側は含めない。**含めると隣の区間まで飲み込む。
+
+    区間の終了と次の区間の開始が一致するのが普通なので、`hi` を
+    「以下」にすると次の発言が消える。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次の発言", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["本文", "次の発言"], [
+        s.text for s in result]
+
+
+def test_carry_over_warns_about_leftover_duplicates():
+    """**重複が残ったら知らせる。ただし勝手に消さない。**
+
+    本当に同じことを 2 回言った可能性もあり、逐語の記録から機械が発言を
+    削るのは筋が違う（CLAUDE.md の「自動削除をしない」と同じ線）。
+    人が見て決められるよう、時刻を添えて知らせるだけにする。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True,
+                orig_start=100.0, orig_end=120.0),   # time_edited は無し
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=100.0, end=120.0, text="本文", cluster="0:A"),
+    ]
+    result, logs = _carry(old, new)
+    assert len(result) == 2, "**勝手に消している**"
+    assert any("同じ時刻・同じ本文" in m for m in logs), logs
+    assert any("消していない" in m for m in logs), logs
+
+
+def test_carry_over_says_nothing_when_there_is_no_duplicate():
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A",
+                speaker_id="sp01", orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次", cluster="0:B"),
+    ]
+    _result, logs = _carry(old, new)
+    assert not any("同じ時刻" in m for m in logs), logs
 
 
 def test_carry_over_keeps_edited_times():
@@ -1212,6 +2282,645 @@ def test_carry_over_absorbs_only_matched_families():
     ]
     result, _ = _carry(old, new)
     assert [s.text for s in result] == ["残すべき区間"]
+
+
+# ======================================================================
+# 話者分離(diarize.py)
+#
+# モデルもライブラリも要らない部分だけを見る。実モデルでの確認は
+# tests/test_align_integration.py が担う(CI 対象外)。
+# ======================================================================
+
+def test_speaker_turn_round_trip():
+    t = diarize.SpeakerTurn(start=1.5, end=3.25, speaker=2)
+    assert diarize.SpeakerTurn.from_dict(t.to_dict()) == t
+
+
+def test_turns_cache_key_includes_the_speaker_count():
+    """話者数が変われば結果が変わる。同じキャッシュを共有してはいけない。"""
+    a = diarize.turns_cache_path("w", "ff00", 6)
+    b = diarize.turns_cache_path("w", "ff00", 9)
+    assert a != b
+    assert a == diarize.turns_cache_path("w", "ff00", 6)     # 同じなら同じ
+    # 手動配置のモデルを差し替えたら別物
+    assert diarize.turns_cache_path("w", "ff00", 6, model_dir="C:/m/a") != a
+    # 指紋が取れない音声はキャッシュしない(古い結果の使い回しを防ぐ)
+    assert diarize.turns_cache_path("w", "", 6) is None
+
+
+def test_turns_cache_round_trip_and_version():
+    with tempfile.TemporaryDirectory() as d:
+        path = diarize.turns_cache_path(d, "ff00", 6)
+        turns = [diarize.SpeakerTurn(0.0, 1.0, 0),
+                 diarize.SpeakerTurn(0.8, 2.0, 1)]      # 重なっていてよい
+        diarize.save_turns(path, turns, num_speakers=6,
+                           fingerprint="ff00", duration=2.0)
+        assert diarize.load_turns(path) == turns
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["diarize_ver"] = diarize.DIARIZE_VER + 1
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert diarize.load_turns(path) is None          # 実装版が違えば読まない
+
+        path.write_text("これは JSON ではない", encoding="utf-8")
+        assert diarize.load_turns(path) is None
+        assert diarize.load_turns(Path(d) / "nope.json") is None
+
+
+def test_missing_models_say_where_they_were_looked_for():
+    """「モデルがありません」だけでは、何を置けばよいか分からない。"""
+    with tempfile.TemporaryDirectory() as d:
+        try:
+            diarize.resolve_models(d)
+        except diarize.DiarizeUnavailable as e:
+            msg = str(e)
+            assert d in msg                       # 探した場所
+            assert "model.onnx" in msg            # 必要なファイル
+            assert "DIARIZE_MODELS" in msg        # 逃げ道
+        else:
+            raise AssertionError("モデルが無いのに通ってしまった")
+
+
+def test_default_speaker_count_is_not_automatic():
+    """自動(-1)は選ばない。実測で 246 人・148 まとまりに割れた(設計書 §7)。"""
+    assert diarize.DEFAULT_NUM_SPEAKERS > 0
+
+
+# ======================================================================
+# 話者分離の結果を区間へ落とす(segments.py の純粋関数)
+# ======================================================================
+
+def _turns(*rows):
+    return [diarize.SpeakerTurn(s, e, spk) for s, e, spk in rows]
+
+
+def _segs(*rows):
+    return [Segment(index=i, start=s, end=e, text=t, cluster="0:?", chunk=0)
+            for i, (s, e, t) in enumerate(rows)]
+
+
+def test_speaker_letters_follow_the_order_of_appearance():
+    """話者番号は連番とは限らない。先に話した人から A/B/C を振る。"""
+    segs = _segs((0.0, 2.0, "あ"), (3.0, 5.0, "い"), (6.0, 8.0, "う"))
+    turns = _turns((0.0, 2.0, 22), (3.0, 5.0, 4), (6.0, 8.0, 22))
+    got = assign_speaker_clusters(segs, turns)
+    assert got == ["g:A", "g:B", "g:A"]      # 22 が A、4 が B
+
+
+def test_assign_takes_the_most_overlapping_speaker():
+    """重なりが最も大きい話者を採る(話者区間は重なりうる)。"""
+    segs = _segs((10.0, 20.0, "あ"))
+    turns = _turns((0.0, 12.0, 0), (11.0, 25.0, 1))   # 2 秒 対 9 秒
+    assert assign_speaker_clusters(segs, turns) == ["g:B"]
+
+
+def test_assign_marks_unknown_when_overlap_is_thin():
+    """重なりが足りなければ判別不能。幽霊話者はここで消える。"""
+    segs = _segs((10.0, 20.0, "あ"))
+    turns = _turns((19.0, 21.0, 0))          # 10 秒の区間に 1 秒しか重ならない
+    assert assign_speaker_clusters(segs, turns) == ["g:?"]
+    assert assign_speaker_clusters(segs, []) == ["g:?"]
+
+
+def test_cluster_label_shows_global_clusters_without_chunk_numbers():
+    seg = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="g:A")
+    assert seg.cluster_label == "声A"
+    assert seg.is_pseudo_cluster is False
+    ghost = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="g:?")
+    assert ghost.is_pseudo_cluster is True
+    old = Segment(index=0, start=0.0, end=1.0, text="あ", cluster="0:A")
+    assert old.cluster_label == "C1-A"        # クラウドは従来どおり
+
+
+def test_merge_joins_a_sentence_split_across_segments():
+    """同じ話者・文の途中・間隔が短い、の 3 つが揃ったときだけ連結する。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます。"),
+                 (2.05, 3.0, "よろしく"))
+    for s in segs:
+        s.cluster = "g:A"
+    out = merge_same_speaker(segs)
+    assert [s.text for s in out] == ["それでは始めます。", "よろしく"]
+    assert out[0].start == 0.0 and out[0].end == 2.0
+    assert [s.index for s in out] == [0, 1]        # 通し番号を振り直す
+
+
+def test_merge_keeps_the_original_times():
+    """orig_start / orig_end は再実行時の突き合わせの鍵。連結で失わない。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます。"))
+    for s in segs:
+        s.cluster = "g:A"
+    out = merge_same_speaker(segs)
+    assert out[0].orig_start == 0.0 and out[0].orig_end == 2.0
+
+
+def test_merge_refuses_when_the_conditions_are_not_met():
+    def joined(rows, cluster="g:A", gap_ok=True):
+        segs = _segs(*rows)
+        for s in segs:
+            s.cluster = cluster
+        return [s.text for s in merge_same_speaker(segs)]
+
+    # 文が終わっている
+    assert joined([(0.0, 1.0, "終わりです。"), (1.1, 2.0, "次です")]) == \
+        ["終わりです。", "次です"]
+    # 間隔が空いている
+    assert joined([(0.0, 1.0, "それでは"), (1.5, 2.0, "始めます")]) == \
+        ["それでは", "始めます"]
+    # 擬似クラスタ(判別不能)はまとめない。中身がばらばらのため
+    assert joined([(0.0, 1.0, "それでは"), (1.1, 2.0, "始めます")],
+                  cluster="g:?") == ["それでは", "始めます"]
+
+
+def test_merge_does_not_touch_what_a_person_edited():
+    """人が手を付けた区間は連結しない。その作業が消えるため。"""
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    for s in segs:
+        s.cluster = "g:A"
+    segs[0].speaker_id = "sp01"
+    assert len(merge_same_speaker(segs)) == 2
+
+    segs2 = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    for s in segs2:
+        s.cluster = "g:A"
+    segs2[1].text_edited = True
+    assert len(merge_same_speaker(segs2)) == 2
+
+
+def test_merge_joins_different_speakers_never():
+    segs = _segs((0.0, 1.0, "それでは"), (1.1, 2.0, "始めます"))
+    segs[0].cluster, segs[1].cluster = "g:A", "g:B"
+    assert len(merge_same_speaker(segs)) == 2
+
+
+# ======================================================================
+# 正解ラベルの評価(evaluate.py)
+#
+# 測る前に手順を固定するための道具。標本の選び方が実行のたびに変わると、
+# 「作りやすい区間を選んだ」という疑いを自分で否定できなくなる。
+# ======================================================================
+
+def _eval_segs(n=600):
+    """長さがばらばらの区間を作る(3 層に散らばるように)。"""
+    out = []
+    for i in range(n):
+        dur = 0.4 + (i % 6) * 0.4      # 0.4/0.8/1.2/1.6/2.0/2.4 秒
+        out.append(Segment(index=i, start=i * 10.0, end=i * 10.0 + dur,
+                           text=f"発言 {i}", cluster="0:?"))
+    return out
+
+
+def test_cer_normalizes_punctuation_but_keeps_fillers():
+    """句読点の違いは誤りに数えない。フィラーは数える(測りたい対象)。"""
+    assert evaluate.cer("はい、そうです。", "はいそうです") == 0.0
+    # フィラーが落ちれば誤りになる
+    got = evaluate.cer("あの、そうですね", "そうですね")
+    assert got > 0.0
+
+
+def test_cer_is_not_capped_at_one():
+    """ひどく間違えた場合と、まあまあ間違えた場合を区別できること。"""
+    mild = evaluate.cer("あいうえお", "あいうえか")
+    awful = evaluate.cer("あい", "まったくちがうながいぶんしょう")
+    assert mild < 1.0 < awful
+
+
+def test_edit_distance_basics():
+    assert evaluate.edit_distance("", "") == 0
+    assert evaluate.edit_distance("あい", "あい") == 0
+    assert evaluate.edit_distance("あい", "あいう") == 1
+    assert evaluate.edit_distance("あい", "") == 2
+
+
+def test_retention_rate_reports_both_counts():
+    """保持率は 1.0 を超えうる。頭打ちにせず、実数も返す。"""
+    rate, got, want = evaluate.retention_rate(
+        "あの、あの、えー", "あの", evaluate.FILLER_TERMS)
+    assert (got, want) == (1, 3)
+    assert abs(rate - 1 / 3) < 1e-9
+    rate2, got2, want2 = evaluate.retention_rate(
+        "あの", "あの、あの", evaluate.FILLER_TERMS)
+    assert rate2 > 1.0 and (got2, want2) == (2, 1)
+    # 正解に 1 つも無ければ 0(割れない)
+    assert evaluate.retention_rate("こんにちは", "あの", evaluate.FILLER_TERMS)[0] == 0.0
+
+
+def test_sample_is_the_same_every_time():
+    """同じ種なら必ず同じ標本になる(測定前に固定できる)。"""
+    segs = _eval_segs()
+    a = evaluate.select_sample(segs, per_stratum=20)
+    b = evaluate.select_sample(segs, per_stratum=20)
+    assert [(x.index, x.round) for x in a] == [(x.index, x.round) for x in b]
+    c = evaluate.select_sample(segs, per_stratum=20, seed=999)
+    assert [x.index for x in a] != [x.index for x in c]
+
+
+def test_sample_takes_the_asked_number_from_each_stratum_and_round():
+    segs = _eval_segs()
+    picked = evaluate.select_sample(segs, per_stratum=20, rounds=2)
+    per = Counter((x.stratum, x.round) for x in picked)
+    for stratum in evaluate.STRATA:
+        assert per[(stratum, 1)] == 20
+        assert per[(stratum, 2)] == 20
+    assert len({x.index for x in picked}) == 120     # 重複しない
+    # 巡ごとに時間順(人が会話を追えるように)
+    for r in (1, 2):
+        starts = [x.start for x in picked if x.round == r]
+        assert starts == sorted(starts)
+
+
+def test_adding_a_round_does_not_change_the_earlier_one():
+    """巡を増やしても 1 巡目の中身は動かない(固定したまま足せる)。"""
+    segs = _eval_segs()
+    one = evaluate.select_sample(segs, per_stratum=20, rounds=1)
+    two = evaluate.select_sample(segs, per_stratum=20, rounds=2)
+    first_of_two = [x for x in two if x.round == 1]
+    assert [x.index for x in one] == [x.index for x in first_of_two]
+
+
+def test_each_round_spreads_over_the_whole_recording():
+    """1 巡だけでも全長に散らばる(途中でやめても前半に偏らない)。"""
+    segs = _eval_segs()
+    picked = [x for x in evaluate.select_sample(segs, per_stratum=20, rounds=2)
+              if x.round == 1]
+    last_start = segs[-1].start
+    halves = Counter("前半" if x.start < last_start / 2 else "後半" for x in picked)
+    # 母集団が一様なので、どちらの半分にも 3 割以上は入るはず
+    assert halves["前半"] > len(picked) * 0.3
+    assert halves["後半"] > len(picked) * 0.3
+
+
+def test_sample_does_not_pad_a_small_stratum():
+    """層の件数が足りないときは全件。水増ししない。"""
+    segs = [Segment(index=i, start=i * 10.0, end=i * 10.0 + 5.0,
+                    text="長い", cluster="0:?") for i in range(4)]
+    segs.append(Segment(index=99, start=999.0, end=999.5, text="ごく短い",
+                        cluster="0:?"))
+    picked = evaluate.select_sample(segs, per_stratum=10, rounds=1)
+    per = Counter(x.stratum for x in picked)
+    assert per[evaluate.STRATUM_LONG] == 4
+    assert per[evaluate.STRATUM_VERY_SHORT] == 1
+    assert per[evaluate.STRATUM_SHORT] == 0
+
+
+def test_strata_boundaries():
+    assert evaluate.stratum_of(0.99) == evaluate.STRATUM_VERY_SHORT
+    assert evaluate.stratum_of(1.0) == evaluate.STRATUM_SHORT
+    assert evaluate.stratum_of(1.99) == evaluate.STRATUM_SHORT
+    assert evaluate.stratum_of(2.0) == evaluate.STRATUM_LONG
+
+
+def test_cluster_purity_uses_the_majority_of_each_group():
+    """まとまりごとに最も多い話者へ対応づけ、一致した割合を返す。"""
+    pairs = [
+        ("g1", "sp01"), ("g1", "sp01"), ("g1", "sp02"),   # 2/3
+        ("g2", "sp03"), ("g2", "sp03"),                    # 2/2
+    ]
+    purity, detail = evaluate.cluster_purity(pairs)
+    assert abs(purity - 4 / 5) < 1e-9
+    assert detail["g1"] == ("sp01", 2, 3)
+    assert detail["g2"] == ("sp03", 2, 2)
+
+
+def test_purity_has_a_floor_above_chance():
+    """でたらめな正解でも純度は 1/話者数 より高く出る(下駄)。
+
+    まとまりごとに多数派を採る性質による。併記しないと実力を読み違える。
+    """
+    pairs = []
+    for c in range(5):                       # 5 つのまとまり × 各 20 件
+        for i in range(20):
+            pairs.append((f"g{c}", f"sp{i % 4:02d}"))   # 話者は 4 名
+    chance = evaluate.purity_chance_level(pairs, trials=30)
+    assert chance > 1 / 4          # 当てずっぽう(25%)より高い
+    assert chance < 0.60           # かといって当たっているわけでもない
+
+
+def test_cluster_purity_skips_unknown_truth():
+    """正解が「分からない」区間は分母に入れない。"""
+    purity, _ = evaluate.cluster_purity(
+        [("g1", "sp01"), ("g1", None), ("g1", "sp01")])
+    assert abs(purity - 1.0) < 1e-9
+
+
+def test_weighted_rate_follows_the_population():
+    """層ごとに同じ件数を採るので、全体値は母集団の構成で重み付けする。"""
+    rates = {evaluate.STRATUM_SHORT: 0.50, evaluate.STRATUM_LONG: 0.90}
+    sizes = {evaluate.STRATUM_SHORT: 670, evaluate.STRATUM_LONG: 549}
+    got = evaluate.weighted_rate(rates, sizes)
+    assert abs(got - (0.50 * 670 + 0.90 * 549) / 1219) < 1e-9
+    # 単純平均(0.70)とは違う
+    assert abs(got - 0.70) > 0.01
+
+
+def test_verdict_says_undecidable_near_the_threshold():
+    """70% の近くでは「判定不能」と言う。出た数字を見てから基準を動かさない。"""
+    half = 0.03
+    assert evaluate.verdict(0.85, half) == "達成"
+    assert evaluate.verdict(0.50, half) == "未達"
+    assert evaluate.verdict(0.72, half) == "判定不能"
+
+
+def test_halfwidth_shrinks_with_more_samples():
+    wide = evaluate.proportion_halfwidth(0.7, 200, population=1219)
+    narrow = evaluate.proportion_halfwidth(0.7, 400, population=1219)
+    assert narrow < wide
+
+
+def test_stratified_halfwidth_uses_the_population_weights():
+    """層別の精度は、層の重みの二乗で効く(単純な n では決まらない)。"""
+    sizes = {evaluate.STRATUM_VERY_SHORT: 285,
+             evaluate.STRATUM_SHORT: 385,
+             evaluate.STRATUM_LONG: 549}
+    rates = {k: 0.7 for k in sizes}
+    one = evaluate.stratified_halfwidth(rates, sizes, {k: 100 for k in sizes})
+    two = evaluate.stratified_halfwidth(rates, sizes, {k: 200 for k in sizes})
+    assert two < one
+    # 設計書 §2.3 の見込み(1 巡 ±4〜5 / 2 巡 ±3 ポイント前後)に合うこと
+    assert 0.035 < one < 0.055
+    assert 0.020 < two < 0.035
+
+
+def test_stratified_halfwidth_is_zero_when_everything_is_measured():
+    """全件を測れば標本誤差は無い(有限母集団の補正が効く)。"""
+    sizes = {evaluate.STRATUM_LONG: 50}
+    half = evaluate.stratified_halfwidth(
+        {evaluate.STRATUM_LONG: 0.7}, sizes, {evaluate.STRATUM_LONG: 50})
+    assert half == 0.0
+
+
+# ======================================================================
+# アダプタ境界(Utterance → Segment)
+#
+# クラウドもローカルも、チャンク単位で Utterance を作るところまでが
+# 経路ごとの仕事。その先は共通の後段が引き受ける(設計書 §4.2)。
+# ======================================================================
+
+def test_parse_utterances_keeps_relative_times():
+    """相対秒のまま返し、クラスタにチャンク番号を付けない。"""
+    us = parse_utterances(
+        "[00:10] 【A】 ひとつめ。\n[00:20] 【B】 ふたつめ。\n", chunk_seconds=60.0)
+    assert [u.rel_start for u in us] == [10.0, 20.0]
+    assert [u.cluster for u in us] == ["A", "B"]     # "0:A" ではない
+
+
+def test_utterances_to_segments_adds_offset_and_namespace():
+    """オフセットの足し込み・チャンク名前空間・通し番号は後段の仕事。"""
+    us = [
+        Utterance(rel_start=0.0, rel_end=5.0, text="あ", cluster="A"),
+        Utterance(rel_start=5.0, rel_end=9.0, text="い", cluster="B"),
+    ]
+    segs = utterances_to_segments(
+        us, chunk_index=2, offset_seconds=1800.0, start_index=40)
+    assert [s.index for s in segs] == [40, 41]
+    assert [s.start for s in segs] == [1800.0, 1805.0]
+    assert [s.end for s in segs] == [1805.0, 1809.0]
+    assert [s.cluster for s in segs] == ["2:A", "2:B"]
+    assert all(s.chunk == 2 for s in segs)
+
+
+def test_utterances_to_segments_does_not_redistribute():
+    """按分を通さない。渡した時刻がそのまま(オフセットぶんだけずれて)出る。
+
+    按分(redistribute_times)は Gemini のタイムスタンプがドリフトする既知バグ
+    への対策であって、実測時刻にかけるものではない(設計書 §4.1)。
+    ここに按分が紛れ込むと、ローカル経路で測った時刻が本文の長さで
+    作り直されてしまう。
+    """
+    # 本文の長さがばらばらで、間も詰まっている(按分が働けば必ず動く形)
+    us = [
+        Utterance(rel_start=0.0, rel_end=1.0, text="あ" * 200, cluster="?"),
+        Utterance(rel_start=1.0, rel_end=30.0, text="い", cluster="?"),
+    ]
+    segs = utterances_to_segments(us)
+    assert [(s.start, s.end) for s in segs] == [(0.0, 1.0), (1.0, 30.0)]
+
+
+def test_utterances_to_segments_gives_zero_length_a_minimum():
+    """長さ 0 の区間は聴き直せないので、最低限の長さを与える。"""
+    segs = utterances_to_segments(
+        [Utterance(rel_start=12.0, rel_end=12.0, text="ん", cluster="?")])
+    assert (segs[0].start, segs[0].end) == (12.0, 13.0)
+
+
+# ======================================================================
+# ローカル転写(local_asr.py)
+#
+# faster-whisper の代わりに偽のモデルを差し込む。実モデルを使う確認は
+# tests/test_align_integration.py が担う(CI 対象外)。
+# ======================================================================
+
+class _FakeWord:
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+
+
+class _FakeSegment:
+    def __init__(self, start, end, text, words=None):
+        self.start, self.end, self.text = start, end, text
+        self.words = words or []
+
+
+class _FakeInfo:
+    def __init__(self, duration):
+        self.duration = duration
+
+
+class _FakeWhisper:
+    """WhisperModel の代わり。モデルもライブラリも要らない。"""
+
+    def __init__(self, segments, duration):
+        self._segments, self._duration = segments, duration
+        self.calls = []
+
+    def transcribe(self, path, **kwargs):
+        self.calls.append(kwargs)
+        return iter(self._segments), _FakeInfo(self._duration)
+
+
+def _local(segments, duration=60.0):
+    """偽モデルを差し込んだ LocalTranscriber を作る。"""
+    t = LocalTranscriber(model="small")
+    fake = _FakeWhisper(segments, duration)
+    t._whisper = fake            # _load を通さずに差し替える
+    return t, fake
+
+
+def test_local_asr_keeps_short_backchannel():
+    """短い相づちは残す。中身が空の区間だけ落とす。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 3.2, " 本日はお忙しい中ありがとうございます。"),
+        _FakeSegment(3.4, 3.9, " はい"),          # 0.5 秒の相づち
+        _FakeSegment(4.0, 4.2, "   "),            # 中身が無い
+        _FakeSegment(4.5, 6.0, " そうですね。"),
+    ])
+    result = t.transcribe(__file__)
+    assert [u.text for u in result.utterances] == [
+        "本日はお忙しい中ありがとうございます。", "はい", "そうですね。"
+    ]
+
+
+def test_local_asr_marks_every_cluster_unknown():
+    """話者分離が入るまでは全区間が判別不能。誰の声かを決める者がいない。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.0, "あ"),
+        _FakeSegment(1.0, 2.0, "い"),
+    ])
+    result = t.transcribe(__file__)
+    assert {u.cluster for u in result.utterances} == {PSEUDO_UNKNOWN}
+
+
+def test_local_asr_returns_words_from_the_same_pass():
+    """本文と単語時刻が 1 回の転写から取れる(別々に転写しない)。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.5, " はい、そうです。", words=[
+            _FakeWord(" はい", 0.0, 0.4),
+            _FakeWord("、", 0.4, 0.5),
+            _FakeWord("  ", 0.5, 0.5),        # 空白だけの語は捨てる
+            _FakeWord("そうです", 0.6, 1.5),
+        ]),
+    ])
+    result = t.transcribe(__file__)
+    assert [w.text for w in result.words] == ["はい", "、", "そうです"]
+    assert result.words[0].start == 0.0 and result.words[-1].end == 1.5
+    # 時刻はチャンク先頭からの相対秒のまま(絶対秒にするのは後段の仕事)
+    assert result.utterances[0].rel_start == 0.0
+
+
+def test_local_asr_never_makes_negative_duration():
+    """まれに終わりが始まりを下回る。負の長さは作らない。"""
+    t, _ = _local([_FakeSegment(10.0, 9.5, "逆転している")])
+    result = t.transcribe(__file__)
+    u = result.utterances[0]
+    assert u.rel_start == 10.0 and u.rel_end == 10.0
+
+
+def test_local_asr_does_not_use_vad():
+    """VAD は使わない。本文を作る経路なので、落ちた発言は記録から消える。"""
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["vad_filter"] is False
+    assert fake.calls[0]["word_timestamps"] is True
+    assert fake.calls[0]["language"] == "ja"
+
+
+def test_local_asr_takes_word_timestamps_by_default():
+    """単語時刻は既定で取る(自動点検の実測値になる)。製品経路は常にこちら。
+
+    切れるようにしたのは測定用——CT2 変換が不完全なモデルは単語時刻の
+    位置合わせでネイティブ層ごと落ちる(kotoba-whisper-v2.0-faster で実測)。
+    """
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["word_timestamps"] is True
+    t.transcribe(__file__, word_timestamps=False)
+    assert fake.calls[1]["word_timestamps"] is False
+
+
+def test_local_asr_keeps_conditioning_on_by_default():
+    """直前の本文の引き継ぎは既定で入り。faster-whisper の既定と同じ。
+
+    ここが黙って False になると、同じキャッシュキー(音声指紋 + チャンク長 +
+    逐語フラグ)のまま別物の転写ができてしまう。切るのは測定専用。
+    """
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.transcribe(__file__)
+    assert fake.calls[0]["condition_on_previous_text"] is True
+
+
+def test_local_asr_can_turn_conditioning_off():
+    """測定のために切れる(段階 2 の比較で使う)。"""
+    t, fake = _local([_FakeSegment(0.0, 1.0, "あ")])
+    t.condition_on_previous_text = False
+    t.transcribe(__file__)
+    assert fake.calls[0]["condition_on_previous_text"] is False
+
+
+def test_local_asr_cancel_leaves_nothing_behind():
+    """中断したら None。途中までの区間を返さない。"""
+    t, _ = _local([
+        _FakeSegment(0.0, 1.0, "一つめ"),
+        _FakeSegment(1.0, 2.0, "二つめ"),
+    ])
+    seen = {"n": 0}
+
+    def cancelled():
+        seen["n"] += 1
+        return seen["n"] > 1          # 2 区間目に入ったところで中断
+
+    assert t.transcribe(__file__, is_cancelled=cancelled) is None
+
+
+def test_local_asr_progress_ends_at_total():
+    """進捗は (処理済み秒, 全体秒) で、最後は必ず全体に届く。"""
+    t, _ = _local([_FakeSegment(0.0, 30.0, "あ")], duration=90.0)
+    seen = []
+    t.transcribe(__file__, on_progress=lambda done, total: seen.append((done, total)))
+    assert seen[0] == (30.0, 90.0)
+    assert seen[-1] == (90.0, 90.0)
+
+
+def test_local_asr_bad_model_dir_is_reported_before_transcribing():
+    """置き場の間違いは、音声を分割し終わる前に分かる。
+
+    例外は align.py と同じ AlignUnavailable 系(LocalAsrUnavailable はその
+    サブクラス)。呼び出し側は 1 つ catch すれば両方の経路を拾える。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "no-such-model"
+        try:
+            LocalTranscriber(model="small", model_dir=missing)
+        except AlignUnavailable as e:
+            assert "モデルフォルダが見つかりません" in str(e)
+        else:
+            raise AssertionError("存在しないモデルフォルダが通ってしまった")
+
+
+# ======================================================================
+# ライセンス表記(話者分離設計書 §9)
+# ======================================================================
+
+def test_credits_file_exists_and_is_reachable():
+    """表記のファイルが実在し、読める。
+
+    **同梱している TitaNet は CC-BY-4.0 で、表示が配布の条件。**
+    ファイルが消えても他のテストは通ってしまうので、ここで固定する。
+    """
+    from src.config import credits_path, credits_text
+    assert credits_path().exists(), f"表記がありません: {credits_path()}"
+    assert len(credits_text()) > 200
+
+
+def test_credits_names_the_cc_by_model():
+    """CC-BY-4.0 のモデルと、その条件が書いてある。
+
+    表記の義務があるのは TitaNet。名前とライセンス名の両方が要る
+    (「第三者の部品を使っています」だけでは表示にならない)。
+    """
+    from src.config import credits_text
+    t = credits_text()
+    for want in ("TitaNet", "CC BY 4.0", "NVIDIA"):
+        assert want in t, f"表記に {want} がありません"
+
+
+def test_credits_names_the_other_bundled_models():
+    """同梱している残りのモデルも挙げる。"""
+    from src.config import credits_text
+    t = credits_text()
+    for want in ("pyannote", "MIT", "Whisper"):
+        assert want in t, f"表記に {want} がありません"
+
+
+def test_credits_survives_a_missing_file():
+    """読めなくても落とさない。表記が出ないのは問題だが、それで転写が
+    止まるのは筋が違う。代わりに要点だけでも出す。"""
+    import src.config as cfg
+    real = cfg.credits_path
+    cfg.credits_path = lambda: Path("存在しない場所") / "CREDITS.txt"
+    try:
+        t = cfg.credits_text()
+    finally:
+        cfg.credits_path = real
+    assert "TitaNet" in t and "CC BY 4.0" in t
 
 
 # ======================================================================

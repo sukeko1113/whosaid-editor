@@ -14,6 +14,29 @@ APP_NAME = "GeminiTranscriber"
 # Day 60 のインストーラ作業で一元化を検討)。Word の検証要約に併記される。
 APP_VERSION = "2.1.0"
 
+# ライセンス表記のファイル名。**同梱している TitaNet は CC-BY-4.0 で、
+# 表示が配布の条件**(claude/claude_話者分離_設計書.md §9)。
+CREDITS_NAME = "CREDITS.txt"
+
+
+def credits_path() -> Path:
+    """ライセンス表記の置き場。凍結後は実行ファイルの隣に展開される。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / CREDITS_NAME
+    return Path(__file__).resolve().parent.parent / "resources" / CREDITS_NAME
+
+
+def credits_text() -> str:
+    """表記の中身。**読めなくても落とさない**——表記が出ないほうが問題だが、
+    それで転写そのものが止まるのは筋が違う。どこを見たかは残す。"""
+    p = credits_path()
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError as e:
+        return (f"ライセンス表記を読めませんでした: {p}\n{e}\n\n"
+                "同梱物には CC BY 4.0 の NVIDIA NeMo TitaNet-Small と、"
+                "MIT の pyannote/segmentation-3.0 が含まれます。")
+
 
 def config_dir() -> Path:
     if sys.platform == "win32":

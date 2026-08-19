@@ -12,15 +12,40 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 
 SCHEMA_VERSION = 5
 
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
+
+# 人が足した相づちを出力にどう書くか(設計書 §11)。データは 1 つのまま、
+# 出し方だけを選ぶ。標準の表記法を調べた結果、BTSJ(基本的な文字化の原則・
+# 宇佐美まゆみ 2019)にちょうどこの規定があったので、それに従う。
+INSERT_STYLE_LINE = "line"       # 行を分ける。続く行は末尾 ,, でつなぐ(BTSJ 2.3.2)
+INSERT_STYLE_INLINE = "inline"   # 行に埋め込む。(山本：はい) の形(BTSJ 3.2.3)
+INSERT_STYLES = (INSERT_STYLE_LINE, INSERT_STYLE_INLINE)
+
+# BTSJ 2.3.2 の「発話文が終わっていない」印。独自記号を作ると外部に説明できない
+CONTINUE_MARK = ",,"
+
+# 記号だけ出しても受け取った人が読めないので、差し込みがあるときだけ添える。
+# 見出しを「凡例」にしない——検証要約にすでに同名の項目があり、1 つの文書に
+# 同じ見出しが 2 つ並ぶ(検査を書いていて気付いた・2026-08-18)。
+INSERT_LEGEND = {
+    INSERT_STYLE_LINE:
+        f"表記について: 発言の末尾の「{CONTINUE_MARK}」は、その発言が下の行に"
+        "続いていることを示します(BTSJ 2.3.2 に準拠)。"
+        "間の行は、そこに重なって入った別の人の発言です。",
+    INSERT_STYLE_INLINE:
+        "表記について: 本文中の「(氏名：…)」は、その位置に重なって入った"
+        "別の人の発言です(BTSJ 3.2.3 に準拠)。"
+        "氏名は冒頭の出席者一覧の略記です。",
+}
 
 # 特別扱いの話者 ID(名簿の人物ではない)
 SPECIAL_UNKNOWN = "__unknown__"
@@ -37,9 +62,38 @@ SPECIAL_SPEAKERS: dict[str, str] = {
 PSEUDO_UNKNOWN = "?"
 PSEUDO_MULTI = "*"
 
+# 処理経路(Project.engine["mode"])。作業ファイルにそのまま入る値なので、
+# 画面・Word の検証要約・パイプラインで同じ文字列を使う。
+ENGINE_CLOUD = "cloud"
+ENGINE_LOCAL = "local"
+ENGINE_LABELS = {ENGINE_CLOUD: "クラウド", ENGINE_LOCAL: "ローカル"}
+
 # 人が時刻を直したり区間を分けたりするときに許す最短の長さ。
 # 0 にすると start == end の区間ができて、再生も出力も意味を失う。
 MIN_SEGMENT_SECONDS = 0.1
+
+
+def segment_key(seg: "Segment") -> tuple[float, float]:
+    """区間を一意に指す鍵 —— **(orig_start, start) の組**。
+
+    **`orig_start` だけでは足りない。**`split_segment` は「元は 1 つだった」と
+    分かるよう、分割した両方に親の `orig_start` をそのまま与える（再実行の
+    引き継ぎのためで、これ自体は正しい）。その結果 `orig_start` は一意でなく
+    なり、実データで 2 組の重複が出た（2026-08-19 に実測。候補の一覧が両方に
+    同じものを出し、片方で × を押すともう片方からも消えていた）。
+
+    `start` は分割の境界で必ず変わるので、組にすれば区別できる。
+    再実行の引き継ぎは従来どおり `orig_start` だけを見るので壊れない。
+
+    **`index` は鍵にしてはいけない**——分割・結合・再実行で振り直る。
+    """
+    orig = seg.orig_start if seg.orig_start is not None else seg.start
+    return (round(float(orig), 3), round(float(seg.start), 3))
+
+
+def key_text(key: tuple[float, float]) -> str:
+    """鍵を文字列に（sidecar に書くとき）。"""
+    return f"{key[0]:.3f}+{key[1]:.3f}"
 
 
 def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
@@ -141,12 +195,87 @@ class Speaker:
         )
 
 
+# 括弧は**最初の開きから最後の閉じまで**を取る。役職に括弧が入れ子で出る
+# (「企画官（命）学校法人経営指導室長」)ため、`[^)）]*` だと途中で切れて
+# 行全体が名前になってしまう(実データで発生・2026-08-18)。
 _ROSTER_LINE = re.compile(
     r"^\s*(?:[-*・]\s*)?"          # 行頭の箇条書き記号は無視
     r"(?P<name>[^(（:：]+?)"        # 名前
-    r"(?:[(（](?P<note1>[^)）]*)[)）])?"   # (役職)
+    r"(?:[(（](?P<note1>.*)[)）])?"        # (役職) — 入れ子を許す
     r"\s*(?:[:：]\s*(?P<note2>.*))?$"      # : 補足
 )
+
+# 役職・所属を表す語。**2 文字以上のものだけ**を使う。「市」「村」「部」の
+# ような 1 文字を入れると「田村」さんが「田」になる(実際に起きる)。
+_ROLE_WORDS = re.compile(
+    "衆議院|参議院|議員|知事|市長|町長|村長|区長|副会長|会長|理事長|理事|監事|"
+    "代表取締役|取締役|代表|社長|専務|常務|部長|課長|係長|室長|局長|次長|所長|"
+    "園長|校長|学長|教授|准教授|講師|教諭|秘書|専門官|参事官|調査官|企画官|"
+    "事務官|技官|主査|主任|委員長|委員|顧問|相談役|幹事|事務局|同窓会|"
+    "学園|学校|高校|中学校|小学校|大学|短大|会社|法人|協会|組合|事務所|"
+    "センター|文科省|厚労省|経産省|国交省|財務省|総務省|防衛省"
+)
+
+# 氏名として残す最低の長さ。これを割ってまで削らない
+_MIN_NAME_CHARS = 2
+
+
+def suggest_split(line: str, others: Sequence[str] = ()) -> tuple[str, str]:
+    """1 行の肩書つき氏名を (名前, 企業・役職) に分ける**提案**を返す。
+
+    「三ツ林衆議院議員」→ ("三ツ林", "衆議院議員")
+    「山本学　文科省 高等教育局…」→ ("山本学", "文科省 高等教育局…")
+
+    規則は 2 つ。
+      1. 空白があればそこで切る
+      2. 役職・所属の語(_ROLE_WORDS)が出てきたら、その手前まで
+      3. **他の人の行にも出てくる 3 字の並びは、個人名ではなく所属**
+         (「加茂暁星」が別の人の行にも出るなら、その人の名前ではない)
+
+    **当てにいきすぎない。**「山口京子蓮田市長」の「蓮田」は地名だが、
+    規則で取ろうとすると本物の姓を削る事故が出る(「山田町長」の「山田」が
+    姓なのか地名なのかは字面では決まらない)。**提案であって確定ではない**
+    ので、外れたぶんは人が直す。設計書 §11.8。
+
+    others には他の出席者の行(分ける前の全体)を渡す。
+    """
+    s = (line or "").strip()
+    if not s:
+        return "", ""
+    # 1. 空白
+    head = re.split(r"\s", s, maxsplit=1)[0].strip()
+    cut = len(head) if head else len(s)
+    # 2. 役職・所属の語
+    m = _ROLE_WORDS.search(s[:cut])
+    if m and m.start() >= _MIN_NAME_CHARS:
+        cut = m.start()
+    # 3. 他の人にも出てくる並び
+    for i in range(_MIN_NAME_CHARS, max(_MIN_NAME_CHARS, cut - 2)):
+        if any(s[i:i + 3] in o for o in others if o):
+            cut = i
+            break
+    name = s[:cut].strip()
+    note = s[cut:].strip()
+    if len(name) < _MIN_NAME_CHARS:      # 削りすぎたら分けない
+        return s, ""
+    return name, note
+
+
+def suggest_roster_rows(text: str) -> list[tuple[str, str]]:
+    """名簿テキスト(1 行 1 人)を [(名前, 企業・役職), …] の提案にする。
+
+    すでに「名前(役職)」の形で書かれている行はそのまま尊重し、
+    分かれていない行だけ suggest_split() にかける。
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    rows: list[tuple[str, str]] = []
+    for sp in parse_roster(text):
+        if sp.note:                       # すでに分かれている
+            rows.append((sp.name, sp.note))
+        else:
+            others = [ln for ln in lines if sp.name not in ln]
+            rows.append(suggest_split(sp.name, others))
+    return rows
 
 
 def parse_roster(text: str) -> list[Speaker]:
@@ -186,6 +315,26 @@ def roster_to_text(speakers: Iterable[Speaker]) -> str:
 # ----------------------------------------------------------------------
 # セグメント
 # ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Utterance:
+    """転写エンジンが返す 1 発言。Segment を組み立てる前の中間の形。
+
+    クラウド(Gemini)とローカル(faster-whisper)で、ここまでは同じ形に揃える。
+    どちらの経路も「チャンク → Utterance の並び」を返し、オフセットの足し込みと
+    通し番号の付与から先は共通の後段が引き受ける
+    (claude/claude_ローカル転写_設計書.md §4.2)。
+
+    時刻はチャンクの先頭からの相対秒。絶対秒にするのは後段の仕事。
+    """
+
+    rel_start: float
+    rel_end: float
+    text: str
+    # 声のまとまりの記号。"A"/"B"… のほか、判別不能は "?"、複数人同時は "*"。
+    # チャンク番号を頭に付けた "0:A" の形にするのは後段(Segment を作るとき)。
+    cluster: str = PSEUDO_UNKNOWN
+
 
 @dataclass
 class Segment:
@@ -237,8 +386,15 @@ class Segment:
 
     @property
     def cluster_label(self) -> str:
-        """UI 表示用の短いクラスタ名 → 'C1-A'"""
+        """UI 表示用の短いクラスタ名。
+
+        チャンク内で閉じたクラスタ(Gemini)は 'C1-A'。
+        全長で分けたクラスタ(話者分離)は '声A' —— チャンク番号を出しても
+        意味が無く、むしろ「C1-A と C2-A は別」という誤解を招く。
+        """
         chunk, _, tail = self.cluster.partition(":")
+        if chunk == "g":
+            return f"声{tail}"
         try:
             return f"C{int(chunk) + 1}-{tail}"
         except ValueError:
@@ -277,6 +433,161 @@ class Segment:
             orig_start=float(orig_start) if orig_start is not None else None,
             orig_end=float(orig_end) if orig_end is not None else None,
         )
+
+
+def utterances_to_segments(
+    utterances: Iterable[Utterance],
+    *,
+    chunk_index: int = 0,
+    offset_seconds: float = 0.0,
+    start_index: int = 0,
+) -> list[Segment]:
+    """Utterance の並びを Segment に組み立てる(両経路の共通の後段)。
+
+    クラウド(Gemini)もローカル(faster-whisper)も、チャンク単位で Utterance を
+    作るところまでが経路ごとの仕事で、その先——チャンク先頭からの相対秒に
+    オフセットを足して絶対秒にする / クラスタ記号にチャンク番号の名前空間を
+    付ける / 通し番号を振る——は同じ。1 か所に集めておかないと、経路を足す
+    たびに同じ処理が増える(設計書 §4.2)。
+
+    ここで時刻をいじるのはオフセットの足し込みだけ。文字数按分
+    (redistribute_times)は通さない。按分は Gemini のタイムスタンプが
+    ドリフトする既知バグへの対策であって、実測時刻にかけるものではない。
+    クラウド経路では parse_utterances の中で既に済ませてある。
+    """
+    out: list[Segment] = []
+    for i, u in enumerate(utterances):
+        start = offset_seconds + u.rel_start
+        end = offset_seconds + u.rel_end
+        # 長さ 0 の区間は聴き直せない(再生しても何も鳴らない)ので、
+        # 最低限の長さを与えて操作できる状態にする。
+        if end <= start:
+            end = start + 1.0
+        out.append(Segment(
+            index=start_index + i,
+            start=round(start, 2),
+            end=round(end, 2),
+            text=u.text,
+            cluster=f"{chunk_index}:{u.cluster}",
+            chunk=chunk_index,
+        ))
+    return out
+
+
+# ----------------------------------------------------------------------
+# 話者分離の結果を区間へ落とす
+# (claude/claude_話者分離_設計書.md §4・§5・§8)
+# ----------------------------------------------------------------------
+
+# 区間の何割が話者区間と重なれば、その話者とみなすか。
+# 自動クラスタリングが作る「1 区間だけの幽霊話者」は、この閾値でどの区間も
+# 取れずに自然に消える(PoC で確認)。
+MIN_SPEAKER_OVERLAP = 0.5
+
+# 連結してよい間隔。これ以上空いていれば別の発言とみなす。
+SPEAKER_MERGE_MAX_GAP = 0.3
+
+# 全長の名前空間。チャンク内で閉じる "0:A" と区別する(設計書 §5)。
+GLOBAL_NAMESPACE = "g"
+
+_SENTENCE_ENDS = "。．！？!?」』…"
+
+
+def _speaker_letters(turns: Iterable[Any]) -> dict[int, str]:
+    """話者番号を A/B/C… に写す。**先に話した人から順**に振る。
+
+    分離器が返す番号は連番とは限らない(実測で 0/1/3/4/7/22/33… のように飛ぶ)。
+    番号をそのまま見せると意味の無い数字が並ぶので、出てきた順に文字を当てる。
+    """
+    order: list[int] = []
+    for t in sorted(turns, key=lambda x: (x.start, x.end)):
+        if t.speaker not in order:
+            order.append(t.speaker)
+    letters: dict[int, str] = {}
+    for i, spk in enumerate(order):
+        letters[spk] = chr(ord("A") + i) if i < 26 else f"S{i + 1}"
+    return letters
+
+
+def assign_speaker_clusters(
+    segments: Sequence[Segment],
+    turns: Sequence[Any],
+    min_overlap: float = MIN_SPEAKER_OVERLAP,
+) -> list[str]:
+    """区間ごとの `cluster` 文字列を作る(設計書 §4・§5)。
+
+    区間の時間範囲と**最も重なる話者区間**の話者を採る。重なりが区間の長さの
+    `min_overlap` に満たなければ `?`(判別不能)にする。
+
+    返すのは文字列の並びだけで、区間には書き込まない。書き込む場所を 1 つに
+    保つため(呼び出し側で `seg.cluster = ...` する)。
+
+    話者区間は重なりうるので、「最も重なる 1 つ」を選ぶ。同時に話している
+    区間には、より長く重なっていたほうが入る。**それを `*` に直すのは人**
+    ——重なりから機械的に判定しようとすると適合率 50% にしかならないことを
+    実測した(設計書 §6)。
+    """
+    letters = _speaker_letters(turns)
+    out: list[str] = []
+    for seg in segments:
+        best_spk, best_ov = None, 0.0
+        for t in turns:
+            ov = min(seg.end, t.end) - max(seg.start, t.start)
+            if ov > best_ov:
+                best_spk, best_ov = t.speaker, ov
+        span = max(0.01, seg.end - seg.start)
+        if best_spk is None or best_ov / span < min_overlap:
+            out.append(f"{GLOBAL_NAMESPACE}:{PSEUDO_UNKNOWN}")
+        else:
+            out.append(f"{GLOBAL_NAMESPACE}:{letters[best_spk]}")
+    return out
+
+
+def merge_same_speaker(
+    segments: Sequence[Segment],
+    max_gap: float = SPEAKER_MERGE_MAX_GAP,
+) -> list[Segment]:
+    """同じ話者の、文の途中で切れた区間を連結する(設計書 §8)。
+
+    ローカル転写は 74% の区間が文の途中で終わる(実測)。話者ラベルが付けば
+    安全に連結できる。条件は 3 つとも満たすこと:
+
+      1. 同じ話者(擬似クラスタ `?` `*` は連結しない)
+      2. 前の区間が句点等で終わっていない(文が続いている)
+      3. 間隔が max_gap 未満
+
+    **人が手を付けた区間は連結しない。**割当・本文の手直し・時刻の修正が
+    入っているものを勝手にまとめると、その作業が消える。
+
+    `orig_start` / `orig_end` は前後の端を保つ。再実行時に新旧の区間を
+    突き合わせる鍵なので、連結で失うと引き継ぎが壊れる。
+    """
+    out: list[Segment] = []
+    for seg in segments:
+        if out:
+            prev = out[-1]
+            touched = any((
+                prev.speaker_id, seg.speaker_id,
+                prev.text_edited, seg.text_edited,
+                prev.time_edited, seg.time_edited,
+            ))
+            joinable = (
+                not touched
+                and prev.cluster == seg.cluster
+                and not prev.is_pseudo_cluster
+                and prev.text
+                and prev.text[-1] not in _SENTENCE_ENDS
+                and seg.start - prev.end < max_gap
+            )
+            if joinable:
+                prev.text = prev.text + seg.text
+                prev.end = seg.end
+                prev.orig_end = seg.orig_end
+                continue
+        out.append(seg)
+    for i, seg in enumerate(out):
+        seg.index = i
+    return out
 
 
 # ----------------------------------------------------------------------
@@ -417,6 +728,334 @@ class Project:
         self.renumber()
         return head, tail
 
+    # -------------------------------------------------- 相づちを足す
+    def added_utterance_keys(self) -> set[float]:
+        """人が足した区間の orig_start（丸め済み）。
+
+        **再実行の引き継ぎがこれを見て、突き合わせから外す。**外さないと、
+        足した区間の独自の時刻が近くの無関係な区間に誤って照合され、
+        その区間を置き換えて消す（設計書 §4）。
+
+        識別に区間のフラグを使わないのは、スキーマを増やさないため
+        （v3 の一括移行まで待つ）。edit_log は既にあり、再実行でも
+        引き継がれるので、ここに置くのが自然。
+        """
+        keys: set[float] = set()
+        for rec in self.edit_log:
+            op = rec.get("op")
+            k = rec.get("orig_start")
+            if k is None:
+                continue
+            if op == "add_utterance":
+                keys.add(round(float(k), 3))
+            elif op == "remove_added_utterance":
+                keys.discard(round(float(k), 3))
+        return keys
+
+    def is_added_utterance(self, seg: Segment) -> bool:
+        """この区間は人が足したものか（消してよいか）。"""
+        key = float(seg.orig_start if seg.orig_start is not None else seg.start)
+        return round(key, 3) in self.added_utterance_keys()
+
+    def add_utterance(self, start: float, end: float, text: str,
+                      cluster: str = "", cut: Optional[int] = None,
+                      parent_orig: Optional[float] = None,
+                      parent_start: Optional[float] = None) -> Segment:
+        """聞こえたのに本文に無い発話を、区間として足す（設計書 §2）。
+
+        時刻と声のまとまりは機械（話者分離の turn）が用意し、本文は人が打つ。
+        **重なりを禁止しない。**相づちは主発言と重なるのが本性なので、
+        既存区間と時間的に重なってよい。
+
+        話者は付けずに返す。付けるのは呼び出し側の通常の割当操作で、
+        そのときの ✓/△ は既存の意味論に従う（機械が ✓ を立てる経路は無い）。
+        """
+        start = round(float(start), 3)
+        end = round(max(float(end), start + MIN_SEGMENT_SECONDS), 3)
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("本文が空です。")
+        # 前後の区間と同じチャンクに属させる（チャンク番号は再生や
+        # クラスタ記号の表示に使われる）
+        near = min(self.segments, key=lambda s: abs(s.start - start),
+                   default=None)
+        seg = Segment(
+            index=0,                        # renumber で振り直す
+            start=start,
+            end=end,
+            text=text,
+            cluster=cluster or f"{near.chunk if near else 0}:{PSEUDO_UNKNOWN}",
+            chunk=near.chunk if near else 0,
+            speaker_id=None,
+            reviewed=False,
+            text_edited=True,               # 人が打った本文
+            time_edited=False,              # 時刻は turn 由来の機械値
+        )
+        pos = len([s for s in self.segments if (s.start, s.index) < (start, 0)])
+        self.segments.insert(pos, seg)
+        self.renumber()
+        self.edit_log.append({
+            "op": "add_utterance",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            "orig_start": float(seg.orig_start),
+            "start": start,
+            "end": end,
+            "cluster": seg.cluster,
+            # **どの区間の本文の、どこに割り込んだか。**
+            # 区間は割らない(割ると直すときに元の本文を復元できない)。
+            # 代わりにここを覚えておき、Word に出すときだけ差し込む。
+            "cut": None if cut is None else int(cut),
+            # **差し込み先は (orig_start, start) の組で指す。**orig_start だけ
+            # では分割した 2 つを区別できない（segment_key を見よ）。
+            # parent_start が無い古い記録は orig_start だけで突き合わせる。
+            "parent_orig": None if parent_orig is None else float(parent_orig),
+            "parent_start": None if parent_start is None else float(parent_start),
+        })
+        return seg
+
+    # ------------------------------------------------------------------
+    # 編集履歴（設計書 §12）
+    #
+    # **記録するのは「人がした判断」であって「区間の書き換え」ではない。**
+    # 一括適用は 50 区間を変えても人の判断は 1 回なので、記録も 1 件で
+    # 対象を列挙する。区間ごとに 1 件ずつ残すと、実データで 95KB になり
+    # (実測 2026-08-19)、しかも「何回判断したか」が読み取れなくなる。
+    #
+    # **before を残す。**「機械が何と言い、人が何に直したか」が無ければ
+    # 検証履歴の意味がない。本文を丸ごと持っても、実データで作業ファイルは
+    # 1.35 倍（280KB→379KB）、起こりうる最大でも 2.4 倍で収まる。
+    #
+    # **書き換えの経路をここに集める。**画面が seg.speaker_id を直接
+    # 書き換えると記録を素通りするので、必ずこのメソッドを通す。
+    # ------------------------------------------------------------------
+    def _log(self, op: str, **kw: Any) -> None:
+        self.edit_log.append({
+            "op": op,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            **kw,
+        })
+
+    def _key(self, seg: Segment) -> list[float]:
+        """記録が指す鍵 —— **(orig_start, start) の組**。
+
+        `index` は振り直るので使わない。**`orig_start` だけでも足りない**
+        ——分割した 2 つが同じ値を持つため（`segment_key` を見よ）。
+        JSON に入れるので list で返す。
+        """
+        return list(segment_key(seg))
+
+    def assign_speaker(self, index: int, speaker_id: Optional[str],
+                       reviewed: bool = True) -> None:
+        """1 区間に話者を割り当てる（人が聴いて決めた 1 回の判断）。
+
+        speaker_id=None なら未確定に戻す（reviewed も落ちる）。
+        """
+        seg = self.segments[index]
+        before, before_rev = seg.speaker_id, seg.reviewed
+        seg.speaker_id = speaker_id
+        seg.reviewed = bool(speaker_id) and reviewed
+        if (before, before_rev) == (seg.speaker_id, seg.reviewed):
+            return                      # 変わっていないなら記録しない
+        self._log("assign", segment=self._key(seg),
+                  before=before, after=speaker_id, reviewed=seg.reviewed)
+
+    def apply_speaker_to(self, indexes: Sequence[int],
+                         speaker_id: Optional[str],
+                         heard_index: Optional[int] = None) -> None:
+        """まとめて適用（1 回の判断で複数区間）。
+
+        heard_index の区間だけ `reviewed=True`（その 1 つを聴いて決めた）。
+        残りは `reviewed=False`——**機械の結果をまとめて当てただけ**で、
+        個別には聴いていない。この区別が製品価値そのもの（CLAUDE.md）。
+        """
+        heard: list[list[float]] = []
+        bulk: list[list[float]] = []
+        for i in indexes:
+            seg = self.segments[i]
+            was = (seg.speaker_id, seg.reviewed)
+            seg.speaker_id = speaker_id
+            seg.reviewed = bool(speaker_id) and (i == heard_index)
+            if was == (seg.speaker_id, seg.reviewed):
+                continue
+            (heard if i == heard_index else bulk).append(self._key(seg))
+        if not (heard or bulk):
+            return
+        self._log("assign_bulk", after=speaker_id,
+                  heard=heard, bulk=bulk, count=len(heard) + len(bulk))
+
+    def restore_assignments(
+        self, snapshot: Sequence[tuple[int, Optional[str], bool]]
+    ) -> None:
+        """取り消し。**取り消したことも履歴に残す。**
+
+        消してしまうと「一度は当てたが戻した」経緯が読めなくなる。
+        検証履歴は結果ではなく経緯の記録なので、打ち消しも記録に残す。
+        """
+        keys: list[list[float]] = []
+        for index, sid, reviewed in snapshot:
+            if not (0 <= index < len(self.segments)):
+                continue
+            seg = self.segments[index]
+            if (seg.speaker_id, seg.reviewed) == (sid, reviewed):
+                continue
+            seg.speaker_id, seg.reviewed = sid, reviewed
+            keys.append(self._key(seg))
+        if keys:
+            self._log("undo_assign", targets=keys, count=len(keys))
+
+    def edit_text(self, index: int, new_text: str) -> bool:
+        """本文を人が直す。変わったときだけ記録して True を返す。"""
+        seg = self.segments[index]
+        new_text = new_text if new_text is not None else ""
+        if new_text == seg.text:
+            return False
+        before = seg.text
+        seg.text = new_text
+        seg.text_edited = True          # 再実行で上書きされないよう印を付ける
+        self._log("edit_text", segment=self._key(seg),
+                  before=before, after=new_text)
+        return True
+
+    def edit_time(self, index: int, start: float, end: float,
+                  reviewed: bool, _log: bool = True) -> bool:
+        """区間の時刻を人が直す／確かめる。変わったときだけ記録。
+
+        値が同じでも `reviewed` が上がる（✎△ → ✎）ことがあるので、
+        そこも変化として記録する。**値の書き込みもここで行う**——
+        画面側で書くと記録を素通りする経路が生まれる（設計書 §1.3）。
+
+        _log=False は「まとめて適用」用。呼び出し側が 1 件の記録に
+        まとめるので、ここでは書き込みだけ行う。
+        """
+        seg = self.segments[index]
+        was = (seg.start, seg.end, seg.time_edited, seg.time_reviewed)
+        changed = was != (start, end, True, bool(reviewed))
+        seg.start, seg.end = start, end
+        seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = bool(reviewed)
+        if changed and _log:
+            self._log("edit_time", segment=self._key(seg),
+                      before=[round(was[0], 3), round(was[1], 3)],
+                      after=[round(start, 3), round(end, 3)],
+                      reviewed=bool(reviewed))
+        return changed
+
+    def apply_times_to(
+        self, items: Sequence[tuple[int, float, float]], reviewed: bool = False
+    ) -> int:
+        """時刻をまとめて当てる（1 回の判断で複数区間・記録は 1 件）。
+
+        点検の提案の一括適用。**すべて ✎△**（機械が当てただけ）。
+        人の耳の確認はあとから 1 件ずつ ✎ に上げる。
+        """
+        keys: list[list[float]] = []
+        for index, start, end in items:
+            if self.edit_time(index, start, end, reviewed, _log=False):
+                keys.append(self._key(self.segments[index]))
+        if keys:
+            self._log("apply_times_bulk", targets=keys, count=len(keys),
+                      reviewed=bool(reviewed))
+        return len(keys)
+
+    def revert_time(self, index: int) -> bool:
+        """パイプラインが出した元の時刻に戻す（以後はまたずれ補正が効く）。"""
+        seg = self.segments[index]
+        if not seg.time_edited:
+            return False
+        before = [round(seg.start, 3), round(seg.end, 3)]
+        seg.start = float(seg.orig_start)
+        seg.end = float(seg.orig_end)
+        seg.time_edited = False
+        seg.time_reviewed = False
+        self._log("revert_time", segment=self._key(seg),
+                  before=before, after=[round(seg.start, 3), round(seg.end, 3)])
+        return True
+
+    def restore_times(
+        self, items: Sequence[tuple[int, float, float, bool, bool]]
+    ) -> int:
+        """時刻の一括適用を丸ごと元に戻す。**戻したことも記録に残す。**"""
+        keys: list[list[float]] = []
+        for index, start, end, edited, reviewed in items:
+            if not (0 <= index < len(self.segments)):
+                continue
+            seg = self.segments[index]
+            if (seg.start, seg.end, seg.time_edited, seg.time_reviewed) == (
+                    start, end, edited, reviewed):
+                continue
+            seg.start, seg.end = start, end
+            seg.time_edited, seg.time_reviewed = edited, reviewed
+            keys.append(self._key(seg))
+        if keys:
+            self._log("undo_times", targets=keys, count=len(keys))
+        return len(keys)
+
+    def clear_speakers(self, speaker_ids: Sequence[str]) -> int:
+        """名簿から消えた人の割当を外す。**外したことを記録に残す。**
+
+        「一度はこの人に当てていたが、名簿から消したので外れた」という
+        経緯は、あとから読む人にとって重要（誰の発言か分からなくなった
+        理由がこれ）。
+        """
+        gone = set(speaker_ids)
+        keys: list[list[float]] = []
+        for seg in self.segments:
+            if seg.speaker_id in gone:
+                seg.speaker_id = None
+                seg.reviewed = False
+                keys.append(self._key(seg))
+        if keys:
+            self._log("clear_speakers", removed=sorted(gone),
+                      targets=keys, count=len(keys))
+        return len(keys)
+
+    def set_added_speaker(self, index: int, speaker_id: str) -> None:
+        """足した発話に、その場で選んだ話者を入れる。
+
+        **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
+        """
+        seg = self.segments[index]
+        seg.speaker_id = speaker_id
+        seg.reviewed = True
+        self._log("assign", segment=self._key(seg),
+                  before=None, after=speaker_id, reviewed=True)
+
+    def log_counts(self) -> dict[str, int]:
+        """検証要約に出す内訳。**op ごとの件数だけ**（明細は Day 75）。"""
+        out: dict[str, int] = {}
+        for rec in self.edit_log:
+            op = str(rec.get("op") or "?")
+            out[op] = out.get(op, 0) + 1
+        return out
+
+    def log_last_at(self) -> str:
+        """最後に手を入れた時刻（ISO・UTC）。無ければ空。"""
+        times = [str(r.get("at") or "") for r in self.edit_log]
+        return max(times) if times else ""
+
+    def remove_added_utterance(self, index: int) -> None:
+        """人が足した区間を消す。**それ以外は消せない。**
+
+        短い相づちの自動削除をしない原則（CLAUDE.md）はそのまま。
+        ここで消せるのは人がいま足したものだけで、音声認識が出した区間には
+        削除の入口を作らない。
+        """
+        if not (0 <= index < len(self.segments)):
+            raise ValueError("その区間はありません。")
+        seg = self.segments[index]
+        if not self.is_added_utterance(seg):
+            raise ValueError("人が足した区間ではないので消せません。")
+        del self.segments[index]
+        self.renumber()
+        self.edit_log.append({
+            "op": "remove_added_utterance",
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            "orig_start": float(seg.orig_start),
+        })
+
     def merge_segments(self, index: int) -> Segment:
         """index の区間と、その次の区間を 1 つにまとめる。
 
@@ -550,17 +1189,195 @@ class Project:
 # Word 出力
 # ----------------------------------------------------------------------
 
+def short_labels(speakers: Sequence[Speaker]) -> dict[str, str]:
+    """話者 ID → 埋め込みで使う短い呼び名。
+
+    本文の中に「(氏名：はい)」の形で入れるとき、名前が長いと相づちが肩書に
+    埋もれる(実データで 6 字の相づちが 40 字の肩書に埋もれた・2026-08-18)。
+    そこで**最初の空白まで**を使う。「山本学　文科省 高等教育局…」→「山本学」。
+
+    **短くした結果が他の人とかぶるなら、その人は短くしない。**取り違えは
+    誰が言ったかの記録そのものを壊すので、読みやすさより優先する。
+    空白の無い名前も、切りようが無いのでそのまま。
+
+    記録を書き換えるわけではない(【 】のラベルと出席者一覧は全名のまま)。
+    根拠は設計書 §11.7。
+    """
+    cand: dict[str, str] = {}
+    for sp in speakers:
+        # \s は全角スペース(U+3000)も含む
+        head = re.split(r"\s", sp.name.strip(), maxsplit=1)[0].strip()
+        cand[sp.id] = head if head else sp.name
+    # 短くした形が 2 人以上でぶつかるなら、その人たちは全名に戻す
+    seen: dict[str, list[str]] = {}
+    for sid, short in cand.items():
+        seen.setdefault(short, []).append(sid)
+    full = {sp.id: sp.name for sp in speakers}
+    for short, ids in seen.items():
+        if len(ids) > 1:
+            for sid in ids:
+                cand[sid] = full[sid]
+    # 他人の全名とぶつかる場合も戻す(「山本」と「山本学」が並ぶ等)
+    names = set(full.values())
+    for sid, short in list(cand.items()):
+        if short != full[sid] and short in names:
+            cand[sid] = full[sid]
+    return cand
+
+
+def speaker_label(
+    proj: Project, sid: Optional[str], with_role: bool = False
+) -> str:
+    """本文の【 】に出す呼び名(設計書 §11.8)。
+
+    with_role=False … 名前だけ。「山本学」
+    with_role=True  … 役職も付ける。「山本学(文科省 高等教育局…)」
+
+    **出席者一覧は常に両方を載せる**(記録として全名を残す)ので、
+    ここで名前だけにしても、誰なのかは文書の冒頭から辿れる。
+    """
+    sp = proj.speaker(sid)
+    if not sp:
+        return UNKNOWN_LABEL
+    return sp.display if with_role else sp.name
+
+
+def _insert_cuts(proj: Project) -> dict:
+    """「どの区間の、本文の何文字目に、どの追加発話が割り込んだか」を集める。
+
+    割り込み位置は add_utterance が edit_log に残している(区間そのものは
+    割らない。割ると、直すときに元の本文を復元できない → 設計書 §5.0.5)。
+    消された追加発話は取り除く。
+
+    鍵は `(parent_orig, parent_start)`。**`parent_start` が無い古い記録は
+    `None`** にしておき、突き合わせのときに `parent_orig` だけで当てる。
+    """
+    cuts: dict[tuple[float, Optional[float]], list[tuple[int, float]]] = {}
+    for rec in proj.edit_log:
+        if (rec.get("op") == "add_utterance" and rec.get("cut") is not None
+                and rec.get("parent_orig") is not None):
+            ps = rec.get("parent_start")
+            key = (round(float(rec["parent_orig"]), 3),
+                   None if ps is None else round(float(ps), 3))
+            cuts.setdefault(key, []).append(
+                (int(rec["cut"]), round(float(rec["orig_start"]), 3)))
+        elif rec.get("op") == "remove_added_utterance":
+            gone = round(float(rec.get("orig_start", -1)), 3)
+            for lst in cuts.values():
+                lst[:] = [c for c in lst if c[1] != gone]
+    return cuts
+
+
+def _cuts_for(cuts: dict, seg: "Segment") -> list[tuple[int, float]]:
+    """その区間に差し込むもの。組で当て、古い形(orig だけ)も拾う。"""
+    k = segment_key(seg)
+    return list(cuts.get(k, [])) + list(cuts.get((k[0], None), []))
+
+
+def has_inserted_utterances(proj: Project) -> bool:
+    """出力の本文に差し込まれる追加発話があるか(凡例を出すかの判断に使う)"""
+    added = {round(float(s.orig_start), 3)
+             for s in proj.segments if proj.is_added_utterance(s)}
+    return any(key in added
+               for lst in _insert_cuts(proj).values() for _cut, key in lst)
+
+
 def _merge_runs(
     proj: Project,
     merge_consecutive: bool = True,
     drop_noise: bool = True,
-) -> list[tuple[float, Optional[str], str]]:
-    """(開始秒, 話者ID, 本文) の並びを作る。
+    insert_style: str = INSERT_STYLE_LINE,
+) -> list[tuple[float, Optional[str], str, bool]]:
+    """(開始秒, 話者ID, 本文, 続きか) の並びを作る。
+
     merge_consecutive=True なら、同一話者の連続区間を 1 段落にまとめる。
     drop_noise=True なら「発言なし・雑音」と印を付けた区間は出力しない。
+    insert_style は人が足した相づちの書き方(設計書 §11)。
+      INSERT_STYLE_LINE   … 行を分け、割られた前半の末尾に ,, を付ける
+      INSERT_STYLE_INLINE … 元の本文の中に (氏名：本文) の形で埋め込む
+
+    「続きか」が True の要素は、**割られた発言の後半**である。時刻を書いては
+    いけない。前半と同じ開始時刻しか持っておらず、そのまま出すと時刻が
+    戻って見える。**後半の本当の開始時刻は測っていないので書かない**
+    (測っていないものを書けば記録として嘘になる → 設計書 §11.3)。
     """
-    runs: list[tuple[float, Optional[str], list[str]]] = []
+    # **人が足した発話は、割り込んだ位置で元の本文に差し込む。**
+    # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
+    # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
+    cuts = _insert_cuts(proj)
+    added_by_key = {round(float(s.orig_start), 3): s
+                    for s in proj.segments if proj.is_added_utterance(s)}
+    inline = insert_style == INSERT_STYLE_INLINE
+
+    def marks_for(seg: Segment) -> list[tuple[int, float]]:
+        return sorted(
+            (c for c in _cuts_for(cuts, seg) if c[1] in added_by_key),
+            key=lambda c: c[0])
+
+    shorts = short_labels(proj.speakers) if inline else {}
+
+    def label_of(seg: Segment) -> str:
+        """埋め込みで使う呼び名。長い肩書に相づちが埋もれるのを避ける。"""
+        sp = proj.speaker(seg.speaker_id)
+        if not sp:
+            return UNKNOWN_LABEL
+        return shorts.get(sp.id, sp.name)
+
+    def pieces(seg: Segment) -> list[tuple[Segment, bool, bool]]:
+        """区間を割り込みの位置で切った断片に分ける(出力のためだけ)。
+
+        返すのは (断片, 続きか, 閉じたか)。「閉じた」は末尾に ,, を付けた
+        断片で、後ろに何も足してはいけない(足すと ,, が文中に埋もれ、
+        そこで割り込まれたことが読み取れなくなる)。
+        inline のときは切らず、本文に埋め込んだ 1 つの断片にする。
+        """
+        marks = marks_for(seg)
+        if not marks:
+            return [(seg, False, False)]
+        if inline:
+            out, prev = [], 0
+            for cut, key in marks:
+                cut = max(0, min(len(seg.text), cut))
+                add = added_by_key[key]
+                if drop_noise and add.speaker_id == SPECIAL_NOISE:
+                    continue
+                body = add.text.strip()
+                if not body:
+                    continue
+                out.append(seg.text[prev:cut])
+                out.append(f"({label_of(add)}：{body})")
+                prev = cut
+            out.append(seg.text[prev:])
+            return [(replace(seg, text="".join(out)), False, False)]
+        out2: list[tuple[Segment, bool, bool]] = []
+        prev, cont = 0, False
+        for cut, key in marks:
+            cut = max(0, min(len(seg.text), cut))
+            head = seg.text[prev:cut]
+            if head.strip():
+                # 下の行に続くことを示す(BTSJ 2.3.2)。ここで閉じる
+                out2.append(
+                    (replace(seg, text=head.rstrip() + CONTINUE_MARK), cont, True))
+                cont = True
+            out2.append((added_by_key[key], False, False))
+            prev = cut
+        tail = seg.text[prev:]
+        if tail.strip():
+            out2.append((replace(seg, text=tail), cont, False))
+        return out2
+
+    ordered: list[tuple[Segment, bool, bool]] = []
     for seg in proj.segments:
+        if proj.is_added_utterance(seg):
+            # 差し込み先で出すので、単独では出さない(先が無ければ出す)
+            key = round(float(seg.orig_start), 3)
+            if any(key == k for v in cuts.values() for _c, k in v):
+                continue
+        ordered.extend(pieces(seg))
+
+    runs: list[tuple[float, Optional[str], list[str], bool]] = []
+    closed = False          # 直前の段落が ,, で閉じられたか
+    for seg, cont, shut in ordered:
         text = seg.text.strip()
         if not text:
             continue
@@ -571,12 +1388,64 @@ def _merge_runs(
             and runs
             and runs[-1][1] == seg.speaker_id
             and seg.speaker_id is not None
+            and not cont          # 割られた後半は、前半と同じ段落に戻さない
+            and not closed        # ,, で閉じた段落の後ろにも足さない
         ):
             runs[-1][2].append(text)
         else:
-            runs.append((seg.start, seg.speaker_id, [text]))
+            runs.append((seg.start, seg.speaker_id, [text], cont))
+        closed = shut
     # 日本語なので連結時に空白を挟まない
-    return [(start, sid, "".join(parts)) for start, sid, parts in runs]
+    return [(start, sid, "".join(parts), cont) for start, sid, parts, cont in runs]
+
+
+# 編集履歴の op → 検証要約に出す日本語（編集履歴設計書 §3）。
+# **知らない op は「その他」にまとめず、op 名のまま出す。**黙って畳むと
+# 新しい操作を足したときに履歴から消えたように見える。
+LOG_LABELS = {
+    "assign": "話者",
+    "assign_bulk": "話者(まとめて)",
+    "undo_assign": "話者の取り消し",
+    "clear_speakers": "名簿から外れた割当",
+    "edit_text": "本文",
+    "edit_time": "時刻",
+    "apply_times_bulk": "時刻(まとめて)",
+    "revert_time": "時刻を戻した",
+    "undo_times": "時刻の取り消し",
+    "add_utterance": "相づちを足した",
+    "remove_added_utterance": "相づちを消した",
+    "restore_lost_segments": "消えた区間を戻した",
+    "split": "区間の分割",
+    "merge": "区間の結合",
+}
+
+
+def fmt_log_at(iso: str) -> str:
+    """記録の時刻（UTC の ISO）を、その場の時刻の見やすい形にする。"""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def build_log_summary(proj: Project) -> str:
+    """検証要約に出す編集履歴の 1 行（明細は Day 75）。"""
+    counts = proj.log_counts()
+    if not counts:
+        return "記録なし"
+    total = sum(counts.values())
+    parts = [f"{LOG_LABELS.get(op, op)} {n}"
+             for op, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+    last = fmt_log_at(proj.log_last_at())
+    out = f"全 {total} 件（" + " / ".join(parts) + "）"
+    if last:
+        out += f"  最終 {last}"
+    return out
 
 
 def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
@@ -591,21 +1460,43 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
     if proj.source_sha256:
         rows.append(("SHA-256", proj.source_sha256))
     if proj.engine:
-        mode = {"cloud": "クラウド", "local": "ローカル"}.get(
+        mode = ENGINE_LABELS.get(
             str(proj.engine.get("mode", "")), str(proj.engine.get("mode", "")))
         model = str(proj.engine.get("model", ""))
         at = str(proj.engine.get("at", ""))
         rows.append(("処理経路", " / ".join(x for x in (mode, model, at) if x)))
     rows.append(("版", f"revision {revision} (schema {SCHEMA_VERSION})"))
 
+    # 数え方は「区間の数」で統一する。分母は必ず全区間数を書き、内訳は
+    # 読点で区切る。区切りに「/」を使うと分数に見え、「聴いて確認 41 /
+    # 適用のみ 40」が「41 分の 40」と読まれる(実出力で発生した)。
+    # 検証要約は確認の履歴そのものなので、読み違えられる表示は信用を損なう。
+    total = proj.total_count
     heard = proj.reviewed_count
     bulk = proj.unreviewed_count
-    unassigned = proj.total_count - proj.assigned_count
-    rows.append(("話者の確認", f"聴いて確定 {heard} / まとめて適用 {bulk} / "
-                              f"未確定 {unassigned}"))
+    unassigned = total - proj.assigned_count
+    rows.append((
+        "話者の確認",
+        f"全 {total} 区間 — 聴いて確定 {heard} 区間、"
+        f"まとめて適用 {bulk} 区間、未確定 {unassigned} 区間",
+    ))
     t_heard = sum(1 for s in proj.segments if s.time_edited and s.time_reviewed)
     t_bulk = sum(1 for s in proj.segments if s.time_edited and not s.time_reviewed)
-    rows.append(("時刻の修正", f"聴いて確認 {t_heard} / 適用のみ {t_bulk}"))
+    rows.append((
+        "時刻の修正",
+        f"全 {total} 区間中 {t_heard + t_bulk} 区間 — "
+        f"聴いて確認 {t_heard} 区間、適用のみ {t_bulk} 区間",
+    ))
+    # **人が何回、何を触ったか。**「どこまで人が原音で確認したかを成果物に
+    # 残せるか」が本製品の差別化そのもの(事業計画 v29)。件数の集計だけでは
+    # 「いつまで手を入れたか」が分からない。明細は Day 75。
+    rows.append(("編集の履歴", build_log_summary(proj)))
+    rows.append((
+        "凡例",
+        "「聴いて確定」「聴いて確認」＝その区間の音声を人が聴いて決めたもの。"
+        "「まとめて適用」「適用のみ」＝機械の結果をまとめて当てただけで、"
+        "その区間を個別には聴いていないもの。数はいずれも区間の数です。",
+    ))
     rows.append(("注意", "本書の記載は確認の履歴であり、内容の正しさや"
                         "法的効力を保証するものではありません。"))
     return rows
@@ -637,11 +1528,15 @@ def write_docx(
     drop_noise: bool = True,
     include_verification: bool = True,
     revision: Optional[int] = None,
+    insert_style: str = INSERT_STYLE_LINE,
+    with_role: bool = False,
 ) -> Path:
     """割当結果を Word ファイルに書き出す。
 
     include_verification: 末尾に検証要約(元音声・SHA-256・処理経路・版・
     確認状態)を付ける。revision はこの出力の版番号(省略時は記録済みの値)。
+    insert_style: 人が足した相づちの書き方(設計書 §11)。
+    with_role: 本文の【 】に企業・役職も入れる(設計書 §11.8)。
     """
     from docx import Document
     from docx.shared import Pt, RGBColor
@@ -669,6 +1564,13 @@ def write_docx(
         head.bold = True
         p.add_run("、".join(sp.display for sp in proj.speakers))
 
+    # 記号だけ出しても受け取った人が読めない。差し込みがあるときだけ添える
+    if has_inserted_utterances(proj):
+        p = doc.add_paragraph()
+        run = p.add_run(INSERT_LEGEND[insert_style])
+        run.italic = True
+        run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
+
     if include_note:
         p = doc.add_paragraph()
         run = p.add_run(build_note(proj))
@@ -676,13 +1578,14 @@ def write_docx(
         run.font.color.rgb = RGBColor(0x70, 0x70, 0x70)
         doc.add_paragraph()
 
-    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
+    for start, sid, text, cont in _merge_runs(
+            proj, merge_consecutive, drop_noise, insert_style):
         p = doc.add_paragraph()
-        if with_timestamps:
+        # 割られた発言の後半には時刻を書かない(測っていない → 設計書 §11.3)
+        if with_timestamps and not cont:
             ts = p.add_run(f"[{fmt_hms(start)}] ")
             ts.bold = True
-        sp = proj.speaker(sid)
-        label = sp.name if sp else UNKNOWN_LABEL
+        label = speaker_label(proj, sid, with_role)
         name_run = p.add_run(f"【{label}】 ")
         name_run.bold = True
         if sid is None:
@@ -717,12 +1620,20 @@ def write_text(
     output_path: Path | str,
     merge_consecutive: bool = True,
     drop_noise: bool = True,
+    insert_style: str = INSERT_STYLE_LINE,
+    with_role: bool = False,
 ) -> Path:
     """プレーンテキスト出力(自分のテンプレートに貼り込む場合や、差分取り用)"""
     output_path = Path(output_path)
     lines = []
-    for start, sid, text in _merge_runs(proj, merge_consecutive, drop_noise):
-        sp = proj.speaker(sid)
-        lines.append(f"[{fmt_hms(start)}] 【{sp.name if sp else UNKNOWN_LABEL}】 {text}")
+    if has_inserted_utterances(proj):
+        lines.append(INSERT_LEGEND[insert_style])
+        lines.append("")
+    for start, sid, text, cont in _merge_runs(
+            proj, merge_consecutive, drop_noise, insert_style):
+        # 後半には時刻を書かない。桁だけ空けて縦を揃える(設計書 §11.3)
+        head = " " * (len(fmt_hms(start)) + 3) if cont else f"[{fmt_hms(start)}] "
+        lines.append(
+            f"{head}【{speaker_label(proj, sid, with_role)}】 {text}")
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output_path

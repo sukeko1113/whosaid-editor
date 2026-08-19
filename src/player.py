@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, Optional
@@ -83,6 +84,12 @@ class SegmentPlayer:
         self._winsound_active = False
         self.on_finished = on_finished
         self.ffplay = find_ffplay()
+        # 一時停止のために「いま何をどこから鳴らしているか」を覚える。
+        # ffplay は外部プロセスで再生位置を問い合わせられないので、
+        # **開始時刻と経過時間から推定する。**相づちの聴き取りでは
+        # 数十ミリ秒の誤差は問題にならない(止めた辺りから鳴り直せればよい)。
+        self._cur: Optional[dict] = None
+        self._paused_at: Optional[float] = None
 
     # ------------------------------------------------------------------
     @property
@@ -112,6 +119,7 @@ class SegmentPlayer:
     ) -> None:
         """[start-pre_roll, end+post_roll] を再生する。既存の再生は止める。"""
         self.stop()
+        self._paused_at = None
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"音声ファイルが見つかりません: {audio_path}")
@@ -122,6 +130,12 @@ class SegmentPlayer:
         with self._lock:
             self._token += 1
             token = self._token
+
+        # 一時停止から鳴らし直すために控える(再生の実体には影響しない)
+        self._cur = {
+            "audio_path": audio_path, "ss": ss, "dur": dur, "speed": speed,
+            "volume": volume, "since": time.monotonic(),
+        }
 
         if self.ffplay:
             self._play_ffplay(audio_path, ss, dur, speed, volume, token)
@@ -260,6 +274,45 @@ class SegmentPlayer:
                 winsound.PlaySound(None, winsound.SND_PURGE)
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    def pause(self) -> bool:
+        """鳴らすのを止め、**その位置を覚える**。再開できるなら True。
+
+        ffplay は外部プロセスなので再生位置を問い合わせられない。
+        開始してからの経過時間（再生速度を掛け戻す）で推定する。
+        相づちの聴き取りでは、止めた辺りから鳴り直せれば足りる。
+        """
+        cur = self._cur
+        if cur is None or not self.is_playing():
+            return False
+        played = (time.monotonic() - cur["since"]) * float(cur["speed"] or 1.0)
+        # 終わりを越えていたら再開しても意味がない
+        if played >= cur["dur"] - 0.05:
+            self.stop()
+            self._paused_at = None
+            return False
+        self._paused_at = max(0.0, played)
+        self.stop()
+        return True
+
+    def resume(self) -> bool:
+        """一時停止した位置から鳴らし直す。再開できなければ False。"""
+        cur, at = self._cur, self._paused_at
+        if cur is None or at is None:
+            return False
+        self._paused_at = None
+        remain = cur["dur"] - at
+        if remain <= 0.05:
+            return False
+        # pre_roll/post_roll は既に cur に織り込まれているので 0 で渡す
+        self.play(cur["audio_path"], cur["ss"] + at, cur["ss"] + cur["dur"],
+                  speed=cur["speed"], pre_roll=0.0, post_roll=0.0,
+                  volume=cur["volume"])
+        return True
+
+    def is_paused(self) -> bool:
+        return self._paused_at is not None
 
     def _notify_finished(self, token: int) -> None:
         with self._lock:
