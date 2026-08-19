@@ -317,7 +317,12 @@ def test_module_does_not_claim_detection():
 def test_real_data_reproduces_the_measured_numbers():
     """逐語正解があるときだけ動く。**設計書の数字が再現するか見張る。**"""
     truth_dir = Path(r"C:\dev\01\test-audio\truth")
-    proj_path = Path(r"C:\dev\01\test-audio\01+02edited.speakers.json")
+    # **見る先は diarized/ の作業ファイル。**本体は人が毎日編集しており、
+    # 区間を分けたり時刻を直したりするたびに候補が増えて数字が動く
+    # (実測: 候補 49→73、適合 69%→55%)。**編集される file を検査の
+    # 基準にすると、機能を壊していないのに落ちる。**
+    proj_path = Path(
+        r"C:\dev\01\test-audio\diarized\01+02edited.speakers.json")
     turns_path = Path(
         r"C:\dev\01\test-audio\.work_01+02edited\diarize"
         r"\turns.ca1fb4d464e99c16.pyannote3-titanet.n9.v1.json")
@@ -348,10 +353,11 @@ def test_real_data_reproduces_the_measured_numbers():
                 if any(abs(c.at - m["at"]) <= 3.0 for c in in_band))
     print(f"       候補 {len(in_band)} 個 / 再現 {found}/{len(missing)} / "
           f"適合 {hit}/{len(in_band)}")
-    # 実測は再現 31/34・適合 35/51。turn の版や作業の進み方で少し動く
-    assert found / len(missing) >= 0.80, f"再現が落ちた: {found}/{len(missing)}"
-    assert hit / len(in_band) >= 0.55, f"適合が落ちた: {hit}/{len(in_band)}"
-    assert len(in_band) <= 80, f"候補が増えすぎた: {len(in_band)}"
+    # 安定したファイルでの実測は 候補 49 / 再現 31/34 / 適合 34/49(69%)。
+    # 設計書の 51 / 31/34 / 35/51(69%) と**割合は同じ**。
+    assert found / len(missing) >= 0.85, f"再現が落ちた: {found}/{len(missing)}"
+    assert hit / len(in_band) >= 0.60, f"適合が落ちた: {hit}/{len(in_band)}"
+    assert len(in_band) <= 60, f"候補が増えすぎた: {len(in_band)}"
 
 
 # ======================================================================

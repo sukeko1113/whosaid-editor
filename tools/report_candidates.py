@@ -35,7 +35,12 @@ from src.segments import Project, Segment          # noqa: E402
 
 TRUTH_DIR = Path(r"C:\dev\01\test-audio\truth")
 BANDS = ["a-setsumei", "b-chuban", "c-ouchou", "d-missitsu"]
-DEFAULT_PROJECT = Path(r"C:\dev\01\test-audio\01+02edited.speakers.json")
+# **編集されない作業ファイルを既定にする。**本体は人が毎日編集しており、
+# 区間を分けたり時刻を直したりするたびに候補が増えて数字が動く
+# (実測: 候補 49→73、適合 69%→55%)。測り直すたびに違う数字が出ると、
+# 機能を変えたのか作業が進んだのか区別できない。
+DEFAULT_PROJECT = Path(
+    r"C:\dev\01\test-audio\diarized\01+02edited.speakers.json")
 DEFAULT_TURNS = Path(
     r"C:\dev\01\test-audio\.work_01+02edited\diarize"
     r"\turns.ca1fb4d464e99c16.pyannote3-titanet.n9.v1.json")

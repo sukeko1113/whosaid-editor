@@ -240,10 +240,10 @@ FILTER_CANDIDATES = "candidates"
 FILTER_LABELS = [
     ("すべて表示", FILTER_ALL),
     ("未確定のみ", FILTER_UNASSIGNED),
-    ("未確認のみ(一括適用したぶんを含む)", FILTER_UNREVIEWED),
+    ("未確認のみ", FILTER_UNREVIEWED),
     # 区間の中に別の声がある区間だけ(設計書 §10.3)。**判定ではない**——
     # 候補が無い区間にも取りこぼしはある。適合は 35/51 で 3 割は空振り。
-    ("候補のみ(別の声)", FILTER_CANDIDATES),
+    ("別の声あり", FILTER_CANDIDATES),
 ]
 
 
@@ -727,11 +727,16 @@ class AssignWindow(tk.Toplevel):
 
         left = ttk.Frame(body)
         body.add(left, weight=3)
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
 
+        # **1 行に詰めない。**「別の声あり」を足したぶんで 840px になり、
+        # 左ペイン(775px)から［時刻へ飛ぶ］が押し出されて押せなくなった
+        # (実機の指摘・2026-08-19)。絞り込みと道具で行を分ける。
         filt = ttk.Frame(left)
-        filt.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        filt.grid(row=0, column=0, sticky="ew", pady=(0, 2))
+        tools_row = ttk.Frame(left)
+        tools_row.grid(row=1, column=0, sticky="ew", pady=(0, 4))
         for label, value in FILTER_LABELS:
             ttk.Radiobutton(
                 filt, text=label, value=value, variable=self.var_filter,
@@ -740,16 +745,16 @@ class AssignWindow(tk.Toplevel):
         # 聴く順。話者分離を通した作業ファイルでだけ選べる。
         # 「検出」とは名乗らない——順番が付かない区間にも取りこぼしはある。
         self.chk_listen = ttk.Checkbutton(
-            filt, text="聴く順(取りこぼしを見つけやすい順)",
+            tools_row, text="聴く順(取りこぼしを見つけやすい順)",
             variable=self.var_listen_order,
             command=self._on_listen_order_change, takefocus=False,
             state="normal" if self._listen_hints else "disabled")
-        self.chk_listen.pack(side="left", padx=(16, 0))
+        self.chk_listen.pack(side="left")
 
         # 時刻へ飛ぶ。**700 区間をスクロールで探すのは現実的でない**
         # (実機の指摘・2026-08-18)。逐語正解の道具には既にあった機能で、
         # 本体に無いのは抜けだった。
-        jump = ttk.Frame(filt)
+        jump = ttk.Frame(tools_row)
         jump.pack(side="right")
         ttk.Label(jump, text="時刻へ飛ぶ:").pack(side="left")
         self.var_jump = tk.StringVar()
@@ -769,9 +774,9 @@ class AssignWindow(tk.Toplevel):
         self.tree.column("cluster", width=56, anchor="center", stretch=False)
         self.tree.column("speaker", width=120, anchor="w", stretch=False)
         self.tree.column("text", width=340, anchor="w")
-        self.tree.grid(row=1, column=0, sticky="nsew")
+        self.tree.grid(row=2, column=0, sticky="nsew")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
-        sb.grid(row=1, column=1, sticky="ns")
+        sb.grid(row=2, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
         self.tree.tag_configure("unassigned", background="#FFF8E1")

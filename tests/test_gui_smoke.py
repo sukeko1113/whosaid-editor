@@ -1715,6 +1715,30 @@ def run() -> int:
         jwin.var_autoplay.set(False)
         jwin.update()
 
+        # **［時刻へ飛ぶ］が画面から押し出されていないこと。**
+        # 「候補のみ」を足したぶんで絞り込みの行が 840px になり、左ペイン
+        # (775px)から入力欄が消えて押せなくなった(実機の指摘・2026-08-19)。
+        jwin.geometry(f"{min(1320, jwin.winfo_screenwidth() - 40)}"
+                      f"x{min(800, jwin.winfo_screenheight() - 90)}")
+        jwin.update()
+        _je = None
+        _stack = [jwin]
+        while _stack:
+            _w = _stack.pop()
+            _stack.extend(_w.winfo_children())
+            if (_w.winfo_class() == "TEntry"
+                    and str(_w.cget("textvariable")) == str(jwin.var_jump)):
+                _je = _w
+        check("［時刻へ飛ぶ］の入力欄が見えている",
+              _je is not None and _je.winfo_ismapped() and _je.winfo_width() > 10)
+        check("絞り込みの行が左ペインに収まる",
+              all(sum(c.winfo_reqwidth() for c in r.winfo_children()
+                      if c.winfo_ismapped()) + 10 <= jwin.tree.master.winfo_width()
+                  for r in jwin.tree.master.winfo_children()
+                  if r is not jwin.tree and r.winfo_children()
+                  and r.winfo_class() == "TFrame"))
+        check("一覧が見えている", jwin.tree.winfo_ismapped())
+
         jwin.var_jump.set("25:02")          # 1502 秒 = 3 番目の区間の先頭
         jwin.jump_to_time()
         check("分:秒 で飛べる", jp.segments[jwin.current].start == 1502.0)
