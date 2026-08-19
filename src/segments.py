@@ -886,21 +886,108 @@ class Project:
         return True
 
     def edit_time(self, index: int, start: float, end: float,
-                  reviewed: bool) -> bool:
+                  reviewed: bool, _log: bool = True) -> bool:
         """区間の時刻を人が直す／確かめる。変わったときだけ記録。
 
         値が同じでも `reviewed` が上がる（✎△ → ✎）ことがあるので、
-        そこも変化として記録する。
+        そこも変化として記録する。**値の書き込みもここで行う**——
+        画面側で書くと記録を素通りする経路が生まれる（設計書 §1.3）。
+
+        _log=False は「まとめて適用」用。呼び出し側が 1 件の記録に
+        まとめるので、ここでは書き込みだけ行う。
         """
         seg = self.segments[index]
         was = (seg.start, seg.end, seg.time_edited, seg.time_reviewed)
-        if was == (start, end, True, reviewed):
+        changed = was != (start, end, True, bool(reviewed))
+        seg.start, seg.end = start, end
+        seg.time_edited = True          # 以後この区間にずれ補正を足さない
+        seg.time_reviewed = bool(reviewed)
+        if changed and _log:
+            self._log("edit_time", orig_start=self._key(seg),
+                      before=[round(was[0], 3), round(was[1], 3)],
+                      after=[round(start, 3), round(end, 3)],
+                      reviewed=bool(reviewed))
+        return changed
+
+    def apply_times_to(
+        self, items: Sequence[tuple[int, float, float]], reviewed: bool = False
+    ) -> int:
+        """時刻をまとめて当てる（1 回の判断で複数区間・記録は 1 件）。
+
+        点検の提案の一括適用。**すべて ✎△**（機械が当てただけ）。
+        人の耳の確認はあとから 1 件ずつ ✎ に上げる。
+        """
+        keys: list[float] = []
+        for index, start, end in items:
+            if self.edit_time(index, start, end, reviewed, _log=False):
+                keys.append(self._key(self.segments[index]))
+        if keys:
+            self._log("apply_times_bulk", targets=keys, count=len(keys),
+                      reviewed=bool(reviewed))
+        return len(keys)
+
+    def revert_time(self, index: int) -> bool:
+        """パイプラインが出した元の時刻に戻す（以後はまたずれ補正が効く）。"""
+        seg = self.segments[index]
+        if not seg.time_edited:
             return False
-        self._log("edit_time", orig_start=self._key(seg),
-                  before=[round(seg.start, 3), round(seg.end, 3)],
-                  after=[round(start, 3), round(end, 3)],
-                  reviewed=bool(reviewed))
+        before = [round(seg.start, 3), round(seg.end, 3)]
+        seg.start = float(seg.orig_start)
+        seg.end = float(seg.orig_end)
+        seg.time_edited = False
+        seg.time_reviewed = False
+        self._log("revert_time", orig_start=self._key(seg),
+                  before=before, after=[round(seg.start, 3), round(seg.end, 3)])
         return True
+
+    def restore_times(
+        self, items: Sequence[tuple[int, float, float, bool, bool]]
+    ) -> int:
+        """時刻の一括適用を丸ごと元に戻す。**戻したことも記録に残す。**"""
+        keys: list[float] = []
+        for index, start, end, edited, reviewed in items:
+            if not (0 <= index < len(self.segments)):
+                continue
+            seg = self.segments[index]
+            if (seg.start, seg.end, seg.time_edited, seg.time_reviewed) == (
+                    start, end, edited, reviewed):
+                continue
+            seg.start, seg.end = start, end
+            seg.time_edited, seg.time_reviewed = edited, reviewed
+            keys.append(self._key(seg))
+        if keys:
+            self._log("undo_times", targets=keys, count=len(keys))
+        return len(keys)
+
+    def clear_speakers(self, speaker_ids: Sequence[str]) -> int:
+        """名簿から消えた人の割当を外す。**外したことを記録に残す。**
+
+        「一度はこの人に当てていたが、名簿から消したので外れた」という
+        経緯は、あとから読む人にとって重要（誰の発言か分からなくなった
+        理由がこれ）。
+        """
+        gone = set(speaker_ids)
+        keys: list[float] = []
+        for seg in self.segments:
+            if seg.speaker_id in gone:
+                seg.speaker_id = None
+                seg.reviewed = False
+                keys.append(self._key(seg))
+        if keys:
+            self._log("clear_speakers", removed=sorted(gone),
+                      targets=keys, count=len(keys))
+        return len(keys)
+
+    def set_added_speaker(self, index: int, speaker_id: str) -> None:
+        """足した発話に、その場で選んだ話者を入れる。
+
+        **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
+        """
+        seg = self.segments[index]
+        seg.speaker_id = speaker_id
+        seg.reviewed = True
+        self._log("assign", orig_start=self._key(seg),
+                  before=None, after=speaker_id, reviewed=True)
 
     def log_counts(self) -> dict[str, int]:
         """検証要約に出す内訳。**op ごとの件数だけ**（明細は Day 75）。"""
@@ -1268,6 +1355,54 @@ def _merge_runs(
     return [(start, sid, "".join(parts), cont) for start, sid, parts, cont in runs]
 
 
+# 編集履歴の op → 検証要約に出す日本語（編集履歴設計書 §3）。
+# **知らない op は「その他」にまとめず、op 名のまま出す。**黙って畳むと
+# 新しい操作を足したときに履歴から消えたように見える。
+LOG_LABELS = {
+    "assign": "話者",
+    "assign_bulk": "話者(まとめて)",
+    "undo_assign": "話者の取り消し",
+    "clear_speakers": "名簿から外れた割当",
+    "edit_text": "本文",
+    "edit_time": "時刻",
+    "apply_times_bulk": "時刻(まとめて)",
+    "revert_time": "時刻を戻した",
+    "undo_times": "時刻の取り消し",
+    "add_utterance": "相づちを足した",
+    "remove_added_utterance": "相づちを消した",
+    "split": "区間の分割",
+    "merge": "区間の結合",
+}
+
+
+def fmt_log_at(iso: str) -> str:
+    """記録の時刻（UTC の ISO）を、その場の時刻の見やすい形にする。"""
+    if not iso:
+        return ""
+    try:
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return iso
+
+
+def build_log_summary(proj: Project) -> str:
+    """検証要約に出す編集履歴の 1 行（明細は Day 75）。"""
+    counts = proj.log_counts()
+    if not counts:
+        return "記録なし"
+    total = sum(counts.values())
+    parts = [f"{LOG_LABELS.get(op, op)} {n}"
+             for op, n in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+    last = fmt_log_at(proj.log_last_at())
+    out = f"全 {total} 件（" + " / ".join(parts) + "）"
+    if last:
+        out += f"  最終 {last}"
+    return out
+
+
 def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
     """docx 末尾の「検証要約」の (項目, 値) を作る。
 
@@ -1307,6 +1442,10 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
         f"全 {total} 区間中 {t_heard + t_bulk} 区間 — "
         f"聴いて確認 {t_heard} 区間、適用のみ {t_bulk} 区間",
     ))
+    # **人が何回、何を触ったか。**「どこまで人が原音で確認したかを成果物に
+    # 残せるか」が本製品の差別化そのもの(事業計画 v29)。件数の集計だけでは
+    # 「いつまで手を入れたか」が分からない。明細は Day 75。
+    rows.append(("編集の履歴", build_log_summary(proj)))
     rows.append((
         "凡例",
         "「聴いて確定」「聴いて確認」＝その区間の音声を人が聴いて決めたもの。"

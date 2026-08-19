@@ -52,7 +52,8 @@ from src.local_asr import LocalTranscriber  # noqa: E402
 from src.segments import (  # noqa: E402
     _merge_runs, has_inserted_utterances, write_text, UNKNOWN_LABEL,
     short_labels, Speaker, suggest_split, suggest_roster_rows,
-    speaker_label,
+    speaker_label, build_log_summary, fmt_log_at, LOG_LABELS,
+    build_verification,
     INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
@@ -1495,6 +1496,124 @@ def test_log_uses_orig_start_not_index():
     proj.assign_speaker(1, proj.speakers[0].id)
     proj.segments[1].index = 99
     assert proj.edit_log[-1]["orig_start"] == key
+
+
+def test_verification_summary_shows_the_edit_history():
+    """**検証要約に履歴の行を出す。**差別化はこの一点(事業計画 v29)。"""
+    proj = _logged()
+    proj.apply_speaker_to([0, 1], proj.speakers[0].id, heard_index=1)
+    proj.edit_text(1, "直しました")
+    rows = dict(build_verification(proj, 1))
+    assert "編集の履歴" in rows
+    body = rows["編集の履歴"]
+    assert "全 2 件" in body
+    assert "話者(まとめて) 1" in body and "本文 1" in body
+    assert "最終" in body, "**いつまで手を入れたかが分からない**"
+
+
+def test_summary_says_so_when_there_is_no_history():
+    """古い作業ファイルには履歴が無い。**黙って空欄にしない。**"""
+    assert build_log_summary(Project(audio_path="x.m4a")) == "記録なし"
+
+
+def test_summary_does_not_hide_an_unknown_operation():
+    """**知らない op も名前のまま出す。**畳むと履歴から消えたように見える。"""
+    proj = _logged()
+    proj._log("brand_new_op", orig_start=1.0)
+    assert "brand_new_op 1" in build_log_summary(proj)
+
+
+def test_log_labels_cover_every_op_we_write():
+    """記録する op には日本語名を用意しておく（生の英語を出さない）。"""
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "segments.py").read_text(encoding="utf-8")
+    ops = set(re.findall(r'_log\(\s*"([a-z_]+)"', src))
+    ops |= set(re.findall(r'"op": "([a-z_]+)"', src))
+    missing = sorted(ops - set(LOG_LABELS))
+    assert missing == [], f"日本語名が無い op: {missing}"
+
+
+def test_log_time_is_shown_in_local_time():
+    """UTC で持ち、表示は手元の時刻に直す（読む人は現地時刻で読む）。"""
+    assert fmt_log_at("") == ""
+    got = fmt_log_at("2026-08-19T05:03:40+00:00")
+    assert len(got) == 16 and got.startswith("2026-08-19"), got
+    assert fmt_log_at("こわれている") == "こわれている", "落ちてはいけない"
+
+
+def test_gui_never_writes_the_fields_directly():
+    """**画面から直接の書き換えを禁じる。**
+
+    seg.speaker_id = … と画面で書くと編集履歴を素通りする。経路が増える
+    たびに記録し忘れるので、Project のメソッドを必ず通す(設計書 §1.3)。
+    **この検査は、うっかり直接書いたときに落ちるためにある。**
+    """
+    import re
+    src = (Path(__file__).resolve().parent.parent
+           / "src" / "assign_gui.py").read_text(encoding="utf-8")
+    banned = re.compile(
+        r"^\s*\w+\.(speaker_id|reviewed|text_edited|time_edited|"
+        r"time_reviewed)\s*=\s*(?!=)", re.M)
+    hits = [m.group(0).strip() for m in banned.finditer(src)]
+    assert hits == [], f"画面が直接書いている: {hits}"
+
+
+def test_bulk_times_are_one_record():
+    """時刻のまとめて適用も 1 件（百件の判断ではない）。"""
+    proj = _logged()
+    n = proj.apply_times_to(
+        [(0, 90.5, 100.0), (2, 110.5, 120.0)], reviewed=False)
+    assert n == 2
+    assert len(proj.edit_log) == 1
+    rec = proj.edit_log[0]
+    assert rec["op"] == "apply_times_bulk" and rec["count"] == 2
+    assert rec["reviewed"] is False, "**まとめて当てただけは ✎△**"
+    assert proj.segments[0].time_reviewed is False
+
+
+def test_revert_time_is_recorded():
+    proj = _logged()
+    proj.edit_time(1, 101.0, 111.0, reviewed=True)
+    assert proj.revert_time(1) is True
+    assert proj.edit_log[-1]["op"] == "revert_time"
+    assert proj.segments[1].time_edited is False
+    assert proj.revert_time(1) is False, "直っていないのに戻している"
+
+
+def test_undo_times_is_recorded():
+    """**戻したことも残す。**"""
+    proj = _logged()
+    snap = [(1, proj.segments[1].start, proj.segments[1].end, False, False)]
+    proj.edit_time(1, 101.0, 111.0, reviewed=True)
+    assert proj.restore_times(snap) == 1
+    assert proj.edit_log[-1]["op"] == "undo_times"
+    assert proj.segments[1].time_edited is False
+
+
+def test_clearing_a_removed_speaker_is_recorded():
+    """名簿から人を消して割当が外れた経緯も残す。
+
+    あとから読む人にとって「誰の発言か分からなくなった理由」がこれ。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    assert proj.clear_speakers([sid]) == 1
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "clear_speakers" and rec["removed"] == [sid]
+    assert proj.segments[1].speaker_id is None
+    assert proj.segments[1].reviewed is False
+
+
+def test_added_speaker_is_marked_heard():
+    """足した発話に選んだ話者は ✓（いま聴いた直後に人が選んだ）。"""
+    proj = _logged()
+    seg = proj.add_utterance(103.0, 103.6, "はい", "g:D")
+    proj.set_added_speaker(seg.index, proj.speakers[1].id)
+    assert seg.reviewed is True
+    assert proj.edit_log[-1]["op"] == "assign"
+    assert proj.edit_log[-1]["reviewed"] is True
 
 
 def test_log_counts_and_last_time():

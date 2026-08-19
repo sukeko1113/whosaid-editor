@@ -264,10 +264,8 @@ class RosterPlan:
         removed_ids = {sp.id for sp in self.removed}
         proj.speakers = self.speakers
         if removed_ids:
-            for seg in proj.segments:
-                if seg.speaker_id in removed_ids:
-                    seg.speaker_id = None
-                    seg.reviewed = False
+            # **外したことを記録に残す**(編集履歴設計書 §1.3)。
+            proj.clear_speakers(removed_ids)
 
 
 class RosterTable(ttk.Frame):
@@ -1704,7 +1702,8 @@ class AssignWindow(tk.Toplevel):
         self.play_span(start, end, pre_roll=0.0)
 
     def _write_times(self, seg: Segment, start: float, end: float, *,
-                     reviewed: bool, refresh: bool = True) -> None:
+                     reviewed: bool, refresh: bool = True,
+                     log: bool = True) -> None:
         """区間に時刻を書く、ただ 1 つの経路。
 
         画面で直したときも、点検の提案を当てたときも必ずここを通す。
@@ -1715,9 +1714,10 @@ class AssignWindow(tk.Toplevel):
         refresh: 画面を描き直すか。まとめて適用では 1 件ごとに描き直すと
         百件級で待たされるので、呼び出し側が最後に 1 回だけ描き直す。
         """
-        seg.start, seg.end = start, end
-        seg.time_edited = True          # 以後この区間にずれ補正を足さない
-        seg.time_reviewed = reviewed
+        # **必ずデータ層を通す**(編集履歴設計書 §1.3)。値が同じでも
+        # ✎△ → ✎ は「確認した」という変化なので記録される。
+        # `_log=False` はまとめて適用のとき——呼び出し側が 1 件にまとめる。
+        self.proj.edit_time(seg.index, start, end, reviewed, _log=log)
         self._dirty = True
         if not refresh:
             return
@@ -1833,8 +1833,14 @@ class AssignWindow(tk.Toplevel):
                            seg.time_edited, seg.time_reviewed)
                           for seg, _s, _e, _p in planned],
             }
+        # **1 回の判断は 1 件の記録**(編集履歴設計書 §1.1)。百件を
+        # 1 件ずつ残すと「何回判断したか」が件数の山に埋もれる。
+        self.proj.apply_times_to(
+            [(seg.index, start, end) for seg, start, end, _p in planned],
+            reviewed=False)
         for seg, start, end, p in planned:
-            self._write_times(seg, start, end, reviewed=False, refresh=False)
+            self._write_times(seg, start, end, reviewed=False, refresh=False,
+                              log=False)
             p.status = "accepted"
         if planned:
             self.reload_tree()
@@ -1866,10 +1872,8 @@ class AssignWindow(tk.Toplevel):
                 parent=self,
             )
             return
-        for index, start, end, edited, reviewed in snap["items"]:
-            seg = self.proj.segments[index]
-            seg.start, seg.end = start, end
-            seg.time_edited, seg.time_reviewed = edited, reviewed
+        # **戻したことも履歴に残す**(編集履歴設計書 §1.4)。
+        self.proj.restore_times(snap["items"])
         self._dirty = True
         self._time_undo = None
         self.reload_tree()
@@ -1887,13 +1891,9 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
-        if not seg.time_edited:
+        if not self.proj.revert_time(self.current):
             self._set_action("この区間の時刻は直されていません。")
             return
-        seg.start = float(seg.orig_start)
-        seg.end = float(seg.orig_end)
-        seg.time_edited = False
-        seg.time_reviewed = False
         self._dirty = True
         self._show_times()
         self._update_seginfo()
@@ -2083,8 +2083,7 @@ class AssignWindow(tk.Toplevel):
                 cut=it.get("cut"), parent_orig=seg.orig_start)
             if it.get("sid"):
                 # **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
-                added.speaker_id = it["sid"]
-                added.reviewed = True
+                self.proj.set_added_speaker(added.index, it["sid"])
             self._remap_undo_for_split(added.index)
             if first is None:
                 first = added
@@ -2196,9 +2195,7 @@ class AssignWindow(tk.Toplevel):
             return
         new = self.txt_body.get("1.0", "end").strip()
         seg = self.proj.segments[loaded]
-        if new != seg.text:
-            seg.text = new
-            seg.text_edited = True      # 再実行時に上書きされないよう印を付ける
+        if self.proj.edit_text(loaded, new):
             self._dirty = True
             self._update_row(seg.index)
 
@@ -2281,10 +2278,11 @@ class AssignWindow(tk.Toplevel):
         self._undo.append(snapshot)
         del self._undo[:-200]
 
-        for s in targets:
-            s.speaker_id = speaker_id
-            # 自分で聴いた区間だけ「確認済み」。まとめて埋めた分は未確認扱い。
-            s.reviewed = bool(speaker_id) and s.index == seg.index
+        # **必ずデータ層を通す。**ここで seg.speaker_id を直接書き換えると
+        # 編集履歴を素通りする(編集履歴設計書 §1.3)。
+        # 自分で聴いた区間だけ「確認済み」。まとめて埋めた分は未確認扱い。
+        self.proj.apply_speaker_to(
+            [s.index for s in targets], speaker_id, heard_index=seg.index)
         self._dirty = True
 
         self.suggester.refresh()
@@ -2325,9 +2323,7 @@ class AssignWindow(tk.Toplevel):
             return
         self._undo.append([(s.index, s.speaker_id, s.reviewed) for s in targets])
         del self._undo[:-200]
-        for s in targets:
-            s.speaker_id = None
-            s.reviewed = False
+        self.proj.apply_speaker_to([s.index for s in targets], None)
         self._dirty = True
         self.suggester.refresh()
         self.update_status()
@@ -2372,10 +2368,9 @@ class AssignWindow(tk.Toplevel):
             self._set_action("取り消せる操作がありません。")
             return
         snapshot = self._undo.pop()
-        for index, sid, reviewed in snapshot:
-            seg = self.proj.segments[index]
-            seg.speaker_id = sid
-            seg.reviewed = reviewed
+        # **取り消したことも履歴に残す。**消すと「当てたが戻した」経緯が
+        # 読めなくなる(編集履歴設計書 §1.4)。
+        self.proj.restore_assignments(snapshot)
         self._dirty = True
         self.suggester.refresh()
         if self.var_filter.get() != FILTER_ALL:
