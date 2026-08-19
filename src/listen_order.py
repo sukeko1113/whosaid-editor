@@ -33,10 +33,10 @@ from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
 from .diarize import SpeakerTurn
-from .segments import Segment
+from .segments import Segment, segment_key
 
 # 実装のバージョン。上げると sidecar を作り直す。
-LISTEN_ORDER_VER = 1
+LISTEN_ORDER_VER = 2   # 鍵を (orig_start, start) に変えた
 
 # 区間の前後にどれだけ広げて数えるか（秒）。
 # 3 / 5 / 10 秒で測り、3 秒が最も分離した（適合率 36% / 24% / 20%）。
@@ -54,9 +54,10 @@ class ListenHint:
     score は前後 WINDOW_SECONDS 秒に重なる話者 turn の数。
     **順番を決めるためだけの数字で、脱落の有無を表さない。**
 
-    **区間を指す鍵は `orig_start`。**`index` は分割・結合・再実行で振り直るので
-    鍵にしてはいけない(自動点検設計書 §6.1 と同じ理由)。`index` は表示の
-    ためだけに持ち、突き合わせには使わない。
+    **区間を指す鍵は `(orig_start, start)` の組。**`index` は分割・結合・
+    再実行で振り直るので鍵にしてはいけない(自動点検設計書 §6.1 と同じ理由)。
+    **`orig_start` だけでも足りない**——分割した 2 つが同じ値を持つため
+    (`segments.segment_key` を見よ)。`index` は表示のためだけに持つ。
     """
 
     orig_start: float
@@ -99,26 +100,23 @@ def score_segments(
         lo, hi = seg.start - window, seg.end + window
         n = sum(1 for t in ordered if t.end > lo and t.start < hi)
         out.append(ListenHint(
-            orig_start=float(seg.orig_start if seg.orig_start is not None
-                             else seg.start),
+            orig_start=segment_key(seg)[0],
             start=seg.start, score=n, index=seg.index))
     return out
 
 
 def match(hints: Sequence[ListenHint],
           segments: Sequence[Segment]) -> dict[int, ListenHint]:
-    """いまの区間に順番を当てる。**鍵は `orig_start`。**
+    """いまの区間に順番を当てる。**鍵は `(orig_start, start)` の組。**
 
     当たらなかった区間は入らない（分割で増えた側など）。呼び出し側は
     「順番が付いていない区間」を安全とみなさないこと。
     """
-    by_orig: dict[float, ListenHint] = {
-        round(h.orig_start, 3): h for h in hints}
+    by_key: dict[tuple[float, float], ListenHint] = {
+        (round(h.orig_start, 3), round(h.start, 3)): h for h in hints}
     out: dict[int, ListenHint] = {}
     for seg in segments:
-        key = round(float(seg.orig_start if seg.orig_start is not None
-                          else seg.start), 3)
-        h = by_orig.get(key)
+        h = by_key.get(segment_key(seg))
         if h is not None:
             out[seg.index] = h
     return out

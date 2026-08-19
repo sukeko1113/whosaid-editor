@@ -35,7 +35,7 @@ from src.candidates import (  # noqa: E402
     save_dismissed,
 )
 from src.diarize import SpeakerTurn  # noqa: E402
-from src.segments import Segment  # noqa: E402
+from src.segments import Project, Segment, parse_roster, segment_key  # noqa: E402
 
 
 def _seg(index: int, start: float, end: float, text: str = "本文") -> Segment:
@@ -129,6 +129,45 @@ def test_for_segment_only_returns_its_own():
     got = find_candidates(segs, turns)
     assert len(for_segment(got, segs[0])) == 1
     assert for_segment(got, segs[0])[0].speaker == 7
+
+
+def test_split_halves_do_not_share_candidates():
+    """**分割した 2 つが互いの候補まで出さない（設計書 §10.3.4）。**
+
+    `split_segment` は「元は 1 つだった」と分かるよう、分割した両方に親の
+    `orig_start` を与える（再実行の引き継ぎのため。これ自体は正しい）。
+    その結果 `orig_start` は一意でなくなり、実データで候補が二重に出て、
+    片方で × を押すともう片方からも消えていた（2026-08-19 に実測）。
+    鍵を `(orig_start, start)` の組にして分けた。
+    """
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("佐藤")
+    proj.segments = [_seg(0, 100.0, 120.0, "まえのはなしとあとのはなし")]
+    head, tail = proj.split_segment(0, 110.0, 6)
+    assert head.orig_start == tail.orig_start, "前提が変わった（分割の設計）"
+    assert segment_key(head) != segment_key(tail), "**鍵が分けられていない**"
+
+    turns = [_turn(100.0, 120.0, 3), _turn(104.0, 105.0, 7),
+             _turn(115.0, 116.0, 8)]
+    got = find_candidates(proj.segments, turns)
+    a = for_segment(got, proj.segments[0])
+    b = for_segment(got, proj.segments[1])
+    assert len(a) == 1 and abs(a[0].at - 104.0) < 0.01, a
+    assert len(b) == 1 and abs(b[0].at - 115.0) < 0.01, b
+    assert a[0].key != b[0].key, "× が両方から消える"
+
+
+def test_true_duplicates_still_share_a_key():
+    """**本物の重複は鍵では分けられない。**
+
+    `start` も `orig_start` も同じ区間が 2 つあると、この鍵でも区別できない。
+    実データに 1 組あった（2026-08-19）。**これは鍵の問題ではなく、
+    区間が重複して作られている問題**なので、鍵を凝っても解決しない。
+    分かっていることを検査に残しておく。
+    """
+    a = _seg(0, 100.0, 110.0, "同じ本文")
+    b = _seg(1, 100.0, 110.0, "同じ本文")
+    assert segment_key(a) == segment_key(b)
 
 
 # --- 却下（×）--------------------------------------------------------

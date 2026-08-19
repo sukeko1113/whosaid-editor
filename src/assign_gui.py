@@ -2080,7 +2080,8 @@ class AssignWindow(tk.Toplevel):
             added = self.proj.add_utterance(
                 float(it.get("at", it.get("start", 0.0))), float(it["end"]),
                 it["text"], it.get("cluster") or "",
-                cut=it.get("cut"), parent_orig=seg.orig_start)
+                cut=it.get("cut"), parent_orig=seg.orig_start,
+                parent_start=seg.start)
             if it.get("sid"):
                 # **いま聴いた直後に人が選んだので ✓。**機械が立てる経路ではない。
                 self.proj.set_added_speaker(added.index, it["sid"])

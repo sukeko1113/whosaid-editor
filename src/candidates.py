@@ -43,10 +43,10 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from .diarize import SpeakerTurn
-from .segments import Segment
+from .segments import Segment, key_text, segment_key
 
 # 実装のバージョン。上げると sidecar を作り直す。
-CANDIDATES_VER = 1
+CANDIDATES_VER = 2   # 鍵を (orig_start, start) に変えた
 
 # 候補として数える最小の重なり（秒）。短すぎる被りは息継ぎや漏れ込みで出る。
 # **この値で 31/34・35/51 を測った。**変えるなら測り直すこと。
@@ -61,7 +61,10 @@ class VoiceCandidate:
     ので鍵にしてはいけない（自動点検設計書 §6.1 と同じ理由）。
     """
 
-    parent_orig: float          # 親区間の orig_start（突き合わせの鍵）
+    # **親区間を指す鍵は (orig_start, start) の組。**orig_start だけでは
+    # 分割した 2 つを区別できない（segments.segment_key を見よ）。
+    parent_orig: float
+    parent_start: float
     at: float                   # その声が聞こえ始める時刻
     end: float
     speaker: int                # turn の話者番号（表示は「声B」等）
@@ -69,19 +72,26 @@ class VoiceCandidate:
     index: int = -1             # 表示のためだけ。鍵には使わない
 
     @property
+    def parent_key(self) -> tuple[float, float]:
+        return (self.parent_orig, self.parent_start)
+
+    @property
     def key(self) -> str:
         """却下の記録に使う識別子。時刻は 0.01 秒に丸める。"""
-        return f"{self.parent_orig:.3f}@{self.at:.2f}"
+        return f"{key_text(self.parent_key)}@{self.at:.2f}"
 
     def to_dict(self) -> dict:
         return {"parent_orig": round(self.parent_orig, 3),
+                "parent_start": round(self.parent_start, 3),
                 "at": round(self.at, 3), "end": round(self.end, 3),
                 "speaker": self.speaker, "overlap": round(self.overlap, 3),
                 "index": self.index}
 
     @classmethod
     def from_dict(cls, d: dict) -> "VoiceCandidate":
-        return cls(parent_orig=float(d["parent_orig"]), at=float(d["at"]),
+        return cls(parent_orig=float(d["parent_orig"]),
+                   parent_start=float(d.get("parent_start", d["parent_orig"])),
+                   at=float(d["at"]),
                    end=float(d["end"]), speaker=int(d["speaker"]),
                    overlap=float(d.get("overlap", 0.0)),
                    index=int(d.get("index", -1)))
@@ -122,9 +132,9 @@ def find_candidates(
             ov = min(seg.end, t.end) - max(seg.start, t.start)
             if ov < min_overlap or t.speaker == main:
                 continue
+            k = segment_key(seg)
             out.append(VoiceCandidate(
-                parent_orig=float(seg.orig_start if seg.orig_start is not None
-                                  else seg.start),
+                parent_orig=k[0], parent_start=k[1],
                 at=max(seg.start, t.start), end=min(seg.end, t.end),
                 speaker=t.speaker, overlap=ov, index=seg.index))
     out.sort(key=lambda c: c.at)
@@ -156,9 +166,15 @@ def done_keys(candidates: Sequence[VoiceCandidate],
 
 def for_segment(candidates: Sequence[VoiceCandidate],
                 seg: Segment) -> list[VoiceCandidate]:
-    """その区間に属する候補（鍵は orig_start）。"""
-    key = float(seg.orig_start if seg.orig_start is not None else seg.start)
-    return [c for c in candidates if abs(c.parent_orig - key) < 0.005]
+    """その区間に属する候補。
+
+    **鍵は (orig_start, start) の組。**orig_start だけで突き合わせると、
+    分割した 2 つの区間が互いの候補まで出す（実データで発生・2026-08-19）。
+    """
+    key = segment_key(seg)
+    return [c for c in candidates
+            if abs(c.parent_orig - key[0]) < 0.005
+            and abs(c.parent_start - key[1]) < 0.005]
 
 
 def drop_dismissed(candidates: Sequence[VoiceCandidate],
@@ -171,10 +187,8 @@ def drop_dismissed(candidates: Sequence[VoiceCandidate],
 def coverage(candidates: Sequence[VoiceCandidate],
              segments: Sequence[Segment]) -> tuple[int, int]:
     """(候補のある区間の数, 全区間) — 何割を聴くことになるかの目安。"""
-    keys = {c.parent_orig for c in candidates}
-    n = sum(1 for s in segments
-            if float(s.orig_start if s.orig_start is not None else s.start)
-            in keys)
+    keys = {c.parent_key for c in candidates}
+    n = sum(1 for s in segments if segment_key(s) in keys)
     return n, len(segments)
 
 

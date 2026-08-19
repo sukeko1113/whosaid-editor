@@ -1438,7 +1438,8 @@ def test_bulk_apply_keeps_the_reviewed_distinction():
     assert proj.segments[2].reviewed is False
     # 記録の側でも区別できる
     rec = proj.edit_log[0]
-    assert rec["heard"] == [proj.segments[1].orig_start]
+    from src.segments import segment_key
+    assert rec["heard"] == [list(segment_key(proj.segments[1]))]
 
 
 def test_undo_is_recorded_too():
@@ -1489,13 +1490,32 @@ def test_time_edit_records_a_confirmation_without_a_change():
     assert proj.edit_log[-1]["reviewed"] is True
 
 
-def test_log_uses_orig_start_not_index():
-    """**index は分割・結合・再実行で振り直る。**鍵にしてはいけない。"""
+def test_log_uses_the_segment_key_not_index():
+    """**鍵は (orig_start, start) の組。**
+
+    `index` は分割・結合・再実行で振り直る。**`orig_start` だけでも足りない**
+    ——分割した 2 つが同じ値を持つため(設計書 §10.3.4)。
+    """
+    from src.segments import segment_key
     proj = _logged()
-    key = proj.segments[1].orig_start
+    key = list(segment_key(proj.segments[1]))
     proj.assign_speaker(1, proj.speakers[0].id)
     proj.segments[1].index = 99
-    assert proj.edit_log[-1]["orig_start"] == key
+    assert proj.edit_log[-1]["segment"] == key
+    assert "orig_start" not in proj.edit_log[-1], "古い形が残っている"
+
+
+def test_split_halves_get_different_log_keys():
+    """分割した 2 つの記録が、どちらのものか区別できること。"""
+    from src.segments import segment_key
+    proj = _logged()
+    head, tail = proj.split_segment(1, 105.0, 5)
+    proj.edit_log.clear()
+    proj.assign_speaker(head.index, proj.speakers[0].id)
+    proj.assign_speaker(tail.index, proj.speakers[1].id)
+    a, b = proj.edit_log[0]["segment"], proj.edit_log[1]["segment"]
+    assert a[0] == b[0], "前提: 分割は orig_start を共有する"
+    assert a != b, "**記録がどちらの区間か区別できていない**"
 
 
 def test_verification_summary_shows_the_edit_history():

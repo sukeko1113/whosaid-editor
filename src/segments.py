@@ -73,6 +73,29 @@ ENGINE_LABELS = {ENGINE_CLOUD: "クラウド", ENGINE_LOCAL: "ローカル"}
 MIN_SEGMENT_SECONDS = 0.1
 
 
+def segment_key(seg: "Segment") -> tuple[float, float]:
+    """区間を一意に指す鍵 —— **(orig_start, start) の組**。
+
+    **`orig_start` だけでは足りない。**`split_segment` は「元は 1 つだった」と
+    分かるよう、分割した両方に親の `orig_start` をそのまま与える（再実行の
+    引き継ぎのためで、これ自体は正しい）。その結果 `orig_start` は一意でなく
+    なり、実データで 2 組の重複が出た（2026-08-19 に実測。候補の一覧が両方に
+    同じものを出し、片方で × を押すともう片方からも消えていた）。
+
+    `start` は分割の境界で必ず変わるので、組にすれば区別できる。
+    再実行の引き継ぎは従来どおり `orig_start` だけを見るので壊れない。
+
+    **`index` は鍵にしてはいけない**——分割・結合・再実行で振り直る。
+    """
+    orig = seg.orig_start if seg.orig_start is not None else seg.start
+    return (round(float(orig), 3), round(float(seg.start), 3))
+
+
+def key_text(key: tuple[float, float]) -> str:
+    """鍵を文字列に（sidecar に書くとき）。"""
+    return f"{key[0]:.3f}+{key[1]:.3f}"
+
+
 def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
     """その区間が実音声のどこで鳴っているか(開始, 終了)。
 
@@ -736,7 +759,8 @@ class Project:
 
     def add_utterance(self, start: float, end: float, text: str,
                       cluster: str = "", cut: Optional[int] = None,
-                      parent_orig: Optional[float] = None) -> Segment:
+                      parent_orig: Optional[float] = None,
+                      parent_start: Optional[float] = None) -> Segment:
         """聞こえたのに本文に無い発話を、区間として足す（設計書 §2）。
 
         時刻と声のまとまりは機械（話者分離の turn）が用意し、本文は人が打つ。
@@ -782,7 +806,11 @@ class Project:
             # 区間は割らない(割ると直すときに元の本文を復元できない)。
             # 代わりにここを覚えておき、Word に出すときだけ差し込む。
             "cut": None if cut is None else int(cut),
+            # **差し込み先は (orig_start, start) の組で指す。**orig_start だけ
+            # では分割した 2 つを区別できない（segment_key を見よ）。
+            # parent_start が無い古い記録は orig_start だけで突き合わせる。
             "parent_orig": None if parent_orig is None else float(parent_orig),
+            "parent_start": None if parent_start is None else float(parent_start),
         })
         return seg
 
@@ -809,9 +837,14 @@ class Project:
             **kw,
         })
 
-    def _key(self, seg: Segment) -> float:
-        """記録が指す鍵。index は振り直るので使わない。"""
-        return float(seg.orig_start if seg.orig_start is not None else seg.start)
+    def _key(self, seg: Segment) -> list[float]:
+        """記録が指す鍵 —— **(orig_start, start) の組**。
+
+        `index` は振り直るので使わない。**`orig_start` だけでも足りない**
+        ——分割した 2 つが同じ値を持つため（`segment_key` を見よ）。
+        JSON に入れるので list で返す。
+        """
+        return list(segment_key(seg))
 
     def assign_speaker(self, index: int, speaker_id: Optional[str],
                        reviewed: bool = True) -> None:
@@ -825,7 +858,7 @@ class Project:
         seg.reviewed = bool(speaker_id) and reviewed
         if (before, before_rev) == (seg.speaker_id, seg.reviewed):
             return                      # 変わっていないなら記録しない
-        self._log("assign", orig_start=self._key(seg),
+        self._log("assign", segment=self._key(seg),
                   before=before, after=speaker_id, reviewed=seg.reviewed)
 
     def apply_speaker_to(self, indexes: Sequence[int],
@@ -837,8 +870,8 @@ class Project:
         残りは `reviewed=False`——**機械の結果をまとめて当てただけ**で、
         個別には聴いていない。この区別が製品価値そのもの（CLAUDE.md）。
         """
-        heard: list[float] = []
-        bulk: list[float] = []
+        heard: list[list[float]] = []
+        bulk: list[list[float]] = []
         for i in indexes:
             seg = self.segments[i]
             was = (seg.speaker_id, seg.reviewed)
@@ -860,7 +893,7 @@ class Project:
         消してしまうと「一度は当てたが戻した」経緯が読めなくなる。
         検証履歴は結果ではなく経緯の記録なので、打ち消しも記録に残す。
         """
-        keys: list[float] = []
+        keys: list[list[float]] = []
         for index, sid, reviewed in snapshot:
             if not (0 <= index < len(self.segments)):
                 continue
@@ -881,7 +914,7 @@ class Project:
         before = seg.text
         seg.text = new_text
         seg.text_edited = True          # 再実行で上書きされないよう印を付ける
-        self._log("edit_text", orig_start=self._key(seg),
+        self._log("edit_text", segment=self._key(seg),
                   before=before, after=new_text)
         return True
 
@@ -903,7 +936,7 @@ class Project:
         seg.time_edited = True          # 以後この区間にずれ補正を足さない
         seg.time_reviewed = bool(reviewed)
         if changed and _log:
-            self._log("edit_time", orig_start=self._key(seg),
+            self._log("edit_time", segment=self._key(seg),
                       before=[round(was[0], 3), round(was[1], 3)],
                       after=[round(start, 3), round(end, 3)],
                       reviewed=bool(reviewed))
@@ -917,7 +950,7 @@ class Project:
         点検の提案の一括適用。**すべて ✎△**（機械が当てただけ）。
         人の耳の確認はあとから 1 件ずつ ✎ に上げる。
         """
-        keys: list[float] = []
+        keys: list[list[float]] = []
         for index, start, end in items:
             if self.edit_time(index, start, end, reviewed, _log=False):
                 keys.append(self._key(self.segments[index]))
@@ -936,7 +969,7 @@ class Project:
         seg.end = float(seg.orig_end)
         seg.time_edited = False
         seg.time_reviewed = False
-        self._log("revert_time", orig_start=self._key(seg),
+        self._log("revert_time", segment=self._key(seg),
                   before=before, after=[round(seg.start, 3), round(seg.end, 3)])
         return True
 
@@ -944,7 +977,7 @@ class Project:
         self, items: Sequence[tuple[int, float, float, bool, bool]]
     ) -> int:
         """時刻の一括適用を丸ごと元に戻す。**戻したことも記録に残す。**"""
-        keys: list[float] = []
+        keys: list[list[float]] = []
         for index, start, end, edited, reviewed in items:
             if not (0 <= index < len(self.segments)):
                 continue
@@ -967,7 +1000,7 @@ class Project:
         理由がこれ）。
         """
         gone = set(speaker_ids)
-        keys: list[float] = []
+        keys: list[list[float]] = []
         for seg in self.segments:
             if seg.speaker_id in gone:
                 seg.speaker_id = None
@@ -986,7 +1019,7 @@ class Project:
         seg = self.segments[index]
         seg.speaker_id = speaker_id
         seg.reviewed = True
-        self._log("assign", orig_start=self._key(seg),
+        self._log("assign", segment=self._key(seg),
                   before=None, after=speaker_id, reviewed=True)
 
     def log_counts(self) -> dict[str, int]:
@@ -1209,24 +1242,36 @@ def speaker_label(
     return sp.display if with_role else sp.name
 
 
-def _insert_cuts(proj: Project) -> dict[float, list[tuple[int, float]]]:
+def _insert_cuts(proj: Project) -> dict:
     """「どの区間の、本文の何文字目に、どの追加発話が割り込んだか」を集める。
 
     割り込み位置は add_utterance が edit_log に残している(区間そのものは
     割らない。割ると、直すときに元の本文を復元できない → 設計書 §5.0.5)。
     消された追加発話は取り除く。
+
+    鍵は `(parent_orig, parent_start)`。**`parent_start` が無い古い記録は
+    `None`** にしておき、突き合わせのときに `parent_orig` だけで当てる。
     """
-    cuts: dict[float, list[tuple[int, float]]] = {}
+    cuts: dict[tuple[float, Optional[float]], list[tuple[int, float]]] = {}
     for rec in proj.edit_log:
         if (rec.get("op") == "add_utterance" and rec.get("cut") is not None
                 and rec.get("parent_orig") is not None):
-            cuts.setdefault(round(float(rec["parent_orig"]), 3), []).append(
+            ps = rec.get("parent_start")
+            key = (round(float(rec["parent_orig"]), 3),
+                   None if ps is None else round(float(ps), 3))
+            cuts.setdefault(key, []).append(
                 (int(rec["cut"]), round(float(rec["orig_start"]), 3)))
         elif rec.get("op") == "remove_added_utterance":
-            key = round(float(rec.get("orig_start", -1)), 3)
+            gone = round(float(rec.get("orig_start", -1)), 3)
             for lst in cuts.values():
-                lst[:] = [c for c in lst if c[1] != key]
+                lst[:] = [c for c in lst if c[1] != gone]
     return cuts
+
+
+def _cuts_for(cuts: dict, seg: "Segment") -> list[tuple[int, float]]:
+    """その区間に差し込むもの。組で当て、古い形(orig だけ)も拾う。"""
+    k = segment_key(seg)
+    return list(cuts.get(k, [])) + list(cuts.get((k[0], None), []))
 
 
 def has_inserted_utterances(proj: Project) -> bool:
@@ -1266,8 +1311,7 @@ def _merge_runs(
 
     def marks_for(seg: Segment) -> list[tuple[int, float]]:
         return sorted(
-            (c for c in cuts.get(round(float(seg.orig_start), 3), [])
-             if c[1] in added_by_key),
+            (c for c in _cuts_for(cuts, seg) if c[1] in added_by_key),
             key=lambda c: c[0])
 
     shorts = short_labels(proj.speakers) if inline else {}
@@ -1327,7 +1371,7 @@ def _merge_runs(
         if proj.is_added_utterance(seg):
             # 差し込み先で出すので、単独では出さない(先が無ければ出す)
             key = round(float(seg.orig_start), 3)
-            if any(key in [k for _c, k in v] for v in cuts.values()):
+            if any(key == k for v in cuts.values() for _c, k in v):
                 continue
         ordered.extend(pieces(seg))
 
