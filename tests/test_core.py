@@ -2061,6 +2061,87 @@ def _carry(old_segments, new_segments):
     return _carry_over_assignments(old, new_segments, logs.append), logs
 
 
+def test_carry_over_does_not_duplicate_at_the_exact_start():
+    """**区間が二重にならない（再実行の取り込みの境界）。**
+
+    実データで、まったく同じ本文・同じ時刻の区間が 2 組できていた
+    （2026-08-19 に実機の指摘から発見。設計書 §10.3.5）。原因は取り込み
+    判定が `lo < start < hi` と両端を含まなかったこと。**開始が
+    ちょうど lo と同じ再生成区間が取り込まれず、そのまま残っていた。**
+
+    1 つ目は照合で使われて `used` に入るので、2 つ目はどの家族にも
+    当たらず、素通りする。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=120.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=100.0, end=120.0, text="本文", cluster="0:A"),
+    ]
+    result, _ = _carry(old, new)
+    assert len(result) == 1, [
+        (s.start, s.speaker_id, s.text) for s in result]
+    assert result[0].speaker_id == "sp01", "人の割当が残っていない"
+
+
+def test_carry_over_does_not_swallow_the_next_segment():
+    """**終わりの側は含めない。**含めると隣の区間まで飲み込む。
+
+    区間の終了と次の区間の開始が一致するのが普通なので、`hi` を
+    「以下」にすると次の発言が消える。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次の発言", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["本文", "次の発言"], [
+        s.text for s in result]
+
+
+def test_carry_over_warns_about_leftover_duplicates():
+    """**重複が残ったら知らせる。ただし勝手に消さない。**
+
+    本当に同じことを 2 回言った可能性もあり、逐語の記録から機械が発言を
+    削るのは筋が違う（CLAUDE.md の「自動削除をしない」と同じ線）。
+    人が見て決められるよう、時刻を添えて知らせるだけにする。
+    """
+    old = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A",
+                speaker_id="sp01", reviewed=True,
+                orig_start=100.0, orig_end=120.0),   # time_edited は無し
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=120.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=100.0, end=120.0, text="本文", cluster="0:A"),
+    ]
+    result, logs = _carry(old, new)
+    assert len(result) == 2, "**勝手に消している**"
+    assert any("同じ時刻・同じ本文" in m for m in logs), logs
+    assert any("消していない" in m for m in logs), logs
+
+
+def test_carry_over_says_nothing_when_there_is_no_duplicate():
+    old = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A",
+                speaker_id="sp01", orig_start=100.0, orig_end=110.0),
+    ]
+    new = [
+        Segment(index=0, start=100.0, end=110.0, text="本文", cluster="0:A"),
+        Segment(index=1, start=110.0, end=120.0, text="次", cluster="0:B"),
+    ]
+    _result, logs = _carry(old, new)
+    assert not any("同じ時刻" in m for m in logs), logs
+
+
 def test_carry_over_keeps_edited_times():
     """時刻を直した区間は orig_start で照合され、直した時刻のまま残る。"""
     old = [

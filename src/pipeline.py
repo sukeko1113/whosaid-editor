@@ -477,7 +477,14 @@ def _carry_over_assignments(
     for pos, seg in enumerate(new_segments):
         fam = matched.get(pos)
         if fam is None:
-            if any(lo < seg.start < hi for lo, hi in absorb):
+            # **開始の側は「以上」。**ちょうど lo と同じ再生成区間が
+            # 取り込まれず、そのまま残って区間が二重になっていた
+            # (実データで 2 組・2026-08-19。設計書 §10.3.5)。
+            # 1 つ目は照合で使われて used に入るので、2 つ目はどの家族にも
+            # 当たらず素通りする。
+            # **終わりの側は「未満」のまま。**区間の終了と次の区間の開始が
+            # 一致するのが普通なので、含めると次の発言まで飲み込む。
+            if any(lo <= seg.start < hi for lo, hi in absorb):
                 absorbed.append(seg.start)
                 continue
             result.append(seg)
@@ -512,6 +519,22 @@ def _carry_over_assignments(
 
     for n, seg in enumerate(result):
         seg.index = n
+
+    # **重複が残っていたら黙って通さない。**取り込みの境界で 2 組できていた
+    # 前例がある(2026-08-19)。**勝手に消さない**——本当に同じことを 2 回
+    # 言った可能性もあり、逐語の記録から機械が発言を削るのは筋が違う。
+    # 人が見て決められるよう、時刻を添えて知らせるだけにする。
+    seen: dict[tuple, int] = {}
+    for seg in result:
+        k = (round(seg.start, 2), round(seg.end, 2), seg.text.strip())
+        if seg.text.strip():
+            seen[k] = seen.get(k, 0) + 1
+    dups = [k for k, v in seen.items() if v > 1]
+    if dups:
+        heads = "、".join(fmt_hms(k[0]) for k in sorted(dups)[:5])
+        more = " ほか" if len(dups) > 5 else ""
+        on_log(f"※ 同じ時刻・同じ本文の区間が {len(dups)} 組あります"
+               f"({heads}{more})。消していないので、画面で確かめてください。")
 
     if added:
         on_th = "、".join(fmt_hms(s.start) for s in added[:5])
