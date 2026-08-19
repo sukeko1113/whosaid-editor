@@ -993,6 +993,8 @@ class AssignWindow(tk.Toplevel):
         bottom.grid(row=3, column=0, sticky="ew")
         ttk.Button(bottom, text="出席者を編集...", command=self.edit_roster).pack(side="left")
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
+        ttk.Button(bottom, text="語句をまとめて直す...",
+                   command=self.replace_words).pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
             .pack(side="left")
         self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
@@ -2202,6 +2204,35 @@ class AssignWindow(tk.Toplevel):
                 "直すときは同じ［＋この声を足す...］から。")
         else:
             self._set_action("この区間に足した発話を全部消しました。")
+
+    def replace_words(self) -> None:
+        """転写の聞き違いを、前後を見ながらまとめて直す(設計書 §16.3)。
+
+        **置換ではなく○×。**「資格」のように、同じ語でも直してよい箇所と
+        そうでない箇所が混ざる。判定は機械が出さない。
+        """
+        if not self.proj.segments:
+            return
+        self._commit_text()
+        dlg = ReplaceWordsDialog(self)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        before, after, targets = dlg.result
+        n = self.proj.replace_text(before, after, targets)
+        if not n:
+            self._set_action("直すところがありませんでした"
+                             "(本文が変わっていた可能性があります)。")
+            return
+        self._dirty = True
+        self.suggester.refresh()
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action(
+            f"「{before}」を「{after}」に {n} 箇所直しました。"
+            "編集の履歴には 1 件として残ります。"
+            "「聴いて確定」の印は付いていません。")
 
     def remove_added(self) -> None:
         """人が足した区間を消す。**それ以外は消せない。**"""
@@ -3808,6 +3839,177 @@ class ProposalRow:
     evidence: str       # なぜそう言えるのか(照合の根拠)
     confidence: str     # どれくらい確からしいか
     text: str           # 発言のプレビュー
+
+
+class ReplaceWordsDialog(tk.Toplevel):
+    """語句をまとめて直す。**置換ではなく、1 箇所ずつ○×する画面。**
+
+    無条件の一括置換は本文を壊す。実データで「資格」は 10 回出るが、
+    そのうち 1 回は本物の資格(防災士の資格)で、直してはいけない
+    (設計書 §16.3)。**だから前後の文脈を必ず出す。**時刻と語だけを
+    並べても、どれが誤りかは判断できない。
+
+    既定は全部○。外すものだけ外してもらう(誤りは大半が同じ聞き違いなので、
+    1 つずつ付けさせると 14 箇所で 14 回押させることになる)。
+    """
+
+    MARK_ON, MARK_OFF = "○", "×"
+
+    def __init__(self, master: "AssignWindow") -> None:
+        super().__init__(master)
+        self.win = master
+        self.hits: list = []                 # list[TextHit]。行の並びと対応
+        self.marks: list[bool] = []
+        self.result: Optional[tuple[str, str, list]] = None
+
+        self.title("語句をまとめて直す")
+        self.transient(master)
+        self.var_before = tk.StringVar()
+        self.var_after = tk.StringVar()
+        self.var_status = tk.StringVar(value="直す前の語句を入れて［探す］。")
+        self._build()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+        self.ent_before.focus_set()
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            self, wraplength=720,
+            text="転写が固有名詞を取り違えたときに、まとめて直します。"
+                 "同じ語でも、直してよい箇所とそうでない箇所があります"
+                 "(「資格」は本物の資格のこともあります)。"
+                 "前後を読んで、直さない行は × にしてください。",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        top = ttk.Frame(self)
+        top.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
+        ttk.Label(top, text="直す前:").pack(side="left")
+        self.ent_before = ttk.Entry(top, textvariable=self.var_before, width=18)
+        self.ent_before.pack(side="left", padx=(4, 10))
+        ttk.Label(top, text="→  直した後:").pack(side="left")
+        self.ent_after = ttk.Entry(top, textvariable=self.var_after, width=18)
+        self.ent_after.pack(side="left", padx=(4, 10))
+        ttk.Button(top, text="探す", command=self.search).pack(side="left")
+        self.ent_before.bind("<Return>", lambda e: self.search())
+
+        cols = ("mark", "at", "text")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings",
+                                 height=12, selectmode="browse")
+        for key, label, width, anchor in (
+                ("mark", "直す", 44, "center"),
+                ("at", "時刻", 78, "center"),
+                ("text", "前後", 620, "w")):
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor=anchor)
+        self.tree.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(row=2, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
+        self.tree.configure(yscrollcommand=sb.set)
+        # クリックでも Space でも切り替えられるように(片方だけだと迷う)
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<space>", lambda e: (self._toggle_selected(), "break"))
+
+        ttk.Label(self, textvariable=self.var_status, foreground="#666",
+                  wraplength=720)\
+            .grid(row=3, column=0, sticky="w", padx=12, pady=(6, 0))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
+        ttk.Button(btns, text="全部に○", command=lambda: self._mark_all(True))\
+            .pack(side="left")
+        ttk.Button(btns, text="全部に×", command=lambda: self._mark_all(False))\
+            .pack(side="left", padx=6)
+        ttk.Button(btns, text="やめる", command=self._close).pack(side="right")
+        self.btn_ok = ttk.Button(btns, text="直す", command=self._ok,
+                                 state="disabled")
+        self.btn_ok.pack(side="right", padx=6)
+
+    # ------------------------------------------------------------------
+    def search(self) -> None:
+        term = self.var_before.get().strip()
+        self.tree.delete(*self.tree.get_children())
+        self.hits, self.marks = [], []
+        if not term:
+            self.var_status.set("直す前の語句を入れてください。")
+            self._refresh_ok()
+            return
+        self.hits = self.win.proj.find_text(term)
+        self.marks = [True] * len(self.hits)
+        for i, h in enumerate(self.hits):
+            self.tree.insert("", "end", iid=str(i), values=(
+                self.MARK_ON, fmt_short_time(h.at), self._line(h)))
+        if not self.hits:
+            self.var_status.set(f"「{term}」は本文にありません。")
+        self._refresh_ok()
+
+    def _line(self, hit) -> str:
+        return ("…" if hit.head else "") + hit.before \
+            + f"【{hit.term}】" + hit.after + ("…" if hit.tail else "")
+
+    # ------------------------------------------------------------------
+    def _on_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        row = self.tree.identify_row(event.y)
+        if row and self.tree.identify_column(event.x) == "#1":
+            self._toggle(int(row))
+
+    def _toggle_selected(self) -> None:
+        sel = self.tree.selection()
+        if sel:
+            self._toggle(int(sel[0]))
+
+    def _toggle(self, i: int) -> None:
+        if not (0 <= i < len(self.marks)):
+            return
+        self.marks[i] = not self.marks[i]
+        self.tree.set(str(i), "mark",
+                      self.MARK_ON if self.marks[i] else self.MARK_OFF)
+        self._refresh_ok()
+
+    def _mark_all(self, on: bool) -> None:
+        for i in range(len(self.marks)):
+            self.marks[i] = on
+            self.tree.set(str(i), "mark", self.MARK_ON if on else self.MARK_OFF)
+        self._refresh_ok()
+
+    def _refresh_ok(self) -> None:
+        n = sum(self.marks)
+        self.btn_ok.configure(text=f"この {n} 箇所を直す" if n else "直す",
+                              state="normal" if n else "disabled")
+        if self.hits:
+            self.var_status.set(
+                f"{len(self.hits)} 箇所のうち {n} 箇所を直します。"
+                "直したところに「聴いて確定」の印は付きません"
+                "(音声を聴いたわけではないため)。")
+
+    # ------------------------------------------------------------------
+    def _ok(self) -> None:
+        before = self.var_before.get().strip()
+        after = self.var_after.get().strip()
+        chosen = [h.target for h, m in zip(self.hits, self.marks) if m]
+        if not chosen:
+            return
+        if before == after:
+            messagebox.showwarning(
+                "同じ語句です", "「直した後」を変えてください。", parent=self)
+            return
+        if not after and not messagebox.askyesno(
+                "語句を消します",
+                f"「{before}」を {len(chosen)} 箇所で消します。よろしいですか。",
+                parent=self):
+            return
+        self.result = (before, after, chosen)
+        self._close()
+
+    def _close(self) -> None:
+        self.grab_release()
+        self.destroy()
 
 
 class ProposalDialog(tk.Toplevel):

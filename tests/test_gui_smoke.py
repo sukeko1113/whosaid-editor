@@ -36,6 +36,7 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MIN_SECONDS,
     AssignWindow,
     ProposalDialog,
+    ReplaceWordsDialog,
     fmt_short_time,
     RosterDialog,
     ProposalRow,
@@ -1469,6 +1470,78 @@ def run() -> int:
         check("いちばん下の帯（保存など）が窓の中にある",
               _bottom_bar.winfo_y() + _bottom_bar.winfo_height()
               <= awin.winfo_height())
+        # 下の帯は既に混んでいる。[語句をまとめて直す...]を足したので、
+        # **横に押し出されていないか**を数える(§10.3.6 で特別な選択肢が
+        # 窓の外に出ていた前例がある)。
+        _left = [c for c in _bottom_bar.winfo_children()
+                 if c.winfo_ismapped() and c.pack_info().get("side") == "left"]
+        _right = [c for c in _bottom_bar.winfo_children()
+                  if c.winfo_ismapped() and c.pack_info().get("side") == "right"]
+        _need_bar = (sum(c.winfo_reqwidth() for c in _left + _right) + 24)
+        check(f"下の帯のボタンが既定の幅に収まる（要 {_need_bar} / 幅 "
+              f"{_bottom_bar.winfo_width()}）",
+              _bottom_bar.winfo_width() >= _need_bar)
+        _rep = next((c for c in _left
+                     if "語句" in str(c.cget("text"))), None)
+        check("［語句をまとめて直す...］がある", _rep is not None)
+        check("［語句をまとめて直す...］が窓の右端をはみ出さない",
+              _rep is not None
+              and _rep.winfo_rootx() + _rep.winfo_reqwidth()
+              <= awin.winfo_rootx() + awin.winfo_width())
+
+        # --- 語句をまとめて直す（設計書 §16.3）---------------------------
+        # **同じ語でも直してよい箇所とそうでない箇所が混ざる。**
+        # 実データで「資格」は 10 回のうち 1 回が本物の資格だった。
+        _keep = [s.text for s in ap.segments]
+        ap.segments[0].text = "防災士の資格も取ってらっしゃって"
+        ap.segments[1].text = "県は資格のことですからと言うだけで"
+        ap.segments[0].reviewed = ap.segments[1].reviewed = False
+        _dlg = ReplaceWordsDialog(awin)
+        try:
+            _dlg.update()
+            _dlg.var_before.set("資格")
+            _dlg.var_after.set("私学")
+            _dlg.search()
+            _dlg.update()
+            check("見つかった箇所が並ぶ", len(_dlg.hits) == 2)
+            _lines = [_dlg.tree.set(i, "text") for i in _dlg.tree.get_children()]
+            check("前後の文脈が出る（時刻と語だけでは判断できない）",
+                  any("防災士" in x for x in _lines)
+                  and all("【資格】" in x for x in _lines))
+            check("はじめは全部○", all(_dlg.marks))
+            check("ボタンに件数が出る", "2 箇所" in str(_dlg.btn_ok.cget("text")))
+            _dlg._toggle(0)                     # 本物の資格を外す
+            _dlg.update()
+            check("×にできる", _dlg.marks == [False, True])
+            check("件数が減る", "1 箇所" in str(_dlg.btn_ok.cget("text")))
+            check("×の行に×印が出る",
+                  _dlg.tree.set("0", "mark") == _dlg.MARK_OFF)
+            _dlg._mark_all(True)
+            check("全部に○を押せる", all(_dlg.marks))
+            _dlg._mark_all(False)
+            check("全部に×にすると押せなくなる",
+                  str(_dlg.btn_ok.cget("state")) == "disabled")
+            _dlg._toggle(1)
+            _dlg._ok()
+            check("選んだぶんだけ返す",
+                  _dlg.result is not None and len(_dlg.result[2]) == 1)
+        finally:
+            try:
+                _dlg.destroy()
+            except tk.TclError:
+                pass
+        _n = ap.replace_text(*_dlg.result) if _dlg.result else 0
+        check("選ばなかった箇所は変わらない",
+              ap.segments[0].text == "防災士の資格も取ってらっしゃって")
+        check("選んだ箇所だけ直る",
+              _n == 1 and ap.segments[1].text == "県は私学のことですからと言うだけで")
+        check("聴いていないので確定の印は付かない",
+              ap.segments[1].reviewed is False)
+        check("人が直した本文なので再実行で戻されない",
+              ap.segments[1].text_edited is True)
+        for _i, _t in enumerate(_keep):
+            ap.segments[_i].text = _t
+        awin.reload_tree()
 
         # --- 本文欄の書き戻しは、読み込んだ区間にだけ効く ----------------
         # current を直接動かした直後に _commit_text が呼ばれると、**別の区間へ
