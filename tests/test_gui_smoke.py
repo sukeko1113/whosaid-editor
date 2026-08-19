@@ -36,6 +36,7 @@ from src.assign_gui import (  # noqa: E402
     PREVIEW_MIN_SECONDS,
     AssignWindow,
     ProposalDialog,
+    fmt_short_time,
     RosterDialog,
     ProposalRow,
     SplitDialog,
@@ -1188,6 +1189,13 @@ def run() -> int:
                   "空振り" in str(awin.lbl_cand_note.cget("text")))
             check("選択肢は時刻と声で読める",
                   ":" in awin.cmb_cand.cget("values")[0])
+            # **選択肢が切れないこと。**HH:MM:SS だと幅に収まらず
+            # 「00:00:29 声!」と切れた(実機で確認・2026-08-19)。
+            check("選択肢が選択欄の幅に収まる",
+                  all(len(v) <= int(awin.cmb_cand.cget("width"))
+                      for v in awin.cmb_cand.cget("values")))
+            check("先頭の 00: を出さない",
+                  not awin.cmb_cand.cget("values")[0].startswith("00:"))
 
             # 絞り込み
             awin.var_filter.set(assign_gui.FILTER_CANDIDATES)

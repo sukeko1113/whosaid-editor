@@ -1338,6 +1338,22 @@ def test_inline_form_never_adds_the_role(tmp_path=None):
     assert "【山本学(文科省" in body or "山本学" in body
 
 
+def test_short_time_drops_the_leading_hours():
+    """候補の選択肢に出す短い時刻(設計書 §10.3.2)。
+
+    HH:MM:SS だと幅に収まらず「00:00:29 声!」と切れた(実機・2026-08-19)。
+    **1 時間を超えたら時も出す**——落とすと別の場所と区別できない。
+    """
+    from src.assign_gui import fmt_short_time
+    assert fmt_short_time(29) == "0:29"
+    assert fmt_short_time(1504) == "25:04"
+    assert fmt_short_time(3600) == "1:00:00"
+    assert fmt_short_time(3930) == "1:05:30"
+    assert fmt_short_time(-1) == "0:00", "負でも落ちない"
+    # 選択肢の幅(11 文字)に収まること。「1:05:30 声B」で 11 文字
+    assert len(fmt_short_time(3930) + " 声B") <= 11
+
+
 def test_legend_only_when_something_was_inserted():
     """凡例は使われたときだけ。無関係な凡例は記録を汚す。"""
     proj = _base_for_insert()

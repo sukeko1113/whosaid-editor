@@ -517,6 +517,18 @@ class RosterDialog(tk.Toplevel):
         self.destroy()
 
 
+def fmt_short_time(seconds: float) -> str:
+    """候補の選択肢に出す短い時刻。1 時間未満なら M:SS、超えたら H:MM:SS。
+
+    HH:MM:SS だと選択肢の幅に収まらず「00:00:29 声!」と切れた(実機で確認・
+    2026-08-19)。**先頭の 00: は 1 時間の録音では常に同じで情報が無い。**
+    ［時刻へ飛ぶ］が受け付ける書き方と同じなので、見て打ち直せる。
+    """
+    total = int(round(max(0.0, seconds)))
+    h, m, s = total // 3600, (total % 3600) // 60, total % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
 def plan_roster_rows(
     proj: Project, rows: Sequence[tuple[str, str, str]]
 ) -> RosterPlan:
@@ -867,7 +879,7 @@ class AssignWindow(tk.Toplevel):
         self.frm_cand = ttk.Frame(row_add)
         ttk.Label(self.frm_cand, text="別の声:").pack(side="left", padx=(8, 3))
         self.cmb_cand = ttk.Combobox(self.frm_cand, textvariable=self.var_cand,
-                                     width=10, state="disabled",
+                                     width=11, state="disabled",
                                      takefocus=False)
         self.cmb_cand.pack(side="left")
         self.btn_cand_add = ttk.Button(
@@ -1191,7 +1203,7 @@ class AssignWindow(tk.Toplevel):
             return
         self.lbl_cand.pack_forget()
         self.frm_cand.pack(side="left")
-        labels = [f"{fmt_hms(c.at)} {self._voice_label(c.speaker)}"
+        labels = [f"{fmt_short_time(c.at)} {self._voice_label(c.speaker)}"
                   for c in items]
         self.cmb_cand.configure(values=labels, state="readonly")
         self.cmb_cand.current(0)
