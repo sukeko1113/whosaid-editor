@@ -1354,6 +1354,173 @@ def test_short_time_drops_the_leading_hours():
     assert len(fmt_short_time(3930) + " 声B") <= 11
 
 
+# --- 編集履歴（設計書 §12）--------------------------------------------
+# 事業計画 v29 で差別化はこの一点に絞られた
+#   「どこまで人が原音で確認したかを成果物に残せるか」
+
+def _logged():
+    """履歴の検査用。**割当を空に戻してから始める。**
+
+    _base_for_insert() は 1 区間を割当済みにしてあり、そのままだと
+    「変わらないものは記録しない」規則に当たって記録が出ない。
+    """
+    proj = _base_for_insert()
+    for s in proj.segments:
+        s.speaker_id, s.reviewed = None, False
+    proj.edit_log.clear()
+    return proj
+
+
+def test_nothing_is_recorded_when_nothing_changed():
+    """**変わらないものは記録しない。**履歴が水増しされると読めなくなる。
+
+    _base_for_insert() が 1 区間を割当済みにしているので、そのまま同じ話者を
+    当てても記録は出ない（この規則を実際に踏んで気付いた・2026-08-19）。
+    """
+    proj = _base_for_insert()
+    proj.edit_log.clear()
+    assert proj.segments[1].speaker_id == "sp01"
+    proj.assign_speaker(1, "sp01")
+    proj.apply_speaker_to([1], "sp01", heard_index=1)
+    proj.edit_text(1, proj.segments[1].text)
+    assert proj.edit_log == [], proj.edit_log
+
+
+def test_assign_is_recorded_with_the_previous_value():
+    """**before を残す。**「機械が何と言い、人が何に直したか」が要る。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "assign"
+    assert rec["before"] is None and rec["after"] == sid
+    assert rec["reviewed"] is True
+    assert rec["actor"] == "user"
+    assert proj.segments[1].speaker_id == sid
+
+
+def test_assign_does_not_record_a_no_op():
+    """変わっていないなら記録しない（履歴が水増しされる）。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.assign_speaker(1, sid)
+    n = len(proj.edit_log)
+    proj.assign_speaker(1, sid)
+    assert len(proj.edit_log) == n
+
+
+def test_bulk_apply_is_one_record_not_one_per_segment():
+    """**記録するのは人の判断。**一括適用は 50 区間変えても判断は 1 回。
+
+    区間ごとに 1 件ずつ残すと実データで 95KB になり(実測 2026-08-19)、
+    しかも「何回判断したか」が読み取れなくなる。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.apply_speaker_to([0, 1, 2], sid, heard_index=1)
+    assert len(proj.edit_log) == 1
+    rec = proj.edit_log[0]
+    assert rec["op"] == "assign_bulk" and rec["count"] == 3
+    assert len(rec["heard"]) == 1 and len(rec["bulk"]) == 2
+
+
+def test_bulk_apply_keeps_the_reviewed_distinction():
+    """**聴いた 1 区間だけ ✓。**残りは △（機械の結果を当てただけ）。
+
+    この区別が製品価値そのもの（CLAUDE.md）。
+    """
+    proj = _logged()
+    sid = proj.speakers[0].id
+    proj.apply_speaker_to([0, 1, 2], sid, heard_index=1)
+    assert proj.segments[1].reviewed is True
+    assert proj.segments[0].reviewed is False
+    assert proj.segments[2].reviewed is False
+    # 記録の側でも区別できる
+    rec = proj.edit_log[0]
+    assert rec["heard"] == [proj.segments[1].orig_start]
+
+
+def test_undo_is_recorded_too():
+    """**取り消したことも残す。**消すと「当てたが戻した」経緯が読めない。"""
+    proj = _logged()
+    sid = proj.speakers[0].id
+    snap = [(1, proj.segments[1].speaker_id, proj.segments[1].reviewed)]
+    proj.assign_speaker(1, sid)
+    proj.restore_assignments(snap)
+    assert proj.segments[1].speaker_id is None
+    assert [r["op"] for r in proj.edit_log] == ["assign", "undo_assign"]
+
+
+def test_undo_ignores_indexes_that_no_longer_exist():
+    """分割・結合のあとでも落ちない（戻せないぶんは触らない）。"""
+    proj = _logged()
+    proj.restore_assignments([(999, "sp01", True)])
+    assert proj.edit_log == []
+
+
+def test_text_edit_keeps_both_sides():
+    proj = _logged()
+    before = proj.segments[1].text
+    assert proj.edit_text(1, "直しました") is True
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "edit_text"
+    assert rec["before"] == before and rec["after"] == "直しました"
+    assert proj.segments[1].text_edited is True, "再実行で上書きされてしまう"
+    assert proj.edit_text(1, "直しました") is False, "同じ内容で記録している"
+
+
+def test_time_edit_records_before_and_after():
+    proj = _logged()
+    seg = proj.segments[1]
+    b = [round(seg.start, 3), round(seg.end, 3)]
+    assert proj.edit_time(1, seg.start + 0.5, seg.end, reviewed=True) is True
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "edit_time"
+    assert rec["before"] == b and rec["after"][0] == round(b[0] + 0.5, 3)
+    assert rec["reviewed"] is True
+
+
+def test_time_edit_records_a_confirmation_without_a_change():
+    """値が同じでも ✎△ → ✎ は変化。**確認したことが履歴の中身。**"""
+    proj = _logged()
+    seg = proj.segments[1]
+    assert proj.edit_time(1, seg.start, seg.end, reviewed=True) is True
+    assert proj.edit_log[-1]["reviewed"] is True
+
+
+def test_log_uses_orig_start_not_index():
+    """**index は分割・結合・再実行で振り直る。**鍵にしてはいけない。"""
+    proj = _logged()
+    key = proj.segments[1].orig_start
+    proj.assign_speaker(1, proj.speakers[0].id)
+    proj.segments[1].index = 99
+    assert proj.edit_log[-1]["orig_start"] == key
+
+
+def test_log_counts_and_last_time():
+    proj = _logged()
+    proj.assign_speaker(1, proj.speakers[0].id)
+    proj.edit_text(1, "直しました")
+    counts = proj.log_counts()
+    assert counts["assign"] == 1 and counts["edit_text"] == 1
+    assert proj.log_last_at().startswith("20"), proj.log_last_at()
+    assert Project(audio_path="x.m4a").log_last_at() == ""
+
+
+def test_log_survives_save_and_load(tmp_path=None):
+    """履歴が保存され、読み直しても残る（成果物に出す前提）。"""
+    import tempfile
+    proj = _logged()
+    proj.assign_speaker(1, proj.speakers[0].id)
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "a.speakers.json"
+        proj.json_path = str(path)
+        proj.save()
+        again = Project.load(str(path))
+    assert [r["op"] for r in again.edit_log] == ["assign"]
+    assert again.edit_log[0]["before"] is None
+
+
 def test_legend_only_when_something_was_inserted():
     """凡例は使われたときだけ。無関係な凡例は記録を汚す。"""
     proj = _base_for_insert()

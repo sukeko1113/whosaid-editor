@@ -786,6 +786,135 @@ class Project:
         })
         return seg
 
+    # ------------------------------------------------------------------
+    # 編集履歴（設計書 §12）
+    #
+    # **記録するのは「人がした判断」であって「区間の書き換え」ではない。**
+    # 一括適用は 50 区間を変えても人の判断は 1 回なので、記録も 1 件で
+    # 対象を列挙する。区間ごとに 1 件ずつ残すと、実データで 95KB になり
+    # (実測 2026-08-19)、しかも「何回判断したか」が読み取れなくなる。
+    #
+    # **before を残す。**「機械が何と言い、人が何に直したか」が無ければ
+    # 検証履歴の意味がない。本文を丸ごと持っても、実データで作業ファイルは
+    # 1.35 倍（280KB→379KB）、起こりうる最大でも 2.4 倍で収まる。
+    #
+    # **書き換えの経路をここに集める。**画面が seg.speaker_id を直接
+    # 書き換えると記録を素通りするので、必ずこのメソッドを通す。
+    # ------------------------------------------------------------------
+    def _log(self, op: str, **kw: Any) -> None:
+        self.edit_log.append({
+            "op": op,
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "actor": "user",
+            **kw,
+        })
+
+    def _key(self, seg: Segment) -> float:
+        """記録が指す鍵。index は振り直るので使わない。"""
+        return float(seg.orig_start if seg.orig_start is not None else seg.start)
+
+    def assign_speaker(self, index: int, speaker_id: Optional[str],
+                       reviewed: bool = True) -> None:
+        """1 区間に話者を割り当てる（人が聴いて決めた 1 回の判断）。
+
+        speaker_id=None なら未確定に戻す（reviewed も落ちる）。
+        """
+        seg = self.segments[index]
+        before, before_rev = seg.speaker_id, seg.reviewed
+        seg.speaker_id = speaker_id
+        seg.reviewed = bool(speaker_id) and reviewed
+        if (before, before_rev) == (seg.speaker_id, seg.reviewed):
+            return                      # 変わっていないなら記録しない
+        self._log("assign", orig_start=self._key(seg),
+                  before=before, after=speaker_id, reviewed=seg.reviewed)
+
+    def apply_speaker_to(self, indexes: Sequence[int],
+                         speaker_id: Optional[str],
+                         heard_index: Optional[int] = None) -> None:
+        """まとめて適用（1 回の判断で複数区間）。
+
+        heard_index の区間だけ `reviewed=True`（その 1 つを聴いて決めた）。
+        残りは `reviewed=False`——**機械の結果をまとめて当てただけ**で、
+        個別には聴いていない。この区別が製品価値そのもの（CLAUDE.md）。
+        """
+        heard: list[float] = []
+        bulk: list[float] = []
+        for i in indexes:
+            seg = self.segments[i]
+            was = (seg.speaker_id, seg.reviewed)
+            seg.speaker_id = speaker_id
+            seg.reviewed = bool(speaker_id) and (i == heard_index)
+            if was == (seg.speaker_id, seg.reviewed):
+                continue
+            (heard if i == heard_index else bulk).append(self._key(seg))
+        if not (heard or bulk):
+            return
+        self._log("assign_bulk", after=speaker_id,
+                  heard=heard, bulk=bulk, count=len(heard) + len(bulk))
+
+    def restore_assignments(
+        self, snapshot: Sequence[tuple[int, Optional[str], bool]]
+    ) -> None:
+        """取り消し。**取り消したことも履歴に残す。**
+
+        消してしまうと「一度は当てたが戻した」経緯が読めなくなる。
+        検証履歴は結果ではなく経緯の記録なので、打ち消しも記録に残す。
+        """
+        keys: list[float] = []
+        for index, sid, reviewed in snapshot:
+            if not (0 <= index < len(self.segments)):
+                continue
+            seg = self.segments[index]
+            if (seg.speaker_id, seg.reviewed) == (sid, reviewed):
+                continue
+            seg.speaker_id, seg.reviewed = sid, reviewed
+            keys.append(self._key(seg))
+        if keys:
+            self._log("undo_assign", targets=keys, count=len(keys))
+
+    def edit_text(self, index: int, new_text: str) -> bool:
+        """本文を人が直す。変わったときだけ記録して True を返す。"""
+        seg = self.segments[index]
+        new_text = new_text if new_text is not None else ""
+        if new_text == seg.text:
+            return False
+        before = seg.text
+        seg.text = new_text
+        seg.text_edited = True          # 再実行で上書きされないよう印を付ける
+        self._log("edit_text", orig_start=self._key(seg),
+                  before=before, after=new_text)
+        return True
+
+    def edit_time(self, index: int, start: float, end: float,
+                  reviewed: bool) -> bool:
+        """区間の時刻を人が直す／確かめる。変わったときだけ記録。
+
+        値が同じでも `reviewed` が上がる（✎△ → ✎）ことがあるので、
+        そこも変化として記録する。
+        """
+        seg = self.segments[index]
+        was = (seg.start, seg.end, seg.time_edited, seg.time_reviewed)
+        if was == (start, end, True, reviewed):
+            return False
+        self._log("edit_time", orig_start=self._key(seg),
+                  before=[round(seg.start, 3), round(seg.end, 3)],
+                  after=[round(start, 3), round(end, 3)],
+                  reviewed=bool(reviewed))
+        return True
+
+    def log_counts(self) -> dict[str, int]:
+        """検証要約に出す内訳。**op ごとの件数だけ**（明細は Day 75）。"""
+        out: dict[str, int] = {}
+        for rec in self.edit_log:
+            op = str(rec.get("op") or "?")
+            out[op] = out.get(op, 0) + 1
+        return out
+
+    def log_last_at(self) -> str:
+        """最後に手を入れた時刻（ISO・UTC）。無ければ空。"""
+        times = [str(r.get("at") or "") for r in self.edit_log]
+        return max(times) if times else ""
+
     def remove_added_utterance(self, index: int) -> None:
         """人が足した区間を消す。**それ以外は消せない。**
 
