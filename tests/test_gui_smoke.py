@@ -1298,6 +1298,44 @@ def run() -> int:
         check("話者の候補とは別物のまま",
               awin._candidates is not awin._voice_candidates)
 
+        # --- 特別な選択肢が名簿に押し出されないこと -----------------------
+        # 「発言なし・雑音 はないです」(実機の指摘・2026-08-19)。出席者が
+        # 9 人だと名簿のボタンに押し出され、下 2 つが画面から切れていた。
+        from src.segments import SPECIAL_MULTI as _SM, SPECIAL_NOISE as _SN
+        from src.segments import SPECIAL_UNKNOWN as _SU
+        many = Project(audio_path=str(tmp / "meeting.m4a"),
+                       duration=600.0, chunk_seconds=420)
+        many.speakers = parse_roster(chr(10).join(
+            [f"出席者{i}(とても長い所属と役職の名前がここに入ります)"
+             for i in range(9)]))
+        many.segments = [
+            Segment(index=i, start=i * 10.0, end=i * 10.0 + 8,
+                    text=f"発言 {i}。", cluster="g:A", chunk=0)
+            for i in range(6)]
+        many.json_path = str(tmp / "many.speakers.json")
+        many.save()
+        mwin = AssignWindow(root, many)
+        mwin.var_autoplay.set(False)
+        mwin.update()
+        check("名簿が 9 人でも候補が出る", len(mwin._candidates) >= 1)
+        for _sid, _name in ((_SU, "発言者不明"), (_SM, "複数人が同時"),
+                            (_SN, "発言なし・雑音")):
+            _b = mwin.special_buttons[_sid]
+            check(f"「{_name}」が見えている",
+                  _b.winfo_ismapped() and _b.winfo_height() > 1)
+            check(f"「{_name}」が窓の中にある",
+                  0 <= _b.winfo_rooty() - mwin.winfo_rooty()
+                  < mwin.winfo_height())
+        check("特別な選択肢は名簿と別枠にある",
+              mwin.special_buttons[_SN].master is not mwin.cand_holder)
+        check("押せば雑音として確定できる",
+              callable(mwin.special_buttons[_SN].cget("command"))
+              or bool(mwin.special_buttons[_SN].cget("command")))
+        mwin.special_buttons[_SN].invoke()
+        check("雑音に確定できる", many.segments[0].speaker_id == _SN)
+        mwin.player.close()
+        mwin.destroy()
+
         # --- 既定の窓幅で、右ペインのボタンが全部見えること ---------------
         # 「右側が切れて表示されます。［＋この声を足す...］ボタンを表示させる
         # には、ウィンドウを広げる必要がある」(実機の指摘・2026-08-18)。

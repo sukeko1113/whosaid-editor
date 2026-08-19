@@ -948,10 +948,18 @@ class AssignWindow(tk.Toplevel):
         self.cand_holder.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
         self.cand_holder.columnconfigure(0, weight=1)
 
+        # **特別な選択肢は名簿と別枠に、横一列で置く。**名簿に入れると、
+        # 出席者が多いときに下から押し出されて画面から切れる(9 人で
+        # 「発言なし・雑音」が消えた・実機の指摘 2026-08-19)。
+        # 別の行にすれば、伸び縮みするのは名簿側だけになる。
+        self.special_holder = ttk.Frame(frm_cand)
+        self.special_holder.grid(row=1, column=0, sticky="ew", padx=6,
+                                 pady=(0, 4))
+
         # 直前の操作の結果。区間を移動しても消えないように専用の行にする
         # (一括適用が何区間に効いたのかが分からないと、事故に気づけない)
         ttk.Label(frm_cand, textvariable=self.var_action, foreground="#1B5E20",
-                  wraplength=560).grid(row=1, column=0, sticky="w", padx=8, pady=(2, 0))
+                  wraplength=560).grid(row=2, column=0, sticky="w", padx=8, pady=(2, 0))
 
         opts = ttk.Frame(frm_cand)
         opts.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
@@ -2232,16 +2240,18 @@ class AssignWindow(tk.Toplevel):
             btn.grid(row=i, column=0, sticky="ew", pady=1)
             self._cand_widgets.append(btn)
 
-        row = len(self._candidates)
+        # **特別な選択肢は別枠に横一列。**名簿に混ぜると出席者が多いときに
+        # 下から切れる(実機の指摘 2026-08-19)。
+        self.special_buttons = {}
         for sid, label in ((SPECIAL_UNKNOWN, "発言者不明"),
                            (SPECIAL_MULTI, "複数人が同時"),
                            (SPECIAL_NOISE, "発言なし・雑音")):
             mark = "●" if seg.speaker_id == sid else "　"
-            btn = ttk.Button(self.cand_holder, text=f"{mark} {label}",
+            btn = ttk.Button(self.special_holder, text=f"{mark} {label}",
                              command=lambda s=sid: self.assign(s))
-            btn.grid(row=row, column=0, sticky="ew", pady=1)
+            btn.pack(side="left", expand=True, fill="x", padx=1)
             self._cand_widgets.append(btn)
-            row += 1
+            self.special_buttons[sid] = btn
 
     # ==================================================================
     # 割当
