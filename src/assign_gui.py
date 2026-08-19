@@ -849,6 +849,13 @@ class AssignWindow(tk.Toplevel):
                    command=self.merge_with_prev).pack(side="left", padx=6)
         ttk.Button(row_edit, text="次の区間と結合", takefocus=False,
                    command=self.merge_with_next).pack(side="left")
+        # **区間を消すはこの行に置く。**下の行は候補の選択肢が入るので幅が
+        # 足りない(1280x720 の画面で 508px 必要・幅 473px しかない)。
+        # こちらの行は 292px しか使っておらず余裕がある。
+        self.btn_del_added = ttk.Button(
+            row_edit, text="この区間を消す", takefocus=False,
+            command=self.remove_added, state="disabled")
+        self.btn_del_added.pack(side="left", padx=(12, 0))
 
         # **もう 1 行に分ける。**1 行に詰めると既定の窓幅(1180)で右端が切れ、
         # 窓を広げないとボタンが押せなかった(実機の指摘・2026-08-18)。
@@ -859,10 +866,6 @@ class AssignWindow(tk.Toplevel):
         # 機械が時刻と声を用意し、人が言葉を入れる。
         ttk.Button(row_add, text="＋この声を足す...", takefocus=False,
                    command=self.add_utterance).pack(side="left")
-        self.btn_del_added = ttk.Button(
-            row_add, text="この区間を消す", takefocus=False,
-            command=self.remove_added, state="disabled")
-        self.btn_del_added.pack(side="left", padx=6)
         # 候補の一覧(設計書 §10.3)。**行を増やさない。**右ペインは既に
         # 詰まっており、行を足すと下の保存ボタンが隠れる(実機の指摘)。
         # **幅の余裕も 21px しか無い**(要 571 / 幅 592)ので、説明文と候補は

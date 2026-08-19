@@ -445,18 +445,27 @@ def _carry_over_assignments(
     used: set[int] = set()
     matched: dict[int, list[Segment]] = {}      # new_segments の位置 → ファミリー
 
-    for pos, seg in enumerate(new_segments):
-        best_i = -1
-        best_gap = MATCH_TOLERANCE_SECONDS + 1e-9
-        for i, fam in enumerate(pool):
-            if i in used:
-                continue
-            gap = abs(float(fam[0].orig_start) - seg.start)
-            if gap < best_gap:
-                best_i, best_gap = i, gap
-        if best_i >= 0:
-            used.add(best_i)
-            matched[pos] = pool[best_i]
+    # **いちばん近いもの同士で当てる。**新しい区間の順に「許容 2 秒以内なら
+    # 当てる」貪欲だったため、**本当の相手より手前の区間に先に当たっていた。**
+    # 当たった区間は旧区間で置き換えられて消え、本当の相手は「使用済み」で
+    # 当たらず残る——**欠落と重複が同じ 1 つの原因から出ていた**
+    # (実データで発言が 2 件失われていた・2026-08-19)。
+    #
+    # ずれの小さい組から確定させる。組の数は数百なので総当たりで足りる。
+    pairs = sorted(
+        ((abs(float(fam[0].orig_start) - seg.start), pos, i)
+         for pos, seg in enumerate(new_segments)
+         for i, fam in enumerate(pool)
+         if abs(float(fam[0].orig_start) - seg.start)
+         <= MATCH_TOLERANCE_SECONDS),
+        key=lambda x: (x[0], x[1], x[2]))
+    taken_pos: set[int] = set()
+    for _gap, pos, i in pairs:
+        if i in used or pos in taken_pos:
+            continue
+        used.add(i)
+        taken_pos.add(pos)
+        matched[pos] = pool[i]
 
     # 結合して 1 つにした区間が、再実行で再び 2 つに戻るのを防ぐ。
     # 判定は再生成区間を差し替える「前」に済ませる。差し替えて入る旧区間の

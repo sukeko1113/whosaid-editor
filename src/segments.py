@@ -1414,6 +1414,7 @@ LOG_LABELS = {
     "undo_times": "時刻の取り消し",
     "add_utterance": "相づちを足した",
     "remove_added_utterance": "相づちを消した",
+    "restore_lost_segments": "消えた区間を戻した",
     "split": "区間の分割",
     "merge": "区間の結合",
 }

@@ -1339,7 +1339,12 @@ def run() -> int:
         # --- 既定の窓幅で、右ペインのボタンが全部見えること ---------------
         # 「右側が切れて表示されます。［＋この声を足す...］ボタンを表示させる
         # には、ウィンドウを広げる必要がある」(実機の指摘・2026-08-18)。
-        awin.geometry("1320x800")
+        # **画面より大きくしない。**アプリ本体と同じ規則で決める。
+        # 1320x800 と決め打ちすると、狭い画面(実際に 1280x720 で動かした)
+        # では窓が画面をはみ出し、右ペインが縮んで検査が落ちる。
+        # 検査したいのは「既定の大きさで収まるか」であって、特定の画素数ではない。
+        _sw, _sh = awin.winfo_screenwidth(), awin.winfo_screenheight()
+        awin.geometry(f"{min(1320, _sw - 40)}x{min(800, _sh - 90)}")
         awin.update()
         _frm = awin.btn_del_added.master.master
         _rows = [r for r in _frm.winfo_children() if r.winfo_children()]

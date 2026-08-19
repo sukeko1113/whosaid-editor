@@ -2061,6 +2061,52 @@ def _carry(old_segments, new_segments):
     return _carry_over_assignments(old, new_segments, logs.append), logs
 
 
+def test_carry_over_does_not_lose_a_neighbour_to_a_greedy_match():
+    """**発言が黙って消えないこと。**実データで 2 件失われていた。
+
+    突き合わせが「新しい区間の順に、許容 2 秒以内なら当てる」貪欲だったため、
+    **本当の相手より手前の区間に先に当たっていた。**当たった区間は旧区間で
+    置き換えられて消え、本当の相手は「使用済み」で当たらず残る——
+    **欠落と重複が同じ 1 つの原因から出ていた**(2026-08-19・§10.3.5)。
+
+    実データの形をそのまま写してある(ずれ 1.70 秒)。
+    """
+    old = [
+        Segment(index=0, start=2110.50, end=2132.30, text="そこが県さんが",
+                cluster="0:A", speaker_id="sp01", reviewed=True,
+                time_edited=True, orig_start=2110.51, orig_end=2132.29),
+    ]
+    new = [
+        Segment(index=0, start=2108.81, end=2110.51,
+                text="そういうのがあるんですよ", cluster="0:A"),
+        Segment(index=1, start=2110.51, end=2132.29, text="そこが県さんが",
+                cluster="0:A"),
+    ]
+    result, _ = _carry(old, new)
+    texts = [s.text for s in result]
+    assert "そういうのがあるんですよ" in texts, texts
+    assert len(result) == 2, texts
+    assert result[1].speaker_id == "sp01", "人の割当が別の区間に付いた"
+
+
+def test_carry_over_matches_the_closest_one():
+    """**いちばん近いもの同士で当てる。**手前から順に当てない。"""
+    old = [
+        Segment(index=0, start=105.0, end=115.0, text="あ", cluster="0:A",
+                speaker_id="sp01", reviewed=True, time_edited=True,
+                orig_start=105.0, orig_end=115.0),
+    ]
+    new = [
+        Segment(index=0, start=103.5, end=105.0, text="手前", cluster="0:A"),
+        Segment(index=1, start=105.0, end=115.0, text="あ", cluster="0:A"),
+        Segment(index=2, start=115.0, end=120.0, text="次", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [s.text for s in result] == ["手前", "あ", "次"], [
+        s.text for s in result]
+    assert result[1].speaker_id == "sp01"
+
+
 def test_carry_over_does_not_duplicate_at_the_exact_start():
     """**区間が二重にならない（再実行の取り込みの境界）。**
 
