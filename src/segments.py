@@ -96,6 +96,20 @@ def key_text(key: tuple[float, float]) -> str:
     return f"{key[0]:.3f}+{key[1]:.3f}"
 
 
+def added_signature(seg: "Segment") -> tuple[float, float, str]:
+    """人が足した区間かを見分けるための身元 —— (orig_start, 終わり, まとまり)。
+
+    `segment_key` とは別物。あちらは「どの区間か」を指す鍵で、こちらは
+    「これは人が足したものか」を `edit_log` の記録と突き合わせるためのもの。
+
+    **開始時刻だけでは足りない。**転写の区間と開始が一致することがある
+    （`Project.added_utterance_signatures` を見よ）。
+    """
+    orig = seg.orig_start if seg.orig_start is not None else seg.start
+    return (round(float(orig), 3), round(float(seg.end), 3),
+            str(seg.cluster or ""))
+
+
 def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
     """その区間が実音声のどこで鳴っているか(開始, 終了)。
 
@@ -752,10 +766,34 @@ class Project:
                 keys.discard(round(float(k), 3))
         return keys
 
+    def added_utterance_signatures(self) -> set[tuple[float, float, str]]:
+        """人が足した区間の身元 `(orig_start, 終わり, まとまり)`。
+
+        **開始時刻だけでは身元にならない。**転写の区間とたまたま開始が
+        一致することがあり、実データで転写の区間が「人が足した」と誤判定
+        されていた（42:15.9 で発生・2026-08-20）。誤判定された区間には
+        ［この区間を消す］が押せてしまう。これは
+        「音声認識が出した区間には削除の入口を作らない」（CLAUDE.md）に反する。
+
+        **消した記録は見ない。**消えた区間はもう存在しないので、記録から
+        引く必要がない。引くと、過去に消し損ねて残った区間まで
+        「足したものではない」ことになり、**二度と消せなくなる**
+        （実データで 42:12.7 に残骸が 1 件できていた）。
+        """
+        out: set[tuple[float, float, str]] = set()
+        for rec in self.edit_log:
+            if rec.get("op") != "add_utterance":
+                continue
+            k, e = rec.get("orig_start"), rec.get("end")
+            if k is None or e is None:
+                continue
+            out.add((round(float(k), 3), round(float(e), 3),
+                     str(rec.get("cluster") or "")))
+        return out
+
     def is_added_utterance(self, seg: Segment) -> bool:
         """この区間は人が足したものか（消してよいか）。"""
-        key = float(seg.orig_start if seg.orig_start is not None else seg.start)
-        return round(key, 3) in self.added_utterance_keys()
+        return added_signature(seg) in self.added_utterance_signatures()
 
     def add_utterance(self, start: float, end: float, text: str,
                       cluster: str = "", cut: Optional[int] = None,
@@ -791,7 +829,10 @@ class Project:
             text_edited=True,               # 人が打った本文
             time_edited=False,              # 時刻は turn 由来の機械値
         )
-        pos = len([s for s in self.segments if (s.start, s.index) < (start, 0)])
+        # **同じ時刻に既にあるものの「後ろ」に入れる。**前に入れていたため
+        # 同時刻に 2 件足すと並びが作った順と逆になり、割り込み位置(cut)と
+        # 本文の対応が入れ替わっていた(2026-08-20)。
+        pos = len([s for s in self.segments if s.start <= start])
         self.segments.insert(pos, seg)
         self.renumber()
         self.edit_log.append({
@@ -1247,28 +1288,34 @@ def _insert_cuts(proj: Project) -> dict:
 
     割り込み位置は add_utterance が edit_log に残している(区間そのものは
     割らない。割ると、直すときに元の本文を復元できない → 設計書 §5.0.5)。
-    消された追加発話は取り除く。
 
     鍵は `(parent_orig, parent_start)`。**`parent_start` が無い古い記録は
     `None`** にしておき、突き合わせのときに `parent_orig` だけで当てる。
+
+    値は `(何文字目, 足した発話の身元)`。**身元は開始時刻ではなく
+    `added_signature` と同じ 3 つ組。**開始時刻だけだと、同じ時刻の 2 件が
+    区別できず、Word で片方が消える(実データで発生・2026-08-20)。
+
+    **消した記録は見ない。**存在しない区間は差し込みようがないので、
+    突き合わせのときに区間の側で落ちる(`added_signature` を見よ)。
     """
-    cuts: dict[tuple[float, Optional[float]], list[tuple[int, float]]] = {}
+    cuts: dict[tuple[float, Optional[float]],
+               list[tuple[int, tuple[float, float, str]]]] = {}
     for rec in proj.edit_log:
         if (rec.get("op") == "add_utterance" and rec.get("cut") is not None
-                and rec.get("parent_orig") is not None):
+                and rec.get("parent_orig") is not None
+                and rec.get("end") is not None):
             ps = rec.get("parent_start")
             key = (round(float(rec["parent_orig"]), 3),
                    None if ps is None else round(float(ps), 3))
-            cuts.setdefault(key, []).append(
-                (int(rec["cut"]), round(float(rec["orig_start"]), 3)))
-        elif rec.get("op") == "remove_added_utterance":
-            gone = round(float(rec.get("orig_start", -1)), 3)
-            for lst in cuts.values():
-                lst[:] = [c for c in lst if c[1] != gone]
+            sig = (round(float(rec["orig_start"]), 3),
+                   round(float(rec["end"]), 3),
+                   str(rec.get("cluster") or ""))
+            cuts.setdefault(key, []).append((int(rec["cut"]), sig))
     return cuts
 
 
-def _cuts_for(cuts: dict, seg: "Segment") -> list[tuple[int, float]]:
+def _cuts_for(cuts: dict, seg: "Segment") -> list:
     """その区間に差し込むもの。組で当て、古い形(orig だけ)も拾う。"""
     k = segment_key(seg)
     return list(cuts.get(k, [])) + list(cuts.get((k[0], None), []))
@@ -1276,10 +1323,10 @@ def _cuts_for(cuts: dict, seg: "Segment") -> list[tuple[int, float]]:
 
 def has_inserted_utterances(proj: Project) -> bool:
     """出力の本文に差し込まれる追加発話があるか(凡例を出すかの判断に使う)"""
-    added = {round(float(s.orig_start), 3)
+    added = {added_signature(s)
              for s in proj.segments if proj.is_added_utterance(s)}
-    return any(key in added
-               for lst in _insert_cuts(proj).values() for _cut, key in lst)
+    return any(sig in added
+               for lst in _insert_cuts(proj).values() for _cut, sig in lst)
 
 
 def _merge_runs(
@@ -1305,14 +1352,34 @@ def _merge_runs(
     # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
     # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
     cuts = _insert_cuts(proj)
-    added_by_key = {round(float(s.orig_start), 3): s
-                    for s in proj.segments if proj.is_added_utterance(s)}
+    # **身元ごとに「並び」で持つ。**辞書に 1 つずつ入れていたため、同じ
+    # 身元の 2 件目が 1 件目を上書きし、上書きされたほうが差し込み先を
+    # 失って**出力から丸ごと落ちていた**(実データで発生・2026-08-20)。
+    pool: dict[tuple[float, float, str], list[Segment]] = {}
+    for s in proj.segments:
+        if proj.is_added_utterance(s):
+            pool.setdefault(added_signature(s), []).append(s)
+
+    # 差し込み記録に区間を 1 つずつ割り当てる。**記録より区間が多いときは
+    # 余りを単独で出す**(消し損ねて残った区間を黙って落とさないため)。
+    marks_by_parent: dict[tuple, list[tuple[int, Segment]]] = {}
+    placed: set[int] = set()
+    for pkey, lst in cuts.items():
+        for cut, sig in lst:
+            queue = pool.get(sig)
+            if not queue:
+                continue
+            seg_add = queue.pop(0)
+            placed.add(id(seg_add))
+            marks_by_parent.setdefault(pkey, []).append((cut, seg_add))
+
     inline = insert_style == INSERT_STYLE_INLINE
 
-    def marks_for(seg: Segment) -> list[tuple[int, float]]:
-        return sorted(
-            (c for c in _cuts_for(cuts, seg) if c[1] in added_by_key),
-            key=lambda c: c[0])
+    def marks_for(seg: Segment) -> list[tuple[int, Segment]]:
+        k = segment_key(seg)
+        return sorted(marks_by_parent.get(k, [])
+                      + marks_by_parent.get((k[0], None), []),
+                      key=lambda c: c[0])
 
     shorts = short_labels(proj.speakers) if inline else {}
 
@@ -1336,9 +1403,8 @@ def _merge_runs(
             return [(seg, False, False)]
         if inline:
             out, prev = [], 0
-            for cut, key in marks:
+            for cut, add in marks:
                 cut = max(0, min(len(seg.text), cut))
-                add = added_by_key[key]
                 if drop_noise and add.speaker_id == SPECIAL_NOISE:
                     continue
                 body = add.text.strip()
@@ -1351,7 +1417,7 @@ def _merge_runs(
             return [(replace(seg, text="".join(out)), False, False)]
         out2: list[tuple[Segment, bool, bool]] = []
         prev, cont = 0, False
-        for cut, key in marks:
+        for cut, add in marks:
             cut = max(0, min(len(seg.text), cut))
             head = seg.text[prev:cut]
             if head.strip():
@@ -1359,7 +1425,7 @@ def _merge_runs(
                 out2.append(
                     (replace(seg, text=head.rstrip() + CONTINUE_MARK), cont, True))
                 cont = True
-            out2.append((added_by_key[key], False, False))
+            out2.append((add, False, False))
             prev = cut
         tail = seg.text[prev:]
         if tail.strip():
@@ -1368,11 +1434,11 @@ def _merge_runs(
 
     ordered: list[tuple[Segment, bool, bool]] = []
     for seg in proj.segments:
-        if proj.is_added_utterance(seg):
-            # 差し込み先で出すので、単独では出さない(先が無ければ出す)
-            key = round(float(seg.orig_start), 3)
-            if any(key == k for v in cuts.values() for _c, k in v):
-                continue
+        # 差し込み先が決まったものは、そこで出すので単独では出さない。
+        # **決まらなかったものは出す。**先が無いのに黙って落とすと、人が
+        # 打った発言が成果物から消える。
+        if id(seg) in placed:
+            continue
         ordered.extend(pieces(seg))
 
     runs: list[tuple[float, Optional[str], list[str], bool]] = []

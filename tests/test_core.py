@@ -2923,6 +2923,76 @@ def test_credits_survives_a_missing_file():
     assert "TitaNet" in t and "CC BY 4.0" in t
 
 
+def test_transcribed_segment_is_not_mistaken_for_an_added_one():
+    """**転写の区間を「人が足した」と誤判定しない。**
+
+    実データで起きた（42:15.9・2026-08-20）。足した発話と開始時刻が
+    たまたま一致した転写の区間に ＋ 印が付き、［この区間を消す］まで
+    押せる状態になっていた。「音声認識が出した区間には削除の入口を
+    作らない」（CLAUDE.md）に反する。
+
+    身元は (orig_start, 終わり, まとまり) の 3 つ組で見る。
+    """
+    proj = _base_for_insert()
+    added = proj.add_utterance(103.0, 103.6, "はい", "g:D")
+    # 開始だけ同じ、終わりもまとまりも違う転写の区間
+    ghost = Segment(index=0, start=103.0, end=108.0,
+                    text="機械が出した本文", cluster="g:B")
+    proj.segments.append(ghost)
+    proj.renumber()
+
+    assert proj.is_added_utterance(added) is True
+    assert proj.is_added_utterance(ghost) is False, "転写の区間を消せてしまう"
+    try:
+        proj.remove_added_utterance(ghost.index)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("転写の区間が消せてしまった")
+
+
+def test_two_added_at_the_same_time_both_reach_the_output():
+    """**同じ時刻に 2 件足しても、両方 Word に出る。**
+
+    身元を開始時刻だけで持っていたため、辞書で 2 件目が 1 件目を上書きし、
+    上書きされたほうが差し込み先を失って**出力から丸ごと落ちていた**
+    （実データ 42:12.7 で発生・2026-08-20）。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    a = _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    b = _add_at(proj, base, 7, 103.0, "ええ", "sp02")
+    assert a.start == b.start, "この検査は同時刻でなければ意味がない"
+
+    bodies = [text for _s, _sid, text, _c in _merge_runs(proj, True)]
+    assert "はい" in bodies, bodies
+    assert "ええ" in bodies, bodies
+    # 割り込み位置と本文の対応が入れ替わっていないこと
+    assert bodies.index("はい") < bodies.index("ええ"), bodies
+
+
+def test_removing_one_of_two_leaves_the_other_removable():
+    """**2 件のうち 1 件を消しても、残りは消せる。**
+
+    鍵を集合で持っていたため、1 件消すと鍵ごと消え、残った 1 件が
+    「人が足したもの」と認識されなくなって**二度と消せなくなっていた**。
+    画面側が ValueError を握りつぶしていたので誰にも見えず、消し残しが
+    作業ファイルに溜まった（実データ 42:12.7・01:04:57.2）。
+    """
+    proj = _base_for_insert()
+    base = proj.segments[1]
+    a = _add_at(proj, base, 3, 103.0, "はい", "sp02")
+    b = _add_at(proj, base, 7, 103.0, "ええ", "sp02")
+
+    proj.remove_added_utterance(b.index)
+    left = [s for s in proj.segments if s.text == "はい"]
+    assert len(left) == 1
+    assert proj.is_added_utterance(left[0]) is True, "残った 1 件が消せない"
+    proj.remove_added_utterance(left[0].index)
+    assert not [s for s in proj.segments if s.text in ("はい", "ええ")]
+    assert a.text == "はい"      # 消したのは指したものだけ
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

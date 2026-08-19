@@ -2147,11 +2147,24 @@ class AssignWindow(tk.Toplevel):
         # **開いたときにあったものは、いったん全部消してから作り直す。**
         # 位置も本文も話者も変えられるので、差分を追うより作り直すほうが
         # 確実で、edit_log にも経緯が残る。index の大きい順に消す。
+        # **消せなかったら黙って進まない。**ここで握りつぶしていたため、
+        # 「消したのに消えない」が起きても誰にも見えず、消し残しが作業
+        # ファイルに溜まっていた(実データで発生・2026-08-20)。
+        failed: list[str] = []
         for index in sorted((i for i, _it in prev), reverse=True):
             try:
                 self.proj.remove_added_utterance(index)
-            except ValueError:
-                pass
+            except ValueError as e:
+                seg_bad = self.proj.segments[index] if (
+                    0 <= index < len(self.proj.segments)) else None
+                failed.append(
+                    f"{fmt_short_time(seg_bad.start)}「{seg_bad.text}」: {e}"
+                    if seg_bad else str(e))
+        if failed:
+            messagebox.showerror(
+                "消せなかったものがあります",
+                "次の発話を消せませんでした。ほかは指示どおりに直しています。\n\n"
+                + "\n".join(failed), parent=self)
         # **区間は割らない。**割ると、直すときに元の本文を復元できなくなる。
         # 代わりに「本文のどこに割り込んだか」(cut)を残し、Word に出すときだけ
         # 差し込む(設計書 §5.0.5)。
