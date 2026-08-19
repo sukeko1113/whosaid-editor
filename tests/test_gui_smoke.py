@@ -1123,7 +1123,7 @@ def run() -> int:
 
         # 小窓は差し替える(開くと応答待ちで止まる)
         real_ask_utt = awin._ask_utterance
-        awin._ask_utterance = lambda seg, turns, existing=None: (
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: (
             [{"cut": 2, "at": 14.0, "end": 14.6, "text": "はいはい",
               "cluster": "g:B", "sid": ap.speakers[0].id}], True)
         try:
@@ -1196,6 +1196,70 @@ def run() -> int:
                       for v in awin.cmb_cand.cget("values")))
             check("先頭の 00: を出さない",
                   not awin.cmb_cand.cget("values")[0].startswith("00:"))
+
+            # **もう足した位置は「済」。隠さずに印を付けて後ろに回す。**
+            ap.add_utterance(13.2, 13.9, "はい", cluster="g:B")
+            awin._show_voice_candidates()
+            awin.update()
+            _vals = list(awin.cmb_cand.cget("values"))
+            check("足した位置に「済」が付く",
+                  any(v.startswith("済") for v in _vals))
+            check("候補そのものは消さない", len(_vals) == 2)
+            check("済は後ろに回す", not _vals[0].startswith("済"))
+            check("残りの数を出す", "残" in str(awin.lbl_cand_note.cget("text")))
+            # 待ち行列（候補のみ）からは、済んだものだけの区間は外れる
+            ap.add_utterance(15.2, 15.9, "ええ", cluster="g:C")
+            awin.var_filter.set(assign_gui.FILTER_CANDIDATES)
+            awin._on_filter_change()
+            check("全部済んだ区間は待ち行列から外れる",
+                  1 not in awin._visible_indexes())
+            for _s in [s for s in ap.segments
+                       if ap.is_added_utterance(s)]:
+                ap.remove_added_utterance(_s.index)
+            awin.var_filter.set(assign_gui.FILTER_ALL)
+            awin._on_filter_change()
+            awin.goto(1)
+            awin.update()
+
+            # --- ［ここから］が位置を渡す（設計書 §10.3.3）------
+            _seen: dict = {}
+
+            def _fake_ask(seg, turns, existing=None,
+                          initial_cut=None, initial_note=""):
+                _seen["cut"] = initial_cut
+                _seen["note"] = initial_note
+                _seen["seg"] = seg
+                return ([], False)
+
+            _real_ask3 = awin._ask_utterance
+            awin._ask_utterance = _fake_ask
+            try:
+                awin.cmb_cand.current(0)
+                awin.add_from_voice_candidate()
+            finally:
+                awin._ask_utterance = _real_ask3
+            check("候補から開くと本文の位置を渡す",
+                  isinstance(_seen.get("cut"), int))
+            check("位置は本文の範囲に収まる",
+                  0 <= _seen["cut"] <= len(_seen["seg"].text))
+            check("どの声かを案内する",
+                  "声" in _seen.get("note", ""))
+            check("**位置が目安だと書く**（実測ではない）",
+                  "目安" in _seen.get("note", ""))
+            # **話者は機械が選ばない。**選ぶと ✓ が機械の判断で立つ
+            _dlg3 = assign_gui.AddUtteranceDialog(
+                awin, ap.segments[1], awin._load_turns(), None,
+                initial_cut=2, initial_note="候補: 0:13 に声B")
+            _dlg3.withdraw()
+            _dlg3.update()
+            check("渡した位置にカーソルが立つ", _dlg3._cut == 2)
+            check("案内が小窓に出る",
+                  "声B" in _dlg3.var_from_cand.get())
+            check("**話者は機械が選ばない**（✓ の意味を守る）",
+                  _dlg3.cmb_sp.current() == 0)
+            _dlg3.destroy()
+            awin.var_filter.set(assign_gui.FILTER_ALL)
+            awin._on_filter_change()
 
             # 絞り込み
             awin.var_filter.set(assign_gui.FILTER_CANDIDATES)
@@ -1321,7 +1385,7 @@ def run() -> int:
         # 空から始まるので直しようがなかった。
         base = next(s for s in ap.segments if s.text == "発言 1。")
         # まず 1 件足す
-        awin._ask_utterance = lambda seg, turns, existing=None: (
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: (
             [{"cut": 2, "at": 14.0, "end": 14.6, "text": "もとの",
               "cluster": "g:B", "sid": None}], True)
         awin.goto(base.index)
@@ -1331,7 +1395,7 @@ def run() -> int:
 
         # 開き直すと、その 1 件が既存として渡る
         seen: list = []
-        awin._ask_utterance = lambda seg, turns, existing=None: (
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: (
             seen.append(list(existing or [])),
             ([{"cut": 2, "at": 14.0, "end": 14.6, "text": "なおした",
                "cluster": "g:B", "sid": None}], True))[1]
@@ -1350,14 +1414,14 @@ def run() -> int:
               sum(1 for s in ap.segments if ap.is_added_utterance(s)) == 1)
 
         # 空にして確定すると全部消える
-        awin._ask_utterance = lambda seg, turns, existing=None: ([], True)
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: ([], True)
         awin.goto(base.index)
         awin.add_utterance()
         check("空にして確定すると全部消える",
               not any(ap.is_added_utterance(s) for s in ap.segments))
 
         # やめた場合は何も変えない
-        awin._ask_utterance = lambda seg, turns, existing=None: (
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: (
             [{"cut": 2, "at": 14.0, "end": 14.6, "text": "入れない",
               "cluster": "g:B", "sid": None}], False)
         n_before = len(ap.segments)
@@ -1369,7 +1433,7 @@ def run() -> int:
         awin._ask_utterance = real_ask_utt
 
         # 話者を選ばなかった場合は ✓ を立てない
-        awin._ask_utterance = lambda seg, turns, existing=None: (
+        awin._ask_utterance = lambda seg, turns, existing=None, **_k: (
             [{"cut": 2, "at": 24.0, "end": 24.6, "text": "うん",
               "cluster": "g:C", "sid": None}], True)
         try:

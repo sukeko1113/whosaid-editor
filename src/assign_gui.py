@@ -1154,7 +1154,15 @@ class AssignWindow(tk.Toplevel):
         if mode == FILTER_UNREVIEWED:
             return not (seg.speaker_id and seg.reviewed)
         if mode == FILTER_CANDIDATES:
-            return bool(self._voice_candidates_for(seg))
+            # **待ち行列なので、済んだものだけの区間は出さない。**
+            # 候補そのものは残っており、すべて表示にすれば「済」付きで見える。
+            items = self._voice_candidates_for(seg)
+            if not items:
+                return False
+            done = cand_mod.done_keys(
+                items, [s for s in self.proj.segments
+                        if self.proj.is_added_utterance(s)])
+            return len(done) < len(items)
         return True
 
     # --- 候補の一覧(設計書 §10.3)------------------------------------
@@ -1192,6 +1200,13 @@ class AssignWindow(tk.Toplevel):
             return
         seg = self.proj.segments[self.current]
         items = self._voice_candidates_for(seg)
+        # **もう足した位置は「済」と印を付ける。隠さない。**隠すと
+        # 「候補が無い＝やることが無い」と読まれ、この道具の性格
+        # (印が無い＝安全ではない)と食い違う。済は後ろに回す。
+        done = cand_mod.done_keys(
+            items, [s for s in self.proj.segments
+                    if self.proj.is_added_utterance(s)])
+        items = sorted(items, key=lambda c: (c.key in done, c.at))
         self._current_voice_candidates = items
         if not items:
             self.frm_cand.pack_forget()             # 幅を空ける(排他)
@@ -1203,7 +1218,8 @@ class AssignWindow(tk.Toplevel):
             return
         self.lbl_cand.pack_forget()
         self.frm_cand.pack(side="left")
-        labels = [f"{fmt_short_time(c.at)} {self._voice_label(c.speaker)}"
+        labels = [("済" if c.key in done else "")
+                  + f"{fmt_short_time(c.at)} {self._voice_label(c.speaker)}"
                   for c in items]
         self.cmb_cand.configure(values=labels, state="readonly")
         self.cmb_cand.current(0)
@@ -1212,7 +1228,9 @@ class AssignWindow(tk.Toplevel):
         # **言い切らない。**3 割は空振りで、候補が無い区間にも脱落はある。
         # 件数は選択肢の一覧で分かる。**「空振りあり」は落とさない**——
         # 3 割は外れるので、書かないと「候補＝脱落」と読まれる。
-        self.lbl_cand_note.configure(text="空振りあり")
+        left = len(items) - len(done)
+        self.lbl_cand_note.configure(
+            text="空振りあり" if left == len(items) else f"残{left}・空振りあり")
 
     def _selected_voice_candidate(self):
         items = getattr(self, "_current_voice_candidates", [])
@@ -1220,11 +1238,34 @@ class AssignWindow(tk.Toplevel):
         return items[i] if 0 <= i < len(items) else None
 
     def add_from_voice_candidate(self) -> None:
-        """選んだ候補の位置から［＋この声を足す］を開く(単位 3 で位置を渡す)。"""
+        """選んだ候補の位置に、カーソルを立てて小窓を開く(設計書 §10.3.3)。
+
+        **話者は入れない。**候補が持っているのは turn の声(声B)であって
+        名簿の誰かではない。機械が選んだ話者のまま押されると ✓ が立ち、
+        「✓＝人が聴いて決めた」という意味が壊れる(CLAUDE.md)。
+        どの声だったかは案内文で伝えるだけにする。
+        """
         c = self._selected_voice_candidate()
         if c is None:
             return
-        self.add_utterance()
+        seg = self.proj.segments[self.current]
+        self.add_utterance(
+            initial_cut=self._cut_for_time(seg, c.at),
+            initial_note=f"候補: {fmt_short_time(c.at)} に"
+                         f"{self._voice_label(c.speaker)}が聞こえます。"
+                         "位置は目安なので、聴いて直してください。")
+
+    @staticmethod
+    def _cut_for_time(seg: Segment, at: float) -> int:
+        """時刻 → 本文の文字位置(文字数按分)。**目安であって実測ではない。**
+
+        小窓が位置 → 時刻を出すのと同じ按分の逆。区間の中で話す速さが
+        一定という粗い仮定なので、人が聴いて直す前提(設計書 §5.0.5)。
+        """
+        text = seg.text or ""
+        span = max(1e-6, seg.end - seg.start)
+        cut = int(round(len(text) * (at - seg.start) / span))
+        return max(0, min(len(text), cut))
 
     def dismiss_voice_candidate(self) -> None:
         """× — この候補は違った、と記録する。**次からは出てこない。**
@@ -1984,7 +2025,9 @@ class AssignWindow(tk.Toplevel):
         return out
 
     def _ask_utterance(self, seg: Segment, turns: list,
-                       existing: Optional[list[dict]] = None):
+                       existing: Optional[list[dict]] = None,
+                       initial_cut: Optional[int] = None,
+                       initial_note: str = ""):
         """小窓を開いて [(開始, 終了, 本文, まとまり, 話者), …] を返す。
 
         **押されたのが［…にする］なら applied=True。**やめたときと
@@ -1993,12 +2036,19 @@ class AssignWindow(tk.Toplevel):
         **画面を出す処理なので、検査では必ず差し替える。**差し替え忘れると
         応答待ちで止まる(GUI 検査で実際に止めた前例がある)。
         """
-        dlg = AddUtteranceDialog(self, seg, turns, existing)
+        dlg = AddUtteranceDialog(self, seg, turns, existing,
+                                 initial_cut=initial_cut,
+                                 initial_note=initial_note)
         self.wait_window(dlg)
         return (dlg.result, dlg.applied)
 
-    def add_utterance(self) -> None:
-        """聞こえたのに本文に無い発話を足す。"""
+    def add_utterance(self, initial_cut: Optional[int] = None,
+                      initial_note: str = "") -> None:
+        """聞こえたのに本文に無い発話を足す。
+
+        initial_cut を渡すと、その文字位置にカーソルを立てて開く
+        (候補の一覧から呼ぶとき・設計書 §10.3.3)。
+        """
         if not self.proj.segments:
             return
         self._commit_text()
@@ -2010,7 +2060,8 @@ class AssignWindow(tk.Toplevel):
         turns.sort(key=lambda t: (t.start, t.end))
         prev = self._added_for(seg)
         got, applied = self._ask_utterance(
-            seg, turns, [item for _i, item in prev])
+            seg, turns, [item for _i, item in prev],
+            initial_cut=initial_cut, initial_note=initial_note)
         if not applied:
             return
         # **開いたときにあったものは、いったん全部消してから作り直す。**
@@ -3198,7 +3249,9 @@ class AddUtteranceDialog(tk.Toplevel):
     MARKS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
     def __init__(self, win: "AssignWindow", seg: Segment,
-                 turns: list, existing: Optional[list[dict]] = None) -> None:
+                 turns: list, existing: Optional[list[dict]] = None,
+                 initial_cut: Optional[int] = None,
+                 initial_note: str = "") -> None:
         super().__init__(win)
         self.win = win
         self.seg = seg
@@ -3214,6 +3267,11 @@ class AddUtteranceDialog(tk.Toplevel):
         self.result: list[tuple[float, float, str, str, Optional[str]]] = []
         self.applied = False          # ［…にする］を押したか(やめる と区別)
         self._had_existing = bool(self._items)
+        # 候補から開いたときの初期位置(設計書 §10.3.3)。
+        # **話者は入れない。**機械が選んだ話者のまま押されると ✓ が立つ。
+        # ✓ は人が決めたという意味なので、そこは譲れない(CLAUDE.md)。
+        self._initial_cut = initial_cut
+        self._initial_note = initial_note
         self.title("聞こえた発話を足す"
                    + (f"（いま {len(self._items)} 件）" if self._items else ""))
         self.transient(win)
@@ -3240,10 +3298,15 @@ class AddUtteranceDialog(tk.Toplevel):
         self.txt.tag_configure("mark", foreground="#D84315",
                                font=("", 12, "bold"))
 
+        # 候補から開いたときの案内(設計書 §10.3.3)。ふだんは空。
+        self.var_from_cand = tk.StringVar(value="")
+        ttk.Label(box, textvariable=self.var_from_cand, foreground="#1B5E20",
+                  wraplength=600, justify="left").grid(
+            row=1, column=0, sticky="w", padx=8)
         self.var_where = tk.StringVar()
         ttk.Label(box, textvariable=self.var_where, foreground="#666",
                   wraplength=600, justify="left").grid(
-            row=1, column=0, sticky="w", padx=8, pady=(0, 6))
+            row=2, column=0, sticky="w", padx=8, pady=(0, 6))
 
         # --- 聴く ---------------------------------------------------------
         play = ttk.LabelFrame(self, text="聴く")
@@ -3338,6 +3401,19 @@ class AddUtteranceDialog(tk.Toplevel):
         self.bind("<Escape>", lambda e: self._cancel())
 
         self._render()
+        # 候補から開いたときは、その位置にカーソルを立てる(設計書 §10.3.3)。
+        # **位置は文字数按分の目安**なので、聴いて直す前提。
+        if self._initial_cut is not None:
+            self._cut = max(0, min(len(self.seg.text or ""),
+                                   int(self._initial_cut)))
+            try:
+                self.txt.mark_set(
+                    "insert", f"1.0 + {self._cut_to_disp(self._cut)} chars")
+            except tk.TclError:
+                pass
+            self._show_cut()
+        if self._initial_note:
+            self.var_from_cand.set(self._initial_note)
         ent.focus_set()
         self.grab_set()
 

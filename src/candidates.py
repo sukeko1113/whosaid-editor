@@ -131,6 +131,29 @@ def find_candidates(
     return out
 
 
+# 「もう足した」と見なす時間の余裕（秒）。
+# 足した発話の時刻は小窓の文字数按分から決まるので、turn の開始とは
+# ずれる。実データで **0.69〜1.07 秒** ずれていた（2026-08-19 実測）。
+DONE_SLACK_SECONDS = 1.0
+
+
+def done_keys(candidates: Sequence[VoiceCandidate],
+              added: Sequence[Segment],
+              slack: float = DONE_SLACK_SECONDS) -> set:
+    """人がもう発話を足した位置の候補。
+
+    **隠すのではなく印を付けるために使う。**隠すと「候補が無い＝やること
+    が無い」と読まれる。この道具の性格（印が無い＝安全ではない）と合わない。
+    """
+    out = set()
+    for c in candidates:
+        for a in added:
+            if a.start <= c.end + slack and a.end >= c.at - slack:
+                out.add(c.key)
+                break
+    return out
+
+
 def for_segment(candidates: Sequence[VoiceCandidate],
                 seg: Segment) -> list[VoiceCandidate]:
     """その区間に属する候補（鍵は orig_start）。"""

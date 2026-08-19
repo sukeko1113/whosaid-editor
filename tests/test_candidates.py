@@ -25,6 +25,8 @@ from src.candidates import (  # noqa: E402
     VoiceCandidate,
     coverage,
     dismissed_path,
+    done_keys,
+    DONE_SLACK_SECONDS,
     drop_dismissed,
     find_candidates,
     for_segment,
@@ -204,6 +206,52 @@ def test_sidecar_keeps_the_warning():
         assert "脱落の有無を表さない" in raw["note"]
         assert "31/34" in raw["measured"] and "51" in raw["measured"]
         assert raw["min_overlap_seconds"] == MIN_OVERLAP_SECONDS
+
+
+# --- もう足した位置（設計書 §10.3.2）----------------------------------
+def _added(start: float, end: float) -> Segment:
+    return Segment(index=99, start=start, end=end, text="はい",
+                   cluster="g:B", chunk=0)
+
+
+def test_done_marks_where_something_was_already_added():
+    """人がもう足した位置は「済」。**隠すのではなく印を付ける。**
+
+    隠すと「候補が無い＝やることが無い」と読まれ、この道具の性格
+    （印が無い＝安全ではない）と食い違う。
+    """
+    seg = _seg(0, 100.0, 110.0)
+    turns = [_turn(100.0, 110.0, 3), _turn(104.0, 105.0, 7),
+             _turn(107.0, 108.0, 8)]
+    got = find_candidates([seg], turns)
+    done = done_keys(got, [_added(104.2, 105.0)])
+    assert len(done) == 1
+    assert got[0].key in done and got[1].key not in done
+    assert len(got) == 2, "**候補そのものは減らさない**"
+
+
+def test_done_allows_for_the_time_gap():
+    """**足した時刻は turn の開始とずれる。**実データで 0.69〜1.07 秒。
+
+    小窓の時刻は本文の位置からの文字数按分で決まるので、声の始まりとは
+    一致しない。余裕を持たせないと、足したのにまた出てくる。
+    """
+    seg = _seg(0, 100.0, 110.0)
+    turns = [_turn(100.0, 110.0, 3), _turn(104.0, 104.5, 7)]
+    got = find_candidates([seg], turns)
+    assert done_keys(got, [_added(105.4, 106.2)]), "1 秒のずれを許していない"
+    assert not done_keys(got, [_added(108.0, 108.8)]), "離れすぎたものまで済にした"
+
+
+def test_done_slack_is_the_measured_value():
+    """**余裕を黙って変えない。**広げると別の相づちまで済にしてしまう。"""
+    assert DONE_SLACK_SECONDS == 1.0
+
+
+def test_done_is_empty_without_added_utterances():
+    seg = _seg(0, 100.0, 110.0)
+    turns = [_turn(100.0, 110.0, 3), _turn(104.0, 105.0, 7)]
+    assert done_keys(find_candidates([seg], turns), []) == set()
 
 
 # --- 作業量の目安 -----------------------------------------------------
