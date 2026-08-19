@@ -628,6 +628,78 @@ def run() -> int:
         pl4 = plan_roster_rows(rp, [(nishimura, "西村香介", ""), ("", "  ", "")])
         check("空の行は人として数えない", len(pl4.speakers) == 1)
 
+        # --- 時刻欄の事故を防ぐ（2026-08-19 の実機の指摘）-----------------
+        # ［時刻へ飛ぶ］のつもりで 00:35:09 を［開始］に打ち、Enter を
+        # 押していないのに記録へ入って区間が 2125 秒に膨らんだ。
+        tp = Project(audio_path=str(tmp / "meeting.m4a"),
+                     duration=3600.0, chunk_seconds=600)
+        tp.speakers = parse_roster("佐藤")
+        tp.segments = [
+            Segment(index=i, start=i * 20.0, end=i * 20.0 + 15.8,
+                    text=f"発言 {i}。", cluster="g:A", chunk=0)
+            for i in range(6)]
+        tp.json_path = str(tmp / "time.speakers.json")
+        tp.save()
+        twin = AssignWindow(root, tp)
+        twin.var_autoplay.set(False)
+        twin.update()
+
+        # ウ: 欄から離れただけでは書かない
+        twin.goto(0)
+        twin.var_start.set("00:35:09")
+        twin._discard_time_edit("start")
+        check("**欄から離れただけでは書かない**", tp.segments[0].start == 0.0)
+        check("捨てたことを黙らない", "Enter" in twin.var_action.get())
+        check("表示は元に戻る", twin.var_start.get().startswith("00:00:00"))
+
+        # イ: どの区間の欄かを見張る（本文欄と同じ守り）
+        twin.goto(0)
+        twin.var_end.set("00:00:18.0")
+        twin._time_index = 3                 # 別の区間の欄だったことにする
+        twin._commit_time("end", explicit=True)
+        check("**別の区間の欄なら書かない**", tp.segments[0].end == 15.8)
+        check("いまの区間も汚さない", tp.segments[3].end == 3 * 20.0 + 15.8)
+
+        # ア: ほかの区間をまたぐ長さは確認する
+        twin.goto(0)
+        twin._time_index = 0
+        asked_wide: list = []
+        real_yn = assign_gui.messagebox.askyesno
+        assign_gui.messagebox.askyesno = lambda *a, **k: (
+            asked_wide.append(a), False)[1]
+        try:
+            twin.var_end.set("00:01:40.0")   # 100 秒 = 区間 1〜4 をまたぐ
+            twin._commit_time("end", explicit=True)
+        finally:
+            assign_gui.messagebox.askyesno = real_yn
+        check("**またぐ長さは確認する**", bool(asked_wide))
+        check("何区間またぐか伝える",
+              asked_wide and "区間" in str(asked_wide[0]))
+        check("いいえなら書かない", tp.segments[0].end == 15.8)
+
+        # はいなら書く
+        assign_gui.messagebox.askyesno = lambda *a, **k: True
+        try:
+            twin.var_end.set("00:01:40.0")
+            twin._commit_time("end", explicit=True)
+        finally:
+            assign_gui.messagebox.askyesno = real_yn
+        check("はいなら書く", abs(tp.segments[0].end - 100.0) < 0.05)
+
+        # 短い直しでは聞かない（毎回聞かれると使えない）
+        twin.goto(2)
+        twin._time_index = 2
+        asked2: list = []
+        assign_gui.messagebox.askyesno = lambda *a, **k: (asked2.append(1), True)[1]
+        try:
+            twin.var_end.set("00:00:56.0")   # 元 55.8 → 56.0（0.2 秒）
+            twin._commit_time("end", explicit=True)
+        finally:
+            assign_gui.messagebox.askyesno = real_yn
+        check("短い直しでは聞かない", not asked2)
+        twin.player.close()
+        twin.destroy()
+
         # --- 名簿を 2 列の表で編集する(設計書 §11.8)-----------------------
         rd = RosterDialog(root, parse_roster(chr(10).join([
             "三ツ林衆議院議員", "山本学　文科省　高等教育局私学部参事官付 企画官",

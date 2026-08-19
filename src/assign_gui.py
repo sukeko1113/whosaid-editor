@@ -813,7 +813,13 @@ class AssignWindow(tk.Toplevel):
             # Enter は「この値でいい」という意思表示。ずれ補正込みの初期値を
             # そのまま押しても、その時刻でこの区間を固定する。
             ent.bind("<Return>", lambda e, w=which: self._commit_time(w, explicit=True))
-            ent.bind("<FocusOut>", lambda e, w=which: self._commit_time(w))
+            # **欄から離れただけでは書かない。**打ち間違えた時刻が、Enter を
+            # 押していないのに記録へ入る事故が起きた(実機・2026-08-19。
+            # ［時刻へ飛ぶ］のつもりで 00:35:09 を［開始］に打ち、区間が
+            # 0〜35:25 の 2125 秒に膨らんだ)。**「検証済みの記録」を売る製品で、
+            # 欄を通り過ぎただけで記録が変わるのは筋が悪い。**
+            # 打ちかけの値は捨て、Enter か［この時刻で確認］を促す。
+            ent.bind("<FocusOut>", lambda e, w=which: self._discard_time_edit(w))
             for text, delta in (("−1", -1.0), ("−0.1", -0.1), ("+0.1", +0.1), ("+1", +1.0)):
                 ttk.Button(
                     row_time, text=text, width=5, takefocus=False,
@@ -1625,15 +1631,41 @@ class AssignWindow(tk.Toplevel):
         start, end = time_edit_base(seg, self.proj.time_offset)
         self.var_start.set(fmt_hms_frac(start))
         self.var_end.set(fmt_hms_frac(end))
+        self._time_index = self.current   # この欄がどの区間のものか（§_commit_time）
         self.btn_revert_time.state(["!disabled"] if seg.time_edited else ["disabled"])
         # 確認済みの区間で押しても意味がない(それ以外は押せる。まだ直して
         # いない区間でも「聴いてこの時刻で合っている」と言えるため)
         done = seg.time_edited and seg.time_reviewed
         self.btn_confirm_time.state(["disabled"] if done else ["!disabled"])
 
-    def _commit_time(self, which: str, explicit: bool = False) -> None:
-        """入力欄の値を区間に反映する。読めない値は元に戻して知らせる。"""
+    def _discard_time_edit(self, which: str) -> None:
+        """欄から離れたときの後始末。**書かずに表示だけ元へ戻す。**
+
+        打ちかけの値をそのまま残すと、次に Enter を押したときに別の区間へ
+        入る。捨てたことを黙らない（打った本人は入ったつもりでいる）。
+        """
         if not self.proj.segments:
+            return
+        var = self.var_start if which == "start" else self.var_end
+        typed = var.get()
+        self._show_times()
+        if typed.strip() != var.get().strip():
+            self._set_action(
+                "時刻は変えていません。変えるには Enter か"
+                "［この時刻で確認］を押してください。")
+
+    def _commit_time(self, which: str, explicit: bool = False) -> None:
+        """入力欄の値を区間に反映する。読めない値は元に戻して知らせる。
+
+        **この欄がどの区間のものかを確かめてから書く。**確かめずに書くと、
+        区間を移った直後に前の区間の値が入る（本文欄で同じ穴を塞いだのに
+        時刻欄に残っていた・2026-08-19）。
+        """
+        if not self.proj.segments:
+            return
+        loaded = getattr(self, "_time_index", None)
+        if loaded is not None and loaded != self.current:
+            self._show_times()
             return
         var = self.var_start if which == "start" else self.var_end
         try:
@@ -1691,6 +1723,14 @@ class AssignWindow(tk.Toplevel):
             self._show_times()
             return
 
+        # **他の区間を丸ごとまたぐ長さになるなら、黙って通さない。**
+        # 打ち間違いで 15.8 秒の区間が 2125 秒になり、290 区間をまたいだ
+        # (実機・2026-08-19)。形式としては正しい時刻なので、書式の検査では
+        # 止まらない。**長さの筋が通っているかは、ここでしか見られない。**
+        if not self._confirm_wide_span(seg, start, end):
+            self._show_times()
+            return
+
         self._write_times(seg, start, end, reviewed=True)
         tail_only = moved == "end"
         self._set_action(
@@ -1704,6 +1744,30 @@ class AssignWindow(tk.Toplevel):
                 self.play_tail()
             else:
                 self.play_current()
+
+    # またぐ区間がこの数以上なら確認する。1 つ重なるのは相づちなどで普通に
+    # 起きるが、2 つ以上を丸ごと飲み込むのは打ち間違いの疑いが濃い。
+    WIDE_SPAN_SEGMENTS = 2
+    # 短い区間の微調整で毎回聞かれないよう、長さの下限も置く
+    WIDE_SPAN_SECONDS = 60.0
+
+    def _confirm_wide_span(self, seg: Segment, start: float,
+                           end: float) -> bool:
+        """他の区間をまたぐ長さなら確認する。続けてよければ True。"""
+        if end - start < self.WIDE_SPAN_SECONDS:
+            return True
+        covered = [s for s in self.proj.segments
+                   if s.index != seg.index and start < s.start < end]
+        if len(covered) < self.WIDE_SPAN_SEGMENTS:
+            return True
+        br = chr(10)
+        return bool(messagebox.askyesno(
+            "確認",
+            f"この区間の長さが {end - start:.0f} 秒になり、"
+            f"ほかの {len(covered)} 区間を丸ごとまたぎます。{br}{br}"
+            f"{fmt_hms_frac(start)} → {fmt_hms_frac(end)}{br}{br}"
+            "打ち間違いではありませんか?",
+            parent=self, default="no"))
 
     def play_tail(self) -> None:
         """いまの区間の終わりだけを鳴らす。
