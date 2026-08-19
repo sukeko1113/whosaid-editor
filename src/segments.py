@@ -604,6 +604,36 @@ def merge_same_speaker(
     return out
 
 
+# 語句を探すときに前後を何文字見せるか。**文脈が無いと判断できない。**
+# 「資格」は 10 回出るが、うち 1 回は本物の資格(防災士の資格)で、直しては
+# いけない。時刻と語だけを並べても○×は付けられない(設計書 §16.3)。
+CONTEXT_CHARS = 22
+
+
+@dataclass(frozen=True)
+class TextHit:
+    """本文に語句が出てくる 1 箇所。**判定は出さない。**
+
+    `listen_order` / `candidates` と同じ線で、これは「見る場所を並べる」道具。
+    直すかどうかは人が前後を読んで決める(設計書 §16.3)。
+    """
+
+    key: tuple[float, float]    # 区間を指す鍵(segment_key)
+    nth: int                    # その区間の中で何番目に出たか(0 から)
+    at: float                   # 区間の開始秒(表示用)
+    index: int                  # 区間番号。**表示だけ。**鍵には使わない
+    before: str                 # 語句の手前(CONTEXT_CHARS 文字まで)
+    term: str                   # 語句そのもの
+    after: str                  # 語句の後ろ(CONTEXT_CHARS 文字まで)
+    head: bool                  # 手前が切り詰められているか(… を出すため)
+    tail: bool                  # 後ろが切り詰められているか
+
+    @property
+    def target(self) -> tuple[tuple[float, float], int]:
+        """`replace_text` に渡す指定。"""
+        return (self.key, self.nth)
+
+
 # ----------------------------------------------------------------------
 # プロジェクト(1 音声ファイル分の作業状態)
 # ----------------------------------------------------------------------
@@ -958,6 +988,84 @@ class Project:
         self._log("edit_text", segment=self._key(seg),
                   before=before, after=new_text)
         return True
+
+    def find_text(self, term: str) -> list[TextHit]:
+        """本文に `term` が出てくる箇所を、前後の文脈つきで全部並べる。
+
+        **1 回の出現につき 1 件返す。**同じ区間に 2 回出ることがある
+        (実データ「同層会ですね同層会が」)。区間単位にまとめると、片方だけ
+        直したい場合に手が出せない。
+        """
+        term = term or ""
+        if not term:
+            return []
+        out: list[TextHit] = []
+        for seg in self.segments:
+            text = seg.text or ""
+            pos = text.find(term)
+            nth = 0
+            while pos >= 0:
+                lo = max(0, pos - CONTEXT_CHARS)
+                hi = min(len(text), pos + len(term) + CONTEXT_CHARS)
+                out.append(TextHit(
+                    key=segment_key(seg), nth=nth, at=float(seg.start),
+                    index=seg.index,
+                    before=text[lo:pos], term=term,
+                    after=text[pos + len(term):hi],
+                    head=lo > 0, tail=hi < len(text)))
+                nth += 1
+                pos = text.find(term, pos + len(term))
+        return out
+
+    def replace_text(self, before: str, after: str,
+                     targets: Sequence[tuple[tuple[float, float], int]]) -> int:
+        """選ばれた箇所だけ語句を置き換える。直した箇所数を返す。
+
+        **一括で置き換えない。**「資格」は 10 回出るが 1 回は本物なので、
+        全部を機械的に直すと本文が壊れる(設計書 §16.3)。どこを直すかは
+        呼び出し側(画面)で人が選ぶ。
+
+        **記録は 1 件。**人の判断は「吉田は吉沢の聞き違いだ」の 1 回であって、
+        区間の数だけ判断したわけではない(編集履歴設計書 §1.1)。
+
+        **`reviewed` の ✓ は立てない。**人が音声を聴いて確かめたわけでは
+        ないため(CLAUDE.md)。`text_edited` は立てる——人が直した本文なので、
+        再実行で機械の出力に戻されては困る。
+        """
+        before = before or ""
+        if not before or before == after:
+            return 0
+        by_key: dict[tuple[float, float], set[int]] = {}
+        for key, nth in targets:
+            by_key.setdefault((round(float(key[0]), 3),
+                               round(float(key[1]), 3)), set()).add(int(nth))
+        done = 0
+        touched: list[list[float]] = []
+        for seg in self.segments:
+            want = by_key.get(segment_key(seg))
+            if not want:
+                continue
+            text, out, pos, nth = seg.text or "", [], 0, 0
+            at = text.find(before)
+            while at >= 0:
+                out.append(text[pos:at])
+                out.append(after if nth in want else before)
+                done += nth in want
+                pos = at + len(before)
+                nth += 1
+                at = text.find(before, pos)
+            out.append(text[pos:])
+            new_text = "".join(out)
+            if new_text == seg.text:
+                continue                    # 指定が古い(本文が変わっていた)
+            seg.text = new_text
+            seg.text_edited = True
+            touched.append(self._key(seg))
+        if not done:
+            return 0
+        self._log("replace_text_bulk", before=before, after=after,
+                  targets=touched, count=done, segments=len(touched))
+        return done
 
     def edit_time(self, index: int, start: float, end: float,
                   reviewed: bool, _log: bool = True) -> bool:
@@ -1474,6 +1582,7 @@ LOG_LABELS = {
     "undo_assign": "話者の取り消し",
     "clear_speakers": "名簿から外れた割当",
     "edit_text": "本文",
+    "replace_text_bulk": "語句(まとめて)",
     "edit_time": "時刻",
     "apply_times_bulk": "時刻(まとめて)",
     "revert_time": "時刻を戻した",

@@ -55,6 +55,8 @@ from src.segments import (  # noqa: E402
     speaker_label, build_log_summary, fmt_log_at, LOG_LABELS,
     build_verification,
     INSERT_STYLE_LINE, INSERT_STYLE_INLINE, INSERT_LEGEND, CONTINUE_MARK)
+from src.segments import TextHit, CONTEXT_CHARS  # noqa: E402,F401
+from src.segments import segment_key  # noqa: E402
 from src.segments import (  # noqa: E402
     PSEUDO_UNKNOWN,
     Utterance,
@@ -2991,6 +2993,96 @@ def test_removing_one_of_two_leaves_the_other_removable():
     proj.remove_added_utterance(left[0].index)
     assert not [s for s in proj.segments if s.text in ("はい", "ええ")]
     assert a.text == "はい"      # 消したのは指したものだけ
+
+
+def _for_replace() -> Project:
+    """実データの形をなぞる。**「資格」は本物と誤りが混ざっている。**"""
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("西村" + chr(10) + "山本")
+    proj.segments = [
+        Segment(index=0, start=10.0, end=20.0, cluster="g:A",
+                text="前のPTAの会長さんは防災士の資格も取ってらっしゃって"),
+        Segment(index=1, start=20.0, end=30.0, cluster="g:B",
+                text="県は資格のことですからと言うだけで"),
+        Segment(index=2, start=30.0, end=40.0, cluster="g:C",
+                text="同層会ですね同層会があのー"),
+    ]
+    return proj
+
+
+def test_find_text_returns_one_hit_per_occurrence():
+    """**同じ区間に 2 回出たら 2 件返す。**
+
+    実データ「同層会ですね同層会が」。区間単位にまとめると、片方だけ
+    直したい場合に手が出せない。
+    """
+    proj = _for_replace()
+    hits = proj.find_text("同層会")
+    assert len(hits) == 2, [h.before + h.term + h.after for h in hits]
+    assert [h.nth for h in hits] == [0, 1]
+    assert all(h.key == segment_key(proj.segments[2]) for h in hits)
+
+
+def test_find_text_carries_context():
+    """**前後が無いと○×を付けられない。**「資格」は本物と誤りが混ざる。"""
+    proj = _for_replace()
+    hits = proj.find_text("資格")
+    assert len(hits) == 2
+    whole = [h.before + h.term + h.after for h in hits]
+    assert "防災士の資格" in whole[0], whole
+    assert "資格のことですから" in whole[1], whole
+
+
+def test_replace_text_only_touches_the_chosen_places():
+    """**選んだ箇所だけ直す。**全部置き換えると本物の「資格」が壊れる。"""
+    proj = _for_replace()
+    hits = proj.find_text("資格")
+    wrong = [h for h in hits if "ことですから" in h.after]
+    assert len(wrong) == 1
+    n = proj.replace_text("資格", "私学", [h.target for h in wrong])
+    assert n == 1
+    assert proj.segments[0].text.endswith("防災士の資格も取ってらっしゃって")
+    assert proj.segments[1].text == "県は私学のことですからと言うだけで"
+
+
+def test_replace_text_can_pick_one_of_two_in_a_segment():
+    """同じ区間の 2 回のうち、後ろだけ直す。"""
+    proj = _for_replace()
+    hits = proj.find_text("同層会")
+    assert proj.replace_text("同層会", "同窓会", [hits[1].target]) == 1
+    assert proj.segments[2].text == "同層会ですね同窓会があのー"
+
+
+def test_replace_text_records_one_judgement():
+    """**14 箇所直しても、人の判断は 1 回。**記録も 1 件（編集履歴 §1.1）。"""
+    proj = _for_replace()
+    hits = proj.find_text("同層会")
+    proj.replace_text("同層会", "同窓会", [h.target for h in hits])
+    recs = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
+    assert len(recs) == 1, proj.edit_log
+    assert recs[0]["before"] == "同層会" and recs[0]["after"] == "同窓会"
+    assert recs[0]["count"] == 2 and recs[0]["segments"] == 1
+    assert "replace_text_bulk" in LOG_LABELS, "検証要約に op 名のまま出てしまう"
+
+
+def test_replace_text_never_marks_reviewed():
+    """**機械が ✓ を立てる経路は作らない。**製品価値そのもの（CLAUDE.md）。"""
+    proj = _for_replace()
+    hits = proj.find_text("同層会")
+    proj.replace_text("同層会", "同窓会", [h.target for h in hits])
+    seg = proj.segments[2]
+    assert seg.reviewed is False, "聴いていないのに確定になった"
+    assert seg.text_edited is True, "再実行で機械の出力に戻される"
+
+
+def test_replace_text_does_nothing_without_a_target():
+    """空・同じ語・対象なしでは、記録も残さない（編集履歴 §1.5）。"""
+    proj = _for_replace()
+    assert proj.replace_text("", "私学", []) == 0
+    assert proj.replace_text("資格", "資格", []) == 0
+    assert proj.replace_text("資格", "私学", []) == 0
+    assert proj.find_text("") == []
+    assert not [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
 
 
 # ======================================================================
