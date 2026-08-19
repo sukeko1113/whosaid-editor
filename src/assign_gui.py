@@ -28,6 +28,7 @@ from typing import Iterable, Optional, Sequence
 from .align import DEFAULT_MODEL, AlignUnavailable, transcribe_words
 from .audio import audio_hashes, extract_peaks
 from .config import load_config
+from . import candidates as cand_mod
 from . import listen_order
 from .inspection import (
     Proposal,
@@ -234,11 +235,15 @@ QUICK_KEYS = "123456789"
 FILTER_ALL = "all"
 FILTER_UNASSIGNED = "unassigned"
 FILTER_UNREVIEWED = "unreviewed"
+FILTER_CANDIDATES = "candidates"
 
 FILTER_LABELS = [
     ("すべて表示", FILTER_ALL),
     ("未確定のみ", FILTER_UNASSIGNED),
     ("未確認のみ(一括適用したぶんを含む)", FILTER_UNREVIEWED),
+    # 区間の中に別の声がある区間だけ(設計書 §10.3)。**判定ではない**——
+    # 候補が無い区間にも取りこぼしはある。適合は 35/51 で 3 割は空振り。
+    ("候補のみ(別の声)", FILTER_CANDIDATES),
 ]
 
 
@@ -644,6 +649,13 @@ class AssignWindow(tk.Toplevel):
         self.var_listen_order = tk.BooleanVar(value=False)
         # orig_start(丸め) → ListenHint。無ければ None(=並べ替えは出せない)
         self._listen_hints = self._load_listen_hints()
+        # 候補の一覧(設計書 §10.3)。**検出器ではない**——候補が無い
+        # 区間にも取りこぼしはある。却下は sidecar に残す(空振りが 3 割)。
+        self._dismissed = cand_mod.load_dismissed(cand_mod.dismissed_path(
+            self._work_dir(), project.audio_fingerprint or ""))
+        self._voice_candidates: list = []
+        self._current_voice_candidates: list = []
+        self.var_cand = tk.StringVar(value="")
         self.var_status = tk.StringVar(value="")
         self.var_seginfo = tk.StringVar(value="")
         self.var_action = tk.StringVar(value="")
@@ -654,6 +666,9 @@ class AssignWindow(tk.Toplevel):
 
         self._build_ui()
         self._bind_keys()
+        # 候補は turn から作る。話者分離を通していなければ空のまま
+        # (呼び出し側で「使えない」と伝える)。
+        self._voice_candidates = self._load_voice_candidates()
         # 声のまとまりが 1 つも無い作業ファイル(ローカル転写)では、一括適用は
         # 成り立たない。ON のまま残すと確定のたびに「一括適用できません」の
         # 警告が出る——1219 区間なら 1219 回になる。最初から外しておく。
@@ -838,9 +853,34 @@ class AssignWindow(tk.Toplevel):
             row_add, text="この区間を消す", takefocus=False,
             command=self.remove_added, state="disabled")
         self.btn_del_added.pack(side="left", padx=6)
-        ttk.Label(row_add, foreground="#666", text="（聞こえたのに本文に無い"
-                  "別の人の発話を、本文の位置を指して足します）").pack(
-            side="left", padx=(10, 0))
+        # 候補の一覧(設計書 §10.3)。**行を増やさない。**右ペインは既に
+        # 詰まっており、行を足すと下の保存ボタンが隠れる(実機の指摘)。
+        # **幅の余裕も 21px しか無い**(要 571 / 幅 592)ので、説明文と候補は
+        # 排他にする——同時には出さない。どちらか広いほうがこの行の幅になる。
+        # **短くしてある。**元の説明文は 360px あり、右ペイン(520px)に
+        # 収まっていなかった(2026-08-19 に実測)。
+        self.lbl_cand = ttk.Label(
+            row_add, foreground="#666",
+            text="（本文に無い発話を、位置を指して足します）")
+        self.lbl_cand.pack(side="left", padx=(10, 0))
+
+        self.frm_cand = ttk.Frame(row_add)
+        ttk.Label(self.frm_cand, text="別の声:").pack(side="left", padx=(8, 3))
+        self.cmb_cand = ttk.Combobox(self.frm_cand, textvariable=self.var_cand,
+                                     width=10, state="disabled",
+                                     takefocus=False)
+        self.cmb_cand.pack(side="left")
+        self.btn_cand_add = ttk.Button(
+            self.frm_cand, text="ここから", takefocus=False,
+            state="disabled", command=self.add_from_voice_candidate)
+        self.btn_cand_add.pack(side="left", padx=(4, 0))
+        self.btn_cand_skip = ttk.Button(
+            self.frm_cand, text="×", width=3, takefocus=False,
+            state="disabled", command=self.dismiss_voice_candidate)
+        self.btn_cand_skip.pack(side="left", padx=(2, 0))
+        self.lbl_cand_note = ttk.Label(self.frm_cand, foreground="#666",
+                                       text="")
+        self.lbl_cand_note.pack(side="left", padx=(8, 0))
 
         frm_text = ttk.LabelFrame(right, text="この区間の発言(編集できます)")
         frm_text.grid(row=2, column=0, sticky="nsew", padx=4, pady=2)
@@ -1101,7 +1141,95 @@ class AssignWindow(tk.Toplevel):
             return not seg.speaker_id
         if mode == FILTER_UNREVIEWED:
             return not (seg.speaker_id and seg.reviewed)
+        if mode == FILTER_CANDIDATES:
+            return bool(self._voice_candidates_for(seg))
         return True
+
+    # --- 候補の一覧(設計書 §10.3)------------------------------------
+    def _load_voice_candidates(self) -> list:
+        """区間の中の「別の声」を集める。話者分離が無ければ空。
+
+        **これは検出器ではない。**適合 35/51・再現 31/34 で、候補が無い区間
+        にも取りこぼしはある。判定は出さず、聴く場所を絞るためだけに使う。
+        """
+        try:
+            turns = self._load_turns()
+            if not turns:
+                return []
+            got = cand_mod.find_candidates(self.proj.segments, turns)
+            return cand_mod.drop_dismissed(got, self._dismissed)
+        except Exception:
+            return []
+
+    def _dismissed_path(self):
+        return cand_mod.dismissed_path(
+            self._work_dir(), self.proj.audio_fingerprint or "")
+
+    def _voice_candidates_for(self, seg) -> list:
+        return cand_mod.for_segment(self._voice_candidates, seg)
+
+    def _refresh_voice_candidates(self, keep: bool = False) -> None:
+        """候補を作り直して画面に反映する。keep=True なら選択位置を保つ。"""
+        if not keep:
+            self._voice_candidates = self._load_voice_candidates()
+        self._show_voice_candidates()
+
+    def _show_voice_candidates(self) -> None:
+        """いまの区間の候補を、足す行の右側に出す(高さを増やさない)。"""
+        if not self.proj.segments:
+            return
+        seg = self.proj.segments[self.current]
+        items = self._voice_candidates_for(seg)
+        self._current_voice_candidates = items
+        if not items:
+            self.frm_cand.pack_forget()             # 幅を空ける(排他)
+            self.lbl_cand.pack(side="left", padx=(10, 0))
+            self.cmb_cand.configure(values=[], state="disabled")
+            self.var_cand.set("")
+            self.btn_cand_add.configure(state="disabled")
+            self.btn_cand_skip.configure(state="disabled")
+            return
+        self.lbl_cand.pack_forget()
+        self.frm_cand.pack(side="left")
+        labels = [f"{fmt_hms(c.at)} {self._voice_label(c.speaker)}"
+                  for c in items]
+        self.cmb_cand.configure(values=labels, state="readonly")
+        self.cmb_cand.current(0)
+        self.btn_cand_add.configure(state="normal")
+        self.btn_cand_skip.configure(state="normal")
+        # **言い切らない。**3 割は空振りで、候補が無い区間にも脱落はある。
+        # 件数は選択肢の一覧で分かる。**「空振りあり」は落とさない**——
+        # 3 割は外れるので、書かないと「候補＝脱落」と読まれる。
+        self.lbl_cand_note.configure(text="空振りあり")
+
+    def _selected_voice_candidate(self):
+        items = getattr(self, "_current_voice_candidates", [])
+        i = self.cmb_cand.current()
+        return items[i] if 0 <= i < len(items) else None
+
+    def add_from_voice_candidate(self) -> None:
+        """選んだ候補の位置から［＋この声を足す］を開く(単位 3 で位置を渡す)。"""
+        c = self._selected_voice_candidate()
+        if c is None:
+            return
+        self.add_utterance()
+
+    def dismiss_voice_candidate(self) -> None:
+        """× — この候補は違った、と記録する。**次からは出てこない。**
+
+        空振りが 3 割あるので、捨てた判断が残らないと毎回出てきて使えない。
+        """
+        c = self._selected_voice_candidate()
+        if c is None:
+            return
+        self._dismissed.append(c.key)
+        cand_mod.save_dismissed(self._dismissed_path(), self._dismissed)
+        self._voice_candidates = cand_mod.drop_dismissed(self._voice_candidates, [c.key])
+        self._show_voice_candidates()
+        if self.var_filter.get() == FILTER_CANDIDATES:
+            self.reload_tree()
+        self._set_action(
+            f"{fmt_hms(c.at)} の候補を外しました(次からは出ません)。")
 
     def _load_listen_hints(self):
         """聴く順の sidecar を読む。無ければ None(並べ替えは出せない)。
@@ -1151,7 +1279,20 @@ class AssignWindow(tk.Toplevel):
         if vis and self.current not in vis:
             self.goto(vis[0])
         label = dict((v, k) for k, v in FILTER_LABELS).get(self.var_filter.get(), "")
-        self._set_action(f"表示: {label}({len(vis)} 区間)")
+        if self.var_filter.get() != FILTER_CANDIDATES:
+            self._set_action(f"表示: {label}({len(vis)} 区間)")
+            return
+        # **言い切らない。**適合 35/51 で 3 割は空振り、再現 31/34 なので
+        # 候補の無い区間にも取りこぼしはある。「ここだけ見れば済む」とは
+        # 読ませない(listen_order と同じ線)。
+        if not self._voice_candidates:
+            self._set_action(
+                "候補を出せません。話者分離を通した作業ファイルでだけ使えます。")
+            return
+        self._set_action(
+            f"別の声がある区間 {len(vis)}/{self.proj.total_count} を出しました"
+            f"(候補 {len(self._voice_candidates)} 箇所)。"
+            "3 割ほどは空振りです。候補の無い区間にも取りこぼしはあります。")
 
     def _on_listen_order_change(self) -> None:
         self.reload_tree()
@@ -1369,7 +1510,8 @@ class AssignWindow(tk.Toplevel):
         self.txt_body.delete("1.0", "end")
         self.txt_body.insert("1.0", seg.text)
         self._body_index = self.current   # この欄がどの区間のものか（§_commit_text）
-        self._rebuild_candidates()
+        self._rebuild_candidates()      # 話者の候補(suggest.py)
+        self._show_voice_candidates()   # 声の候補(candidates.py・§10.3)
         self._draw_timeline()
         # 消せるのは人が足した区間だけ。**音声認識が出した区間には削除の
         # 入口を作らない**(短い相づちの自動削除をしない原則)。

@@ -1155,6 +1155,77 @@ def run() -> int:
                   not any(s.text == "はいはい" for s in ap.segments))
             check("元の 4 区間は残る", len(ap.segments) == 4)
 
+        # --- 候補の一覧（設計書 §10.3）------------------------------------
+        # **検出器ではない。**適合 35/51 で 3 割は空振り、再現 31/34 なので
+        # 候補の無い区間にも取りこぼしはある。言い切っていないことも見る。
+        from src.diarize import SpeakerTurn
+
+        check("話者分離が無ければ候補は空", awin._voice_candidates == [])
+        awin.var_filter.set(assign_gui.FILTER_CANDIDATES)
+        awin._on_filter_change()
+        check("使えないと知らせる（黙って 0 件にしない）",
+              "話者分離" in awin.var_action.get())
+
+        # turn を差し替えて候補を作る（区間 1 の中に別の声）
+        real_turns = awin._load_turns
+        awin._load_turns = lambda: [
+            SpeakerTurn(start=10.0, end=18.0, speaker=1),
+            SpeakerTurn(start=13.0, end=13.9, speaker=2),
+            SpeakerTurn(start=15.5, end=16.2, speaker=3),
+            SpeakerTurn(start=20.0, end=28.0, speaker=1),
+        ]
+        try:
+            awin._voice_candidates = awin._load_voice_candidates()
+            check("区間の中の別の声を拾う", len(awin._voice_candidates) == 2)
+            awin.goto(1)
+            awin.update()
+            check("選択肢に時刻と声が出る",
+                  len(awin.cmb_cand.cget("values")) == 2
+                  and "声" in awin.cmb_cand.cget("values")[0])
+            check("候補があればボタンが押せる",
+                  str(awin.btn_cand_add.cget("state")) == "normal")
+            check("**言い切らない**（空振りがあると書く）",
+                  "空振り" in str(awin.lbl_cand_note.cget("text")))
+            check("選択肢は時刻と声で読める",
+                  ":" in awin.cmb_cand.cget("values")[0])
+
+            # 絞り込み
+            awin.var_filter.set(assign_gui.FILTER_CANDIDATES)
+            awin._on_filter_change()
+            check("候補のある区間だけ出す", awin._visible_indexes() == [1])
+            check("取りこぼしの言い方を弱めない",
+                  "空振り" in awin.var_action.get()
+                  and "取りこぼし" in awin.var_action.get())
+
+            # × で捨てる
+            awin.goto(1)
+            first = awin._current_voice_candidates[0]
+            awin.cmb_cand.current(0)
+            awin.dismiss_voice_candidate()
+            check("× で候補が減る", len(awin._voice_candidates) == 1)
+            check("消したと知らせる", "外しました" in awin.var_action.get())
+            check("**判断が残る**（作り直しても出てこない）",
+                  first.key not in
+                  [c.key for c in awin._load_voice_candidates()])
+
+            # 候補が無くなれば、説明に戻る
+            awin.cmb_cand.current(0)
+            awin.dismiss_voice_candidate()
+            awin._show_voice_candidates()
+            awin.update()
+            check("候補が尽きたらボタンを止める",
+                  str(awin.btn_cand_add.cget("state")) == "disabled")
+            check("元の説明に戻る", awin.lbl_cand.winfo_ismapped()
+                  and not awin.frm_cand.winfo_ismapped())
+        finally:
+            awin._load_turns = real_turns
+            awin.var_filter.set(assign_gui.FILTER_ALL)
+            awin._on_filter_change()
+
+        # 話者の候補（suggest.py）と混ざっていないこと
+        check("話者の候補とは別物のまま",
+              awin._candidates is not awin._voice_candidates)
+
         # --- 既定の窓幅で、右ペインのボタンが全部見えること ---------------
         # 「右側が切れて表示されます。［＋この声を足す...］ボタンを表示させる
         # には、ウィンドウを広げる必要がある」(実機の指摘・2026-08-18)。
@@ -1162,8 +1233,12 @@ def run() -> int:
         awin.update()
         _frm = awin.btn_del_added.master.master
         _rows = [r for r in _frm.winfo_children() if r.winfo_children()]
-        _need = max(sum(c.winfo_reqwidth() for c in r.winfo_children()) + 20
-                    for r in _rows)
+        # **見えている部品だけ数える。**説明文と候補の選択肢は排他で、
+        # 同時には出ない(設計書 §10.3)。両方を足すと実際より広く見積もる。
+        def _row_need(r):
+            return sum(c.winfo_reqwidth() for c in r.winfo_children()
+                       if c.winfo_ismapped()) + 20
+        _need = max(_row_need(r) for r in _rows)
         _have = _frm.master.winfo_width()
         check(f"既定の幅で右ペインのボタン列が収まる（要 {_need} / 幅 {_have}）",
               _have >= _need)
@@ -1171,6 +1246,33 @@ def run() -> int:
               awin.btn_del_added.winfo_x() + awin.btn_del_added.winfo_width()
               <= _have)
         check("行を分けてある（1 行に詰めない）", len(_rows) >= 4)
+
+        # 候補を出した状態でも収まること（説明文と排他にしてある）
+        from src.diarize import SpeakerTurn as _ST
+        _real_turns2 = awin._load_turns
+        awin._load_turns = lambda: [
+            _ST(start=10.0, end=18.0, speaker=1),
+            _ST(start=13.0, end=13.9, speaker=2)]
+        _real_dismissed = awin._dismissed
+        awin._dismissed = []      # 上の検査で × を付けたぶんを外す
+        try:
+            awin._voice_candidates = awin._load_voice_candidates()
+            awin.goto(1)
+            awin.update()
+            check("候補が出ている（この検査の前提）",
+                  len(awin._current_voice_candidates) >= 1)
+            _row = awin.btn_cand_add.master.master
+            check("候補を出しても収まる（要 "
+                  + str(_row_need(_row)) + " / 幅 " + str(_have) + "）",
+                  _have >= _row_need(_row))
+            check("候補が出ている間は説明文を出さない（幅の取り合い）",
+                  not awin.lbl_cand.winfo_ismapped())
+        finally:
+            awin._load_turns = _real_turns2
+            awin._dismissed = _real_dismissed
+            awin._voice_candidates = []
+            awin._show_voice_candidates()
+            awin.update()
 
         # 高さ: **画面より大きくしない**(はみ出すと下の［保存］が画面外に出る)
         check("窓が画面からはみ出さない",
