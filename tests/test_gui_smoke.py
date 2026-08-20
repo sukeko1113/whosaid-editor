@@ -2136,6 +2136,16 @@ def run_main_window() -> int:
                     app._update_engine_state()
                     check("経路を往復しても戻らない",
                           app.var_model.get() == "large-v3")
+                    # **他方の経路の欄に漏らさない。**確かめずに書いて
+                    # いたため、ローカルで選んだ large-v3 がクラウドの欄に
+                    # 入り、設定ファイルが壊れていた(実機で発生・
+                    # 2026-08-20。model が 'large-v3' になっていた)。
+                    check("クラウドの欄に漏れていない",
+                          app._model_by_engine[main_gui.ENGINE_CLOUD]
+                          in main_gui.MODELS)
+                    check("設定のクラウド側も汚れていない",
+                          _saved.get("model", main_gui.MODELS[0])
+                          in main_gui.MODELS)
                 finally:
                     main_gui.save_config = _real_save
                     app.var_model.set("small")

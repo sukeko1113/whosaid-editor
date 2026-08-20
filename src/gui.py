@@ -514,9 +514,14 @@ class App(tk.Tk):
         local = self.var_engine.get() == ENGINE_LOCAL
         other = ENGINE_CLOUD if local else ENGINE_LOCAL
 
-        # いま表示しているモデルを、切り替える前の経路の側に覚えておく
-        if self.var_model.get():
-            self._model_by_engine[other] = self.var_model.get()
+        # いま表示しているモデルを、切り替える前の経路の側に覚えておく。
+        # **その経路で使えるモデルのときだけ。**確かめずに書いていたため、
+        # ローカルで選んだ large-v3 がクラウドの欄に入り、設定ファイルが
+        # 壊れていた(実機で発生・2026-08-20。model が 'large-v3' に
+        # なっていた)。画面上は候補に無い値が捨てられるので気づけない。
+        now = self.var_model.get()
+        if now and now in (MODELS if other == ENGINE_CLOUD else LOCAL_MODELS):
+            self._model_by_engine[other] = now
 
         # 逐語モードは灰色にするだけでなく、チェックも外す。入ったまま
         # 灰色にすると「有効なのに触れない」と読めてしまい、実際には
