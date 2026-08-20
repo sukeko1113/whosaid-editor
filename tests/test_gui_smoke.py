@@ -2116,6 +2116,32 @@ def run_main_window() -> int:
                       "誤字" in _txt and "速く" in _txt)
                 check("勝手に切り替えない", app.var_model.get() == "small")
 
+                # **選んだら、その場で覚える。**覚える処理が「経路を
+                # 切り替えたとき」と「転写を開始したとき」にしか無く、
+                # 選んで放置すると元に戻っていた(実機の指摘・2026-08-20)。
+                _saved = {}
+                _real_save = main_gui.save_config
+                try:
+                    main_gui.save_config = lambda d: _saved.update(d)
+                    app.var_model.set("large-v3")
+                    app._on_model_chosen()
+                    check("選んだモデルを覚える",
+                          app._model_by_engine[main_gui.ENGINE_LOCAL]
+                          == "large-v3")
+                    check("設定にも書く", _saved.get("local_model") == "large-v3")
+                    # 経路を往復しても戻らない
+                    app.var_engine.set(main_gui.ENGINE_CLOUD)
+                    app._update_engine_state()
+                    app.var_engine.set(main_gui.ENGINE_LOCAL)
+                    app._update_engine_state()
+                    check("経路を往復しても戻らない",
+                          app.var_model.get() == "large-v3")
+                finally:
+                    main_gui.save_config = _real_save
+                    app.var_model.set("small")
+                    app._model_by_engine[main_gui.ENGINE_LOCAL] = "small"
+                    app._update_gpu_hint()
+
                 # **重なっていないかを見る。**文字の中身だけを検査していた
                 # ため、チャンク長の行に重ねたまま通っていた(実機の指摘・
                 # 2026-08-20)。§10.3.6 と同じ種類の見落とし。

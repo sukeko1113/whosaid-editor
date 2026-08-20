@@ -290,7 +290,7 @@ class App(tk.Tk):
                                       wraplength=560, justify="left", text="")
         self.lbl_gpu_hint.grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.cmb_model.bind("<<ComboboxSelected>>",
-                            lambda e: self._update_gpu_hint())
+                            lambda e: self._on_model_chosen())
 
         ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
@@ -554,6 +554,26 @@ class App(tk.Tk):
             self.lbl_auto_note.configure(text="")
         self._update_gpu_hint()
         self._update_mode_state()
+
+    def _on_model_chosen(self) -> None:
+        """モデルを選んだら、その場で覚えて設定に書く。
+
+        **選んだだけでは残らなかった。**覚える処理が「経路を切り替えたとき」と
+        「転写を開始したとき」にしかなく、選んで放置すると次に画面が更新された
+        時点で元に戻っていた(実機の指摘・2026-08-20)。設定への保存も
+        開始時だけだったので、アプリを閉じると消えていた。
+        """
+        engine = self.var_engine.get()
+        value = self.var_model.get()
+        if value:
+            self._model_by_engine[engine] = value
+            self.cfg["model"] = self._model_by_engine.get(ENGINE_CLOUD, "")
+            self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
+            try:
+                save_config(self.cfg)
+            except OSError:
+                pass        # 書けなくても選択自体は効いている
+        self._update_gpu_hint()
 
     def _update_gpu_hint(self) -> None:
         """GPU があるのに小さいモデルが選ばれていたら、理由を添えて出す。
