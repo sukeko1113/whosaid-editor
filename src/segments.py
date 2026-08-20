@@ -994,6 +994,42 @@ class Project:
                   was_reviewed=undone)
         return len(targets)
 
+    def carry_speakers(
+        self,
+        assignments: Sequence[tuple[tuple[float, float], Optional[str]]],
+        source: str = "",
+    ) -> int:
+        """別の転写から話者の割当を写す。写した数を返す。
+
+        使いどころは**転写し直したとき**。モデルを変えると区間の切れ目が
+        変わるので、`_carry_over_assignments`（`orig_start` で突き合わせる）
+        では引き継げない。時間の重なりで対応づけて写す。
+
+        **すべて △（まとめて適用）になる。**元が ✓ でも △ に落ちる。
+        区間の切れ目が変わっている以上、「その区間を聴いて確定した」とは
+        言えない。✓ のまま写すと `reviewed` の意味論が壊れる（CLAUDE.md）。
+
+        **記録は 1 件。**どこから何件写したかを残す——あとから
+        「これは前の転写から写したものだ」と読めるようにするため。
+        """
+        want = {(round(float(k[0]), 3), round(float(k[1]), 3)): sid
+                for k, sid in assignments if sid}
+        if not want:
+            return 0
+        done: list[list[float]] = []
+        for seg in self.segments:
+            sid = want.get(segment_key(seg))
+            if not sid or seg.speaker_id == sid:
+                continue
+            seg.speaker_id = sid
+            seg.reviewed = False        # 機械が ✓ を立てる経路は作らない
+            done.append(self._key(seg))
+        if not done:
+            return 0
+        self._log("carry_speakers", targets=done, count=len(done),
+                  source=source)
+        return len(done)
+
     def restore_assignments(
         self, snapshot: Sequence[tuple[int, Optional[str], bool]]
     ) -> None:
@@ -1622,6 +1658,7 @@ LOG_LABELS = {
     "edit_text": "本文",
     "replace_text_bulk": "語句(まとめて)",
     "replace_speaker_bulk": "話者の置き換え",
+    "carry_speakers": "前の転写から写した割当",
     "edit_time": "時刻",
     "apply_times_bulk": "時刻(まとめて)",
     "revert_time": "時刻を戻した",

@@ -16,6 +16,7 @@ from .audio import audio_fingerprint
 from .config import credits_text, load_config, save_config
 from typing import Optional
 
+from . import align
 from .align import AVAILABLE_MODELS as LOCAL_MODELS
 # **既定はこの機械の装置で決まる。**GPU があれば large-v3、無ければ
 # small(CPU で large-v3 は実時間比が数倍で実用外)。呼び出しのたびに
@@ -274,6 +275,16 @@ class App(tk.Tk):
             state="readonly")
         self.cmb_model.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
         self.cmb_model.bind("<MouseWheel>", self._on_wheel_over_value)
+        # **勝手に変えない。**GPU があるのに小さいモデルが選ばれていることは
+        # 起こる(設定に前回の値が残るため。実機で発生・2026-08-20)。
+        # 黙って上げると「意図して small を選んだ人」の設定を壊すので、
+        # 理由を書いて出すだけにする。判断は人がする。
+        self.lbl_gpu_hint = ttk.Label(frm_adv, foreground="#B26500",
+                                      wraplength=520, text="")
+        self.lbl_gpu_hint.grid(row=2, column=1, columnspan=3, sticky="w",
+                               padx=6, pady=(0, 4))
+        self.cmb_model.bind("<<ComboboxSelected>>",
+                            lambda e: self._update_gpu_hint())
 
         ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
@@ -535,7 +546,25 @@ class App(tk.Tk):
         else:
             self.rdo_mode_auto.configure(state="normal")
             self.lbl_auto_note.configure(text="")
+        self._update_gpu_hint()
         self._update_mode_state()
+
+    def _update_gpu_hint(self) -> None:
+        """GPU があるのに小さいモデルが選ばれていたら、理由を添えて出す。
+
+        **切り替えはしない。**この製品は「機械が勝手に決めない」で通して
+        いる(✓ を立てない・相づちを消さない・話者を確定しない)。設定も
+        同じ扱いにする。
+        """
+        if not hasattr(self, "lbl_gpu_hint"):
+            return
+        local = self.var_engine.get() == ENGINE_LOCAL
+        best = align.default_model()
+        show = (local and best != align.DEFAULT_MODEL
+                and self.var_model.get() != best)
+        self.lbl_gpu_hint.configure(text=(
+            f"※ この機械には GPU があります。{best} なら誤字が約 4 割減り、"
+            "処理も速くなります(実測)。" if show else ""))
 
     def _update_mode_state(self) -> None:
         """モード切替に応じてチェックボックスと名簿欄の有効/無効を整える。

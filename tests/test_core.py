@@ -3224,6 +3224,53 @@ def test_style_prompt_is_versioned():
     assert "耐震" not in local_asr.STYLE_PROMPT
 
 
+def test_carry_speakers_never_keeps_the_heard_mark():
+    """**別の転写から写した割当は、必ず △。**
+
+    モデルを変えると区間の切れ目が変わる（実データで 725 → 772）。
+    切れ目が違う以上「その区間を聴いて確定した」とは言えないので、
+    元が ✓ でも △ に落とす（CLAUDE.md の ✓/△ の意味論）。
+    """
+    proj = _for_leave()
+    yo = proj.speakers[0].id
+    for s in proj.segments:
+        s.speaker_id, s.reviewed = None, False
+    n = proj.carry_speakers(
+        [(segment_key(proj.segments[0]), yo),
+         (segment_key(proj.segments[2]), yo)], source="前.json")
+    assert n == 2
+    assert proj.segments[0].speaker_id == yo
+    assert proj.segments[0].reviewed is False, "機械が ✓ を立てている"
+    assert proj.segments[1].speaker_id is None, "指定していない区間が埋まった"
+
+
+def test_carry_speakers_records_one_judgement():
+    """記録は 1 件。どこから写したかを残す（編集履歴 §1.1・§1.2）。"""
+    proj = _for_leave()
+    yo = proj.speakers[0].id
+    for s in proj.segments:
+        s.speaker_id = None
+    proj.carry_speakers([(segment_key(s), yo) for s in proj.segments],
+                        source="前.json")
+    recs = [r for r in proj.edit_log if r.get("op") == "carry_speakers"]
+    assert len(recs) == 1, proj.edit_log
+    assert recs[0]["count"] == 4 and recs[0]["source"] == "前.json"
+    assert "carry_speakers" in LOG_LABELS
+
+
+def test_carry_speakers_does_nothing_without_targets():
+    """空・話者なし・すでに同じ、では記録も残さない（編集履歴 §1.5）。"""
+    proj = _for_leave()
+    yo = proj.speakers[0].id
+    assert proj.carry_speakers([], source="x") == 0
+    assert proj.carry_speakers(
+        [(segment_key(proj.segments[0]), None)], source="x") == 0
+    # すでに同じ人なら変化なし
+    assert proj.carry_speakers(
+        [(segment_key(proj.segments[0]), yo)], source="x") == 0
+    assert not [r for r in proj.edit_log if r.get("op") == "carry_speakers"]
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

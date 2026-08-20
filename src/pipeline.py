@@ -635,6 +635,16 @@ def run_segment_pipeline(
         transcriber = local_asr.LocalTranscriber(
             model=model, model_dir=engine.model_dir)
         transcriber.ensure_available()
+        # **GPU があるのに小さいモデルで回そうとしていたら、ここで言う。**
+        # 設定に前回の値が残るので、GPU を積んだ機械でも small のまま
+        # 走り出すことがある(実機で発生・2026-08-20)。画面の注記だけでは
+        # 見落とす——**始まってすぐ気づけて、止められる場所**に置く。
+        best = align.default_model(transcriber.device)
+        if transcriber.device == align.GPU_DEVICE and transcriber.model != best:
+            on_log(f"※ この機械には GPU があります。いまの設定は "
+                   f"{transcriber.model} ですが、{best} なら誤字が約 4 割減り、"
+                   "処理も速くなります(実測)。"
+                   "設定画面のモデル欄で変えられます。")
 
     # 話者分離も先に確かめる。ただし**使えなくても止めない**——転写は 25 分
     # かかる。それを終えてから「話者分離の部品がありません」で全部を捨てるのは

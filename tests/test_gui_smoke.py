@@ -2204,6 +2204,36 @@ def run_main_window() -> int:
             main_gui.messagebox.askyesno = lambda *a, **k: True
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
+
+            # --- GPU があるのに小さいモデルを選んでいたら知らせる ---------
+            # **勝手に切り替えない。**設定に前回の値が残るので、GPU 機でも
+            # small のまま走り出すことがある(実機で発生・2026-08-20)。
+            from src import align as _al
+            _real_default = _al.default_model
+            try:
+                _al.default_model = lambda device=None: "large-v3"
+                app.var_engine.set(main_gui.ENGINE_LOCAL)
+                app.var_model.set("small")
+                app._update_gpu_hint()
+                app.update()
+                _txt = str(app.lbl_gpu_hint.cget("text"))
+                check("GPU があるのに small なら注記が出る", "large-v3" in _txt)
+                check("理由も書いてある（判断できるように）",
+                      "誤字" in _txt and "速く" in _txt)
+                check("勝手に切り替えない", app.var_model.get() == "small")
+                app.var_model.set("large-v3")
+                app._update_gpu_hint()
+                check("選び直したら注記は消える",
+                      str(app.lbl_gpu_hint.cget("text")) == "")
+                # GPU が無い機械では出さない
+                _al.default_model = lambda device=None: _al.DEFAULT_MODEL
+                app.var_model.set("small")
+                app._update_gpu_hint()
+                check("GPU が無ければ出さない",
+                      str(app.lbl_gpu_hint.cget("text")) == "")
+            finally:
+                _al.default_model = _real_default
+                app._update_gpu_hint()
             app.var_diarize_local.set(True)
             main_gui._ask_speaker_count = real_ask_count
         finally:
