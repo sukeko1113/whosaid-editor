@@ -16,7 +16,12 @@ from .audio import audio_fingerprint
 from .config import credits_text, load_config, save_config
 from typing import Optional
 
-from .align import AVAILABLE_MODELS as LOCAL_MODELS, DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
+from .align import AVAILABLE_MODELS as LOCAL_MODELS
+# **既定はこの機械の装置で決まる。**GPU があれば large-v3、無ければ
+# small(CPU で large-v3 は実時間比が数倍で実用外)。呼び出しのたびに
+# 判定すると重いので、起動時に 1 回だけ決める。
+from .align import default_model as _default_local_model
+DEFAULT_LOCAL_MODEL = _default_local_model()
 from .diarize import DEFAULT_NUM_SPEAKERS
 from .pipeline import DEFAULT_CLOUD_MODEL, EngineSpec, run_pipeline, run_segment_pipeline
 from .transcribe import FatalTranscriptionError

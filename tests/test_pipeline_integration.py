@@ -695,8 +695,12 @@ def run_local() -> int:
     class FakeLocal:
         """LocalTranscriber の代わり。モデルもライブラリも要らない。"""
 
-        def __init__(self, model="small", model_dir=None):
+        def __init__(self, model="small", model_dir=None, **kw):
             self.model, self.model_dir = model, model_dir
+            # 本物と同じだけの素性を持つ。**キャッシュキーに入るので
+            # 欠けると、設定違いの転写が同じキーを共有する検査にならない。**
+            self.device, self.compute_type = "cpu", "int8"
+            self.prompt_ver = 0
 
         def ensure_available(self):
             pass

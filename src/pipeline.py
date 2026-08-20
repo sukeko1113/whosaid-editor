@@ -16,6 +16,7 @@ from typing import Callable, Optional
 from google import genai
 from google.genai import types as genai_types
 
+from . import align
 from . import diarize as diarize_mod
 from . import listen_order
 from . import local_asr
@@ -99,10 +100,14 @@ class EngineSpec:
         return ENGINE_LABELS.get(self.mode, self.mode)
 
     def resolved_model(self) -> str:
-        """モデル名。指定が無ければ経路ごとの既定。"""
+        """モデル名。指定が無ければ経路ごとの既定。
+
+        **ローカルの既定は装置で変わる**——GPU があれば large-v3、
+        無ければ small(CPU で large-v3 は実時間比が数倍で実用外)。
+        """
         if self.model:
             return self.model
-        return DEFAULT_LOCAL_MODEL if self.is_local else DEFAULT_CLOUD_MODEL
+        return align.default_model() if self.is_local else DEFAULT_CLOUD_MODEL
 
     def record(self) -> dict:
         """作業ファイルに残す engine の中身(Word の検証要約に出る処理経路)。
@@ -116,7 +121,10 @@ class EngineSpec:
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         if self.is_local:
-            rec["compute_type"] = local_asr.COMPUTE_TYPE
+            # **実際に使った装置と精度を残す。**「どの経路のどのモデルで
+            # 作られた記録か」を第三者が読めるようにするのが目的なので、
+            # 固定値ではなく走らせた値を書く(GPU で回れば違う値になる)。
+            rec["device"], rec["compute_type"] = align.pick_device()
             if self.model_dir:
                 rec["model_dir"] = str(self.model_dir)
         return rec
@@ -705,10 +713,15 @@ def run_segment_pipeline(
             this_len = max(1.0, min(this_len, duration - offset))
 
         if engine.is_local:
+            # **モデルだけでなく、装置の精度とプロンプトの版もキーに入れる。**
+            # 実際に使うモデルは transcriber が決める(GPU なら large-v3 に
+            # 上がる)ので、engine の指定ではなく transcriber の値を使う。
             cache_path = local_asr.chunk_cache_path(
                 cache_dir, chunk.stem, fingerprint=fingerprint,
-                chunk_seconds=chunk_seconds, model=model,
-                model_dir=engine.model_dir)
+                chunk_seconds=chunk_seconds, model=transcriber.model,
+                model_dir=engine.model_dir,
+                compute_type=transcriber.compute_type,
+                prompt_ver=transcriber.prompt_ver)
             cached = None if force_retranscribe else local_asr.load_chunk(cache_path)
             if cached is not None:
                 on_log(f"{label} (キャッシュから復元)")
@@ -721,7 +734,8 @@ def run_segment_pipeline(
                     on_log("キャンセルされました。"
                            "(完了済みチャンクはキャッシュに保存されています)")
                     return None
-                local_asr.save_chunk(cache_path, result, model=model)
+                local_asr.save_chunk(cache_path, result,
+                                     model=transcriber.model)
                 utterances = result.utterances
         else:
             cache_path = cache_dir / f"{chunk.stem}{cache_suffix}"

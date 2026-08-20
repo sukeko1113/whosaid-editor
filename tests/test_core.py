@@ -3157,6 +3157,73 @@ def test_replace_speaker_ignores_segments_of_other_people():
     assert proj.replace_speaker(yo, ni, []) == 0
 
 
+def test_device_choice_pairs_with_the_model():
+    """**装置とモデルは組で決まる。**CPU で large-v3 は実用外(実時間比が数倍)。
+
+    実測(2026-08-20・GTX 1660 SUPER)で、GPU + large-v3 + int8_float16 は
+    誤字 11.9% → 7.0%、67 分の音声が 24 分 → 15.5 分。**速くなって正確**
+    という珍しい形なので、利用者に選ばせる必要がない。
+    """
+    from src import align
+    assert align.default_model("cpu") == align.DEFAULT_MODEL == "small"
+    assert align.default_model(align.GPU_DEVICE) == align.GPU_DEFAULT_MODEL
+    assert "large-v3" in align.AVAILABLE_MODELS
+    # GPU を使わない指定は、GPU のある機械でも CPU の組を返す
+    assert align.pick_device(prefer_gpu=False) == (align.DEVICE,
+                                                   align.COMPUTE_TYPE)
+
+
+def test_gpu_uses_int8_not_plain_float16():
+    """**float16 ではなく int8_float16。**同じ品質で 3.5 倍速い（実測）。
+
+    large-v3 で 67 分の音声が 53.7 分 → 15.5 分。誤字 7.1% → 7.0%、
+    脱落 11.6% → 11.0%、落とした発言の回収は同じ 17/34。
+    """
+    from src import align
+    assert align.GPU_COMPUTE_TYPE == "int8_float16"
+
+
+def test_cache_key_separates_device_and_prompt():
+    """**装置の精度とプロンプトの版が違えば、別のキャッシュになる。**
+
+    どちらも転写結果を変える。キーに入れないと古い転写を使い回す
+    （CLAUDE.md「どれかを欠くと古い転写の使い回し事故になる」）。
+    プロンプトを変えたときは句読点の密度が 1 万字あたり 452 → 1055 に
+    動いた（実測）。
+    """
+    from src import local_asr
+    def key(**kw):
+        return local_asr.chunk_cache_path(
+            "/tmp", "chunk_0000", fingerprint="abc", chunk_seconds=420,
+            model="large-v3", **kw).name
+
+    base = key()
+    assert base != key(compute_type="int8_float16"), "精度で分かれていない"
+    assert base != key(prompt_ver=1), "プロンプトの版で分かれていない"
+    assert key(compute_type="int8") != key(compute_type="int8_float16")
+    assert key(prompt_ver=1) != key(prompt_ver=2)
+    # モデルで分かれるのは従来どおり（壊していないこと）
+    assert local_asr.chunk_cache_path(
+        "/tmp", "c", fingerprint="a", chunk_seconds=420, model="small").name         != local_asr.chunk_cache_path(
+            "/tmp", "c", fingerprint="a", chunk_seconds=420,
+            model="large-v3").name
+    # 指紋が無ければ従来どおりキャッシュしない
+    assert local_asr.chunk_cache_path(
+        "/tmp", "c", fingerprint="", chunk_seconds=420, model="small") is None
+
+
+def test_style_prompt_is_versioned():
+    """プロンプトを変えたら版を上げる、という約束を検査で縛る。
+
+    版を上げ忘れると、古い転写を使い回して「直したのに変わらない」になる。
+    """
+    from src import local_asr
+    assert local_asr.PROMPT_VER >= 1
+    assert "、" in local_asr.STYLE_PROMPT, "句読点のための例文でなくなっている"
+    # 用語を入れない（句読点の効果と用語の効果を混ぜないため・実測の経緯）
+    assert "耐震" not in local_asr.STYLE_PROMPT
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -29,13 +31,29 @@ from .audio import audio_fingerprint
 # 実装のバージョン。上げると words キャッシュを作り直す。
 ALIGN_VER = 1
 
-# 既定は small。base は速いが精度が落ち、medium は CPU では重い(§9)。
+# **CPU での既定は small。**base は速いが精度が落ち、medium は CPU では重い(§9)。
 DEFAULT_MODEL = "small"
-AVAILABLE_MODELS = ("base", "small", "medium")
 
-# CPU で回す前提。int8 量子化で実用速度になる(torch は要らない)。
+# **GPU がある機械での既定は large-v3。**実測(2026-08-20・逐語正解 4 帯):
+#   誤字 11.9% → 7.0% / 落とした発言の回収 11/34 → 17/34
+#   固有名詞は 0/5 → 5/5(同窓会・文科省・耐震・新潟・建て替え)
+#   67 分の音声に 24 分 → 15.5 分。**速くなって正確になる。**
+# CPU では large-v3 は実用外(実時間比が数倍)なので、既定を分ける。
+GPU_DEFAULT_MODEL = "large-v3"
+
+AVAILABLE_MODELS = ("base", "small", "medium", "large-v3")
+
+# **CPU での既定。**int8 量子化で実用速度になる(torch は要らない)。
+# GPU がある機械では pick_device() が cuda / int8_float16 を返す。
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
+
+# GPU で回すときの組み合わせ。**float16 ではなく int8_float16。**
+# 実測(2026-08-20・GTX 1660 SUPER・逐語正解 4 帯)で、品質は変わらないのに
+# 3.5 倍速い。large-v3 で 67 分の音声が 53.7 分 → 15.5 分になった
+# (誤字 7.1% → 7.0%・脱落 11.6% → 11.0%・落とした発言の回収は同じ 17/34)。
+GPU_DEVICE = "cuda"
+GPU_COMPUTE_TYPE = "int8_float16"
 
 LANGUAGE = "ja"
 
@@ -46,6 +64,75 @@ class AlignUnavailable(RuntimeError):
     利用者に何をすれば動くのかを伝えるための例外。呼び出し側は
     そのままメッセージを見せてよい。
     """
+
+
+def add_cuda_dll_path() -> None:
+    """pip で入れた CUDA の DLL を探索先に足す(あれば)。
+
+    `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` は DLL を site-packages の
+    中に置くので、**既定の探索先に入っていない。**足さないと
+    `cublas64_12.dll is not found` で落ちる(実機で発生・2026-08-20)。
+
+    無い環境では何もしない。同梱ビルドで別の場所に置く場合もここを直す。
+    """
+    if sys.platform != "win32":
+        return                      # Linux/macOS は既定の探索先で見つかる
+    try:
+        import nvidia
+    except ImportError:
+        return
+    for root in getattr(nvidia, "__path__", []):
+        for d in Path(root).glob("*/bin"):
+            if not d.is_dir():
+                continue
+            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(str(d))
+            except OSError:
+                pass
+
+
+def cuda_available() -> bool:
+    """GPU で回せそうか。**これは目安であって保証ではない。**
+
+    `get_cuda_device_count()` はドライバがあれば 1 を返すが、**cuBLAS の
+    DLL が無くても 1 を返す**(実機で確認・2026-08-20)。実際に落ちるのは
+    最初の推論のときなので、確定は `LocalTranscriber` 側の試し撃ちで行う。
+    """
+    try:
+        import ctranslate2
+    except ImportError:
+        return False
+    try:
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return False
+        return GPU_COMPUTE_TYPE in ctranslate2.get_supported_compute_types("cuda")
+    except Exception:
+        return False
+
+
+def pick_device(prefer_gpu: bool = True) -> tuple[str, str]:
+    """(装置, 精度)を決める。GPU があれば cuda / int8_float16。
+
+    **速いほうが正確でもある**という珍しい形になっている(上の定数の注記)。
+    そのため「速度と品質のどちらを採るか」を利用者に選ばせる必要はない。
+    """
+    if prefer_gpu:
+        add_cuda_dll_path()
+        if cuda_available():
+            return GPU_DEVICE, GPU_COMPUTE_TYPE
+    return DEVICE, COMPUTE_TYPE
+
+
+def default_model(device: Optional[str] = None) -> str:
+    """その装置での既定モデル。GPU なら large-v3、CPU なら small。
+
+    装置を省くと `pick_device()` で判定する。**利用者が明示的に選んだ
+    モデルは尊重する**(ここは「何も選ばなかったとき」の話)。
+    """
+    if device is None:
+        device, _ = pick_device()
+    return GPU_DEFAULT_MODEL if device == GPU_DEVICE else DEFAULT_MODEL
 
 
 @dataclass

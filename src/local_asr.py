@@ -19,6 +19,7 @@ faster_whisper は関数の中で import する(align.py と同じ理由)。
 from __future__ import annotations
 
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +32,9 @@ from .align import (
     DEVICE,
     LANGUAGE,
     Word,
+    default_model,
     model_tag,
+    pick_device,
     resolve_model,
 )
 from .segments import PSEUDO_UNKNOWN, Utterance
@@ -39,6 +42,28 @@ from .segments import PSEUDO_UNKNOWN, Utterance
 
 # 実装のバージョン。上げるとローカル転写のキャッシュを作り直す。
 LOCAL_ASR_VER = 1
+
+# **プロンプトの版。変えたら必ず上げること**(キャッシュキーに入る)。
+# p1 = 句読点の例文 + この種の会議の用語(2026-08-20)。
+PROMPT_VER = 1
+
+# **large-v3 は句読点をほとんど付けない。**実測(2026-08-20・逐語正解 4 帯)で、
+# 説明が続く帯では 1 つも付かなかった(1 万字あたり 正解 1138 に対し 0)。
+# 区間が細かい(725 → 1298)ぶん断片が文の途中で終わるため。そのままだと
+# Word 出力で「同じ話者の連続区間」を 1 段落にまとめたときに文が繋がる。
+#
+# 例文を与えると戻る(0 → 971)。**用語は固有名詞には効かない**ことも
+# 測定済みだが(initial_prompt では同窓会 0/5 のまま)、誤字全体は下がり、
+# 脱落と長さも改善するので併せて置く。
+#
+# 代償: 掛け合いの帯では読点が過剰になる(正解 142 に対し 1274)。意味は
+# 壊れないので許容した。「建て替え」が 1 回落ちるのも確認済みで、
+# これは［語句をまとめて直す...］で直せる範囲。
+STYLE_PROMPT = (
+    "本日は、お忙しい中お集まりいただき、ありがとうございます。"
+    "それでは、お手元の資料に沿って、順にご説明いたします。"
+    "この点につきまして、何かご質問がございましたら、お願いいたします。"
+)
 
 
 class LocalAsrUnavailable(AlignUnavailable):
@@ -72,13 +97,22 @@ def chunk_cache_path(
     chunk_seconds: float,
     model: str,
     model_dir: Optional[Path | str] = None,
+    compute_type: str = "",
+    prompt_ver: int = 0,
 ) -> Optional[Path]:
     """ローカル転写のチャンクキャッシュの置き場(設計書 §7)。
 
-    キーは「音声の指紋 + チャンク長 + モデルの素性 + 実装バージョン」。
-    クラウド側(.cluster.<指紋>.c<秒>[.vb].txt)にモデルを足した形で、
-    どれが欠けても別物の転写を使い回す事故になる。指紋が取れなかった音声は
-    そもそもキャッシュしない(毎回取り直すほうが安全)。
+    キーは「音声の指紋 + チャンク長 + モデルの素性 + **精度** +
+    **プロンプトの版** + 実装バージョン」。クラウド側
+    (.cluster.<指紋>.c<秒>[.vb].txt)にモデルを足した形で、どれが欠けても
+    別物の転写を使い回す事故になる。指紋が取れなかった音声はそもそも
+    キャッシュしない(毎回取り直すほうが安全)。
+
+    **精度とプロンプトの版は 2026-08-20 に足した。**
+    - `int8`(CPU) と `int8_float16`(GPU) では出力が変わりうる
+    - 用語と句読点のプロンプトを変えると転写が変わる。実測で句読点の密度が
+      1 万字あたり 452 → 1055 に動いた。版を入れないと古い転写を使い回す
+      (CLAUDE.md「どれかを欠くと古い転写の使い回し事故になる」)
 
     逐語フラグ(.vb)は付けない。ローカルに逐語モードは無いので、付けると
     同じ転写が 2 つできるだけになる(§5.4)。
@@ -88,6 +122,10 @@ def chunk_cache_path(
     if not fingerprint:
         return None
     tag = model_tag(model, model_dir)
+    if compute_type:
+        tag += "." + re.sub(r"[^A-Za-z0-9_]+", "-", compute_type)
+    if prompt_ver:
+        tag += f".p{int(prompt_ver)}"
     return Path(cache_dir) / (
         f"{chunk_stem}.local.{fingerprint}.c{int(chunk_seconds)}"
         f".{tag}.v{LOCAL_ASR_VER}.json"
@@ -149,10 +187,14 @@ class LocalTranscriber:
     でモデルの読み込みだけを 8 回繰り返すことになる。
     """
 
-    def __init__(self, model: str = DEFAULT_MODEL,
+    def __init__(self, model: Optional[str] = None,
                  model_dir: Optional[Path | str] = None,
-                 condition_on_previous_text: bool = True) -> None:
-        """condition_on_previous_text: 直前までの本文を次の 30 秒に引き継ぐか。
+                 condition_on_previous_text: bool = True,
+                 prefer_gpu: bool = True,
+                 style_prompt: Optional[str] = STYLE_PROMPT) -> None:
+        """model を省くと、装置に合った既定を選ぶ(GPU なら large-v3)。
+
+        condition_on_previous_text: 直前までの本文を次の 30 秒に引き継ぐか。
 
         **既定は True。faster-whisper の既定と同じで、これまでの挙動を変えない。**
         False にすると各 30 秒が独立に起きるので、言い淀みが整えられて落ちる
@@ -164,12 +206,17 @@ class LocalTranscriber:
         設定違いの転写が同じキーを共有してしまう。だから今は測定専用で、
         pipeline からは渡していない。
         """
-        self.model = model
+        # **装置を先に決める。**モデルの既定が装置で変わる(GPU なら
+        # large-v3、CPU なら small。CPU で large-v3 は実用外)。
+        self.device, self.compute_type = pick_device(prefer_gpu)
+        self.model = model or default_model(self.device)
         self.model_dir = model_dir
         self.condition_on_previous_text = condition_on_previous_text
+        self.style_prompt = style_prompt or None
+        self.prompt_ver = PROMPT_VER if self.style_prompt else 0
         # 置き場の間違い(フォルダが無い・model.bin が無い)はここで分かる。
         # 音声を分割し終わってから気づくのでは遅い。
-        self.target = resolve_model(model, model_dir)
+        self.target = resolve_model(self.model, model_dir)
         self._whisper = None
 
     def ensure_available(self) -> None:
@@ -198,18 +245,47 @@ class LocalTranscriber:
         self.ensure_available()
         from faster_whisper import WhisperModel      # 重いのでここで読む
 
+        where = "GPU" if self.device == "cuda" else "CPU"
         if on_log:
-            on_log(f"ローカル転写の準備をしています(モデル {self.model} / CPU)。")
+            on_log(f"ローカル転写の準備をしています"
+                   f"(モデル {self.model} / {where})。")
+
+        def build(device: str, ctype: str):
+            m = WhisperModel(self.target, device=device, compute_type=ctype)
+            # **試し撃ちをする。**CUDA のドライバがあれば device_count は 1 を
+            # 返すが、cuBLAS の DLL が無いと**最初の推論で**落ちる(実機で発生・
+            # 2026-08-20)。1 チャンク起こしたあとで気づくのでは遅いので、
+            # ここで無音 1 秒を通して確かめる。
+            if device == "cuda":
+                import numpy as np
+                list(m.transcribe(np.zeros(16000, dtype=np.float32),
+                                  language=LANGUAGE,
+                                  without_timestamps=True)[0])
+            return m
+
         try:
-            self._whisper = WhisperModel(
-                self.target, device=DEVICE, compute_type=COMPUTE_TYPE)
-        except Exception as e:
+            self._whisper = build(self.device, self.compute_type)
+        except Exception as first:
+            if self.device == "cuda":
+                # **GPU が駄目でも止めない。**CPU に落とす。既定モデルも
+                # 戻す——CPU で large-v3 は実時間比が数倍で実用外になる。
+                if on_log:
+                    on_log(f"GPU では動かせませんでした({first})。"
+                           "CPU に切り替えます。")
+                self.device, self.compute_type = DEVICE, COMPUTE_TYPE
+                self.model = default_model(self.device)
+                self.target = resolve_model(self.model, self.model_dir)
+                try:
+                    self._whisper = build(self.device, self.compute_type)
+                    return self._whisper
+                except Exception as e:
+                    first = e
             raise LocalAsrUnavailable(
                 f"モデルを読み込めませんでした({self.model})。\n"
                 "オンラインで取得できない環境では、別の PC で取得したモデル"
                 "フォルダを指定してください。\n"
-                f"--- 詳細 ---\n{e}"
-            ) from e
+                f"--- 詳細 ---\n{first}"
+            ) from first
         return self._whisper
 
     def transcribe(
@@ -245,6 +321,9 @@ class LocalTranscriber:
             # 記録から消える(align.py の「照合不能」より重い)。
             vad_filter=False,
             condition_on_previous_text=self.condition_on_previous_text,
+            # **句読点のための例文**(STYLE_PROMPT の注記)。変えたら
+            # PROMPT_VER を上げること——キャッシュキーに入っている。
+            initial_prompt=self.style_prompt,
         )
         total = float(getattr(info, "duration", 0.0) or 0.0)
 
