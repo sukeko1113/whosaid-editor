@@ -2300,6 +2300,55 @@ def run_main_window() -> int:
             main_gui.messagebox.askyesno = lambda *a, **k: True
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
+
+            # --- 設定の往復（保存 → 読み直し）-----------------------------
+            # **今日の 4 件はここに固まっていた。**設定を扱う場所が 4 つ
+            # あり(読み込み・経路の切替・モデルを選んだとき・開始時)、
+            # そのうち 1 つだけ直しても別の経路から壊れた。
+            # **1 か所ずつ見るのではなく、往復するかを見る。**
+            _want = {
+                "engine": main_gui.ENGINE_LOCAL,
+                "local_model": "large-v3",
+                "model": main_gui.MODELS[1],
+                "chunk_minutes": 12,
+                "diarize": False,
+                "mode": main_gui.MODE_MANUAL,
+            }
+            app.var_engine.set(_want["engine"])
+            app._update_engine_state()
+            app.var_model.set(_want["local_model"])
+            app._on_model_chosen()
+            app._model_by_engine[main_gui.ENGINE_CLOUD] = _want["model"]
+            app.var_chunk.set(_want["chunk_minutes"])
+            app.var_diarize_local.set(_want["diarize"])
+            app.var_mode.set(_want["mode"])
+
+            _out = {}
+            main_gui.save_config = lambda d: _out.update(d)
+            main_gui.messagebox.askyesno = lambda *a, **k: True
+            app._start()
+            for _k, _v in _want.items():
+                check(f"設定が保存される: {_k}", _out.get(_k) == _v)
+
+            # 読み直したときに同じ状態になるか（別の App を作って確かめる）
+            main_gui.load_config = lambda: dict(_out)
+            _app2 = main_gui.App()
+            try:
+                _app2.update()
+                check("読み直して経路が戻る",
+                      _app2.var_engine.get() == _want["engine"])
+                check("読み直してモデルが戻る",
+                      _app2.var_model.get() == _want["local_model"])
+                check("読み直してクラウドのモデルも保たれる",
+                      _app2._model_by_engine[main_gui.ENGINE_CLOUD]
+                      == _want["model"])
+                check("読み直してチャンク長が戻る",
+                      _app2.var_chunk.get() == _want["chunk_minutes"])
+                check("読み直して話者分離の設定が戻る",
+                      _app2.var_diarize_local.get() == _want["diarize"])
+            finally:
+                _app2.destroy()
+                main_gui.load_config = real_load
             app.var_diarize_local.set(True)
             main_gui._ask_speaker_count = real_ask_count
         finally:
