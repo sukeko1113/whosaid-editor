@@ -270,19 +270,25 @@ class App(tk.Tk):
             ENGINE_CLOUD: MODELS[0],
             ENGINE_LOCAL: DEFAULT_LOCAL_MODEL,
         }
+        # **モデル欄と注記を 1 つの枠に入れる。**下の行(チャンク長)に
+        # 直接置いたら重なった(実機で発生・2026-08-20)。枠にしておけば
+        # 他の行の番号を触らずに済み、注記が空のときは高さも取らない。
+        model_box = ttk.Frame(frm_adv)
+        model_box.grid(row=1, column=1, columnspan=3, sticky="ew",
+                       padx=6, pady=4)
+        model_box.columnconfigure(0, weight=1)
         self.cmb_model = ttk.Combobox(
-            frm_adv, values=list(LOCAL_MODELS), textvariable=self.var_model,
+            model_box, values=list(LOCAL_MODELS), textvariable=self.var_model,
             state="readonly")
-        self.cmb_model.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=4)
+        self.cmb_model.grid(row=0, column=0, sticky="ew")
         self.cmb_model.bind("<MouseWheel>", self._on_wheel_over_value)
         # **勝手に変えない。**GPU があるのに小さいモデルが選ばれていることは
         # 起こる(設定に前回の値が残るため。実機で発生・2026-08-20)。
         # 黙って上げると「意図して small を選んだ人」の設定を壊すので、
         # 理由を書いて出すだけにする。判断は人がする。
-        self.lbl_gpu_hint = ttk.Label(frm_adv, foreground="#B26500",
-                                      wraplength=520, text="")
-        self.lbl_gpu_hint.grid(row=2, column=1, columnspan=3, sticky="w",
-                               padx=6, pady=(0, 4))
+        self.lbl_gpu_hint = ttk.Label(model_box, foreground="#B26500",
+                                      wraplength=560, justify="left", text="")
+        self.lbl_gpu_hint.grid(row=1, column=0, sticky="w", pady=(3, 0))
         self.cmb_model.bind("<<ComboboxSelected>>",
                             lambda e: self._update_gpu_hint())
 

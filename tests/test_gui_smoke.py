@@ -2099,6 +2099,66 @@ def run_main_window() -> int:
             check("モデルはホイールで変わらない",
                   app.var_model.get() == before_model)
 
+            # --- GPU があるのに小さいモデルを選んでいたら知らせる ---------
+            # **勝手に切り替えない。**設定に前回の値が残るので、GPU 機でも
+            # small のまま走り出すことがある(実機で発生・2026-08-20)。
+            from src import align as _al
+            _real_default = _al.default_model
+            try:
+                _al.default_model = lambda device=None: "large-v3"
+                app.var_engine.set(main_gui.ENGINE_LOCAL)
+                app.var_model.set("small")
+                app._update_gpu_hint()
+                app.update()
+                _txt = str(app.lbl_gpu_hint.cget("text"))
+                check("GPU があるのに small なら注記が出る", "large-v3" in _txt)
+                check("理由も書いてある（判断できるように）",
+                      "誤字" in _txt and "速く" in _txt)
+                check("勝手に切り替えない", app.var_model.get() == "small")
+
+                # **重なっていないかを見る。**文字の中身だけを検査していた
+                # ため、チャンク長の行に重ねたまま通っていた(実機の指摘・
+                # 2026-08-20)。§10.3.6 と同じ種類の見落とし。
+                #
+                # **窓が見えているうちにやること。**withdraw のあとだと
+                # 部品の大きさが取れず、重なり判定が素通りする(これも
+                # 一度やった)。「見えている」の検査を必ず先に置く。
+                def _box(w):
+                    return (w.winfo_rootx(), w.winfo_rooty(),
+                            w.winfo_rootx() + w.winfo_width(),
+                            w.winfo_rooty() + w.winfo_height())
+
+                def _hits(x, y):
+                    ax1, ay1, ax2, ay2 = _box(x)
+                    bx1, by1, bx2, by2 = _box(y)
+                    return ax1 < bx2 and bx1 < ax2 and ay1 < by2 and by1 < ay2
+
+                check("注記が見えている（これが偽なら下の検査は無意味）",
+                      app.lbl_gpu_hint.winfo_ismapped()
+                      and app.lbl_gpu_hint.winfo_width() > 10)
+                for _name, _w in (("モデル欄", app.cmb_model),
+                                  ("チャンク長", app.spin_chunk)):
+                    check(f"注記が{_name}に重ならない",
+                          not _hits(app.lbl_gpu_hint, _w))
+                check("注記はモデル欄の下にある",
+                      app.lbl_gpu_hint.winfo_rooty()
+                      >= app.cmb_model.winfo_rooty()
+                      + app.cmb_model.winfo_height())
+
+                app.var_model.set("large-v3")
+                app._update_gpu_hint()
+                check("選び直したら注記は消える",
+                      str(app.lbl_gpu_hint.cget("text")) == "")
+                _al.default_model = lambda device=None: _al.DEFAULT_MODEL
+                app.var_model.set("small")
+                app._update_gpu_hint()
+                check("GPU が無ければ出さない",
+                      str(app.lbl_gpu_hint.cget("text")) == "")
+            finally:
+                _al.default_model = _real_default
+                app.var_model.set(main_gui.DEFAULT_LOCAL_MODEL)
+                app._update_gpu_hint()
+
             app._canvas.unbind_all("<MouseWheel>")
             app.withdraw()
             # 既定はローカル。録音を外へ出す判断を既定に紛れ込ませない
@@ -2204,36 +2264,6 @@ def run_main_window() -> int:
             main_gui.messagebox.askyesno = lambda *a, **k: True
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
-
-            # --- GPU があるのに小さいモデルを選んでいたら知らせる ---------
-            # **勝手に切り替えない。**設定に前回の値が残るので、GPU 機でも
-            # small のまま走り出すことがある(実機で発生・2026-08-20)。
-            from src import align as _al
-            _real_default = _al.default_model
-            try:
-                _al.default_model = lambda device=None: "large-v3"
-                app.var_engine.set(main_gui.ENGINE_LOCAL)
-                app.var_model.set("small")
-                app._update_gpu_hint()
-                app.update()
-                _txt = str(app.lbl_gpu_hint.cget("text"))
-                check("GPU があるのに small なら注記が出る", "large-v3" in _txt)
-                check("理由も書いてある（判断できるように）",
-                      "誤字" in _txt and "速く" in _txt)
-                check("勝手に切り替えない", app.var_model.get() == "small")
-                app.var_model.set("large-v3")
-                app._update_gpu_hint()
-                check("選び直したら注記は消える",
-                      str(app.lbl_gpu_hint.cget("text")) == "")
-                # GPU が無い機械では出さない
-                _al.default_model = lambda device=None: _al.DEFAULT_MODEL
-                app.var_model.set("small")
-                app._update_gpu_hint()
-                check("GPU が無ければ出さない",
-                      str(app.lbl_gpu_hint.cget("text")) == "")
-            finally:
-                _al.default_model = _real_default
-                app._update_gpu_hint()
             app.var_diarize_local.set(True)
             main_gui._ask_speaker_count = real_ask_count
         finally:
