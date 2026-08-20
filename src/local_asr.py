@@ -23,7 +23,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 from .align import (
     AlignUnavailable,
@@ -64,6 +64,35 @@ STYLE_PROMPT = (
     "それでは、お手元の資料に沿って、順にご説明いたします。"
     "この点につきまして、何かご質問がございましたら、お願いいたします。"
 )
+
+
+# **同じ本文が何区間続いたら「暴走」とみなすか。**
+# whisper が同じ文を延々と繰り返し、その間の会話が丸ごと失われる既知の
+# 事故。実データで large-v3 が 00:49:16 から **20 回**繰り返し、4 分ぶんが
+# 消えた(実機の指摘・2026-08-20)。small では起きなかった。
+#
+# 3 にしたのは、本物の繰り返しを巻き込まないため。同じ音声で「はい。」が
+# 3 回、「吉沢さん。」が 4 回続く箇所があり、**どちらも実際にそう言っている**。
+# ここは検出であって削除ではないので、拾いすぎても起こし直すだけで済む。
+LOOP_RUN_THRESHOLD = 3
+
+
+def max_repeat_run(utterances: Sequence[Utterance]) -> int:
+    """同じ本文が連続した最大の回数。
+
+    **区間ごとに数えること。**本文を 1 本に繋いでから正規表現で探すと、
+    区間をまたいだ繰り返しを拾えない(それで一度見逃した)。
+    """
+    best = run = 0
+    prev = None
+    for u in utterances:
+        t = (u.text or "").strip()
+        if t and t == prev:
+            run += 1
+        else:
+            run, prev = 1, t
+        best = max(best, run)
+    return best
 
 
 class LocalAsrUnavailable(AlignUnavailable):
@@ -309,6 +338,54 @@ class LocalTranscriber:
         if not audio_path.exists():
             raise LocalAsrUnavailable(f"音声ファイルが見つかりません: {audio_path}")
 
+        result = self._once(audio_path, self.condition_on_previous_text,
+                            on_log=on_log, on_progress=on_progress,
+                            is_cancelled=is_cancelled,
+                            word_timestamps=word_timestamps)
+        if result is None:
+            return None
+
+        # **暴走していないか見る。**同じ本文が続くのは、その間の会話が
+        # 丸ごと失われているということ。**黙って通してはいけない。**
+        n = max_repeat_run(result.utterances)
+        if n < LOOP_RUN_THRESHOLD or not self.condition_on_previous_text:
+            return result
+
+        if on_log:
+            on_log(f"  ※ 同じ本文が {n} 区間続いています(転写の暴走)。"
+                   "引き継ぎを切って起こし直します。")
+        retry = self._once(audio_path, False, on_log=None,
+                           on_progress=on_progress, is_cancelled=is_cancelled,
+                           word_timestamps=word_timestamps)
+        if retry is None:
+            return None
+        n2 = max_repeat_run(retry.utterances)
+        before = sum(len(u.text) for u in result.utterances)
+        after = sum(len(u.text) for u in retry.utterances)
+        if n2 < n:
+            if on_log:
+                on_log(f"  → 直りました({n} 区間 → {n2} 区間の繰り返し / "
+                       f"本文 {before:,} 字 → {after:,} 字)。")
+            return retry
+        # **直らなかったことを必ず伝える。**この事故は本文が消えるので、
+        # 気づかないまま納品されるのがいちばん悪い。
+        if on_log:
+            on_log(f"  ※ 起こし直しても直りませんでした({n2} 区間)。"
+                   "この付近は本文が失われている可能性があります。"
+                   "音声を聴いて確かめてください。")
+        return result
+
+    def _once(
+        self,
+        audio_path: Path,
+        condition_on_previous_text: bool,
+        *,
+        on_log=None,
+        on_progress=None,
+        is_cancelled=None,
+        word_timestamps: bool = True,
+    ) -> Optional[ChunkResult]:
+        """1 回だけ起こす。**暴走の判定はしない**(呼び出し側が見る)。"""
         whisper = self._load(on_log)
 
         segments, info = whisper.transcribe(
@@ -320,7 +397,7 @@ class LocalTranscriber:
             # 恐れがある。ここは本文を作る経路なので、落ちればその発言は
             # 記録から消える(align.py の「照合不能」より重い)。
             vad_filter=False,
-            condition_on_previous_text=self.condition_on_previous_text,
+            condition_on_previous_text=condition_on_previous_text,
             # **句読点のための例文**(STYLE_PROMPT の注記)。変えたら
             # PROMPT_VER を上げること——キャッシュキーに入っている。
             initial_prompt=self.style_prompt,

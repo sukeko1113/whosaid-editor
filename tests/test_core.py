@@ -3271,6 +3271,98 @@ def test_carry_speakers_does_nothing_without_targets():
     assert not [r for r in proj.edit_log if r.get("op") == "carry_speakers"]
 
 
+def _utts(*texts):
+    from src.segments import Utterance
+    return [Utterance(rel_start=i * 2.0, rel_end=i * 2.0 + 1.5, text=t)
+            for i, t in enumerate(texts)]
+
+
+def test_loop_detection_counts_across_segments():
+    """**区間ごとに数える。**本文を 1 本に繋いで正規表現で探すと拾えない。
+
+    実データで large-v3 が同じ文を 20 区間繰り返し、4 分ぶんの会話が
+    丸ごと消えた（2026-08-20）。1 本に繋いだ文字列で調べていたため、
+    最初の測定では 0 件と出てしまった。
+    """
+    from src.local_asr import max_repeat_run, LOOP_RUN_THRESHOLD
+    assert max_repeat_run(_utts("あ", "い", "う")) == 1
+    assert max_repeat_run(_utts("あ", "同じ", "同じ", "同じ", "い")) == 3
+    assert max_repeat_run(_utts(*(["同じ"] * 20))) == 20
+    assert max_repeat_run([]) == 0
+    # 空の本文は数えない（繋がっているように見えてしまう）
+    assert max_repeat_run(_utts("同じ", "", "同じ")) == 1
+    assert LOOP_RUN_THRESHOLD == 3
+
+
+def test_loop_detection_does_not_fire_on_real_repeats():
+    """**本物の繰り返しを暴走と混同しない。**
+
+    同じ音声に「はい。」が 3 回、「吉沢さん。」が 4 回続く箇所があり、
+    どちらも実際にそう言っている。閾値 3 では拾ってしまうが、**ここは
+    検出であって削除ではない**ので、起こし直して同じなら元を採る。
+    """
+    from src.local_asr import max_repeat_run
+    # 拾うこと自体は正しい（そのあと起こし直して確かめる）
+    assert max_repeat_run(_utts("はい。", "はい。", "はい。")) == 3
+    # 2 回では拾わない（相づちの応酬を毎回起こし直すことになる）
+    assert max_repeat_run(_utts("はい。", "はい。")) == 2
+
+
+def test_retry_replaces_the_run_and_says_so():
+    """暴走したら引き継ぎを切って起こし直し、**直ったことを利用者に伝える**。"""
+    from src import local_asr
+    tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
+    tr.condition_on_previous_text = True
+    calls, logs = [], []
+    good = local_asr.ChunkResult(utterances=_utts("あ", "い", "う", "え"))
+    bad = local_asr.ChunkResult(utterances=_utts(*(["同じ"] * 8)))
+
+    def fake_once(path, condition, **kw):
+        calls.append(condition)
+        return bad if condition else good
+
+    tr._once = fake_once
+    got = local_asr.LocalTranscriber.transcribe(
+        tr, __file__, on_log=logs.append)
+    assert calls == [True, False], "引き継ぎを切って起こし直していない"
+    assert got is good, "直った結果に差し替えていない"
+    assert any("暴走" in x for x in logs), logs
+    assert any("直りました" in x for x in logs), logs
+
+
+def test_retry_that_fails_is_reported_not_hidden():
+    """**直らなかったことを黙らない。**本文が消える事故なので、
+    気づかないまま納品されるのがいちばん悪い。"""
+    from src import local_asr
+    tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
+    tr.condition_on_previous_text = True
+    logs = []
+    bad = local_asr.ChunkResult(utterances=_utts(*(["同じ"] * 8)))
+    tr._once = lambda path, condition, **kw: bad
+    got = local_asr.LocalTranscriber.transcribe(
+        tr, __file__, on_log=logs.append)
+    assert got is bad
+    assert any("直りませんでした" in x for x in logs), logs
+    assert any("聴いて確かめ" in x for x in logs), logs
+
+
+def test_no_retry_when_nothing_looks_wrong():
+    """暴走していなければ、起こし直さない（時間が倍になる）。"""
+    from src import local_asr
+    tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
+    tr.condition_on_previous_text = True
+    calls = []
+    ok = local_asr.ChunkResult(utterances=_utts("あ", "い", "う"))
+
+    def fake_once(path, condition, **kw):
+        calls.append(condition)
+        return ok
+
+    tr._once = fake_once
+    assert local_asr.LocalTranscriber.transcribe(tr, __file__) is ok
+    assert calls == [True], "起こし直してしまっている"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
