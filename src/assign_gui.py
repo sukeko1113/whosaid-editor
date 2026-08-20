@@ -61,6 +61,7 @@ from .segments import (
     parse_roster,
     speaker_label,
     roster_to_text,
+    segment_key,
     suggest_roster_rows,
     suggest_split,
     write_docx,
@@ -995,6 +996,8 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="語句をまとめて直す...",
                    command=self.replace_words).pack(side="left", padx=(0, 6))
+        ttk.Button(bottom, text="話者をまとめて置き換える...",
+                   command=self.replace_speaker).pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
             .pack(side="left")
         self.btn_inspect = ttk.Button(bottom, text="時刻を点検...",
@@ -2233,6 +2236,39 @@ class AssignWindow(tk.Toplevel):
             f"「{before}」を「{after}」に {n} 箇所直しました。"
             "編集の履歴には 1 件として残ります。"
             "「聴いて確定」の印は付いていません。")
+
+    def replace_speaker(self) -> None:
+        """途中退席した人の発言を、まとめて別の人に付け替える。
+
+        **すべて △(まとめて適用)になる。**確かめたのは「その人は居なかった」
+        ことであって、1 区間ずつの声ではない(CLAUDE.md の ✓/△ の意味論)。
+        """
+        if not self.proj.segments:
+            return
+        if not self.proj.speakers:
+            messagebox.showinfo(
+                "出席者がいません",
+                "先に［出席者を編集...］で名簿を入れてください。", parent=self)
+            return
+        self._commit_text()
+        dlg = ReplaceSpeakerDialog(self)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        before, after, keys = dlg.result
+        n = self.proj.replace_speaker(before, after, keys)
+        if not n:
+            self._set_action("置き換えるところがありませんでした。")
+            return
+        self._dirty = True
+        self.suggester.refresh()
+        self.reload_tree()
+        self.show_current()
+        self.update_status()
+        self._set_action(
+            f"{self.proj.speaker_name(before)} の {n} 区間を "
+            f"{self.proj.speaker_name(after)} にしました。"
+            "すべて △(まとめて適用)です。編集の履歴には 1 件として残ります。")
 
     def remove_added(self) -> None:
         """人が足した区間を消す。**それ以外は消せない。**"""
@@ -3839,6 +3875,203 @@ class ProposalRow:
     evidence: str       # なぜそう言えるのか(照合の根拠)
     confidence: str     # どれくらい確からしいか
     text: str           # 発言のプレビュー
+
+
+class ReplaceSpeakerDialog(tk.Toplevel):
+    """話者をまとめて置き換える。**途中退席のための画面。**
+
+    「32:17 に吉沢さんが帰ったので、それ以降の吉沢忠一は全部西村香介」
+    ——実データで 108 区間あった（2026-08-20）。1 つずつ付け直すのは
+    現実的でない。
+
+    `ReplaceWordsDialog` と同じ形にしてある。**機械が判定せず、人が
+    1 区間ずつ○×する。**退席の直前・直後は本人の発言が混ざるので
+    （「ちょっと中座させてもらいます」は本人）、一律に変えると壊れる。
+
+    **すべて △（まとめて適用）になる。**✓ が付いていた区間も △ に落ちる。
+    確かめたのは「その人はもう居なかった」という事実であって、区間ごとの
+    声ではない。件数を画面に出して、そうなることを先に伝える。
+    """
+
+    MARK_ON, MARK_OFF = "○", "×"
+
+    def __init__(self, master: "AssignWindow") -> None:
+        super().__init__(master)
+        self.win = master
+        self.rows: list = []                 # list[Segment]
+        self.marks: list[bool] = []
+        self.result: Optional[tuple[Optional[str], Optional[str], list]] = None
+
+        self.title("話者をまとめて置き換える")
+        self.transient(master)
+        self._names = [(sp.name, sp.id) for sp in master.proj.speakers]
+        self.var_after_time = tk.StringVar()
+        self.var_status = tk.StringVar(value="置き換える人を選んで［探す］。")
+        self._build()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+
+    # ------------------------------------------------------------------
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            self, wraplength=720,
+            text="途中で退席した人の発言を、まとめて別の人に付け替えます。"
+                 "退席の直前は本人の発言なので（「中座させてもらいます」など）、"
+                 "前後を読んで、変えない行は × にしてください。",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
+
+        top = ttk.Frame(self)
+        top.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
+        ttk.Label(top, text="いまの話者:").pack(side="left")
+        self.cmb_before = ttk.Combobox(top, state="readonly", width=22,
+                                       values=[n for n, _ in self._names])
+        self.cmb_before.pack(side="left", padx=(4, 10))
+        ttk.Label(top, text="→  こちらにする:").pack(side="left")
+        self.cmb_after = ttk.Combobox(top, state="readonly", width=22,
+                                      values=[n for n, _ in self._names])
+        self.cmb_after.pack(side="left", padx=(4, 14))
+        ttk.Label(top, text="この時刻より後だけ:").pack(side="left")
+        self.ent_time = ttk.Entry(top, textvariable=self.var_after_time, width=10)
+        self.ent_time.pack(side="left", padx=(4, 2))
+        ttk.Label(top, text="(32:17 のように。空なら全部)",
+                  foreground="#666").pack(side="left", padx=(0, 10))
+        ttk.Button(top, text="探す", command=self.search).pack(side="left")
+        self.ent_time.bind("<Return>", lambda e: self.search())
+
+        cols = ("mark", "at", "seen", "text")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings",
+                                 height=14, selectmode="browse")
+        for key, label, width, anchor in (
+                ("mark", "変える", 52, "center"),
+                ("at", "時刻", 78, "center"),
+                ("seen", "印", 40, "center"),
+                ("text", "発言", 600, "w")):
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor=anchor)
+        self.tree.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(row=2, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<space>", lambda e: (self._toggle_selected(), "break"))
+
+        ttk.Label(self, textvariable=self.var_status, foreground="#666",
+                  wraplength=720)\
+            .grid(row=3, column=0, sticky="w", padx=12, pady=(6, 0))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
+        ttk.Button(btns, text="全部に○", command=lambda: self._mark_all(True))\
+            .pack(side="left")
+        ttk.Button(btns, text="全部に×", command=lambda: self._mark_all(False))\
+            .pack(side="left", padx=6)
+        ttk.Button(btns, text="やめる", command=self._close).pack(side="right")
+        self.btn_ok = ttk.Button(btns, text="置き換える", command=self._ok,
+                                 state="disabled")
+        self.btn_ok.pack(side="right", padx=6)
+
+    # ------------------------------------------------------------------
+    def _id_of(self, cmb: ttk.Combobox) -> Optional[str]:
+        i = cmb.current()
+        return self._names[i][1] if 0 <= i < len(self._names) else None
+
+    def search(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        self.rows, self.marks = [], []
+        sid = self._id_of(self.cmb_before)
+        if sid is None:
+            self.var_status.set("いまの話者を選んでください。")
+            self._refresh_ok()
+            return
+        raw = self.var_after_time.get().strip()
+        floor = None
+        if raw:
+            floor = parse_hms(raw)
+            if floor is None:
+                messagebox.showwarning(
+                    "時刻を読み取れません",
+                    "32:17 や 1:04:30 のように入れてください。", parent=self)
+                return
+        self.rows = [s for s in self.win.proj.segments
+                     if s.speaker_id == sid
+                     and (floor is None or s.start > floor)]
+        self.marks = [True] * len(self.rows)
+        for i, s in enumerate(self.rows):
+            self.tree.insert("", "end", iid=str(i), values=(
+                self.MARK_ON, fmt_short_time(s.start),
+                "✓" if s.reviewed else "△", (s.text or "")[:80]))
+        if not self.rows:
+            self.var_status.set("その条件に当てはまる区間はありません。")
+        self._refresh_ok()
+
+    # ------------------------------------------------------------------
+    def _on_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        row = self.tree.identify_row(event.y)
+        if row and self.tree.identify_column(event.x) == "#1":
+            self._toggle(int(row))
+
+    def _toggle_selected(self) -> None:
+        sel = self.tree.selection()
+        if sel:
+            self._toggle(int(sel[0]))
+
+    def _toggle(self, i: int) -> None:
+        if not (0 <= i < len(self.marks)):
+            return
+        self.marks[i] = not self.marks[i]
+        self.tree.set(str(i), "mark",
+                      self.MARK_ON if self.marks[i] else self.MARK_OFF)
+        self._refresh_ok()
+
+    def _mark_all(self, on: bool) -> None:
+        for i in range(len(self.marks)):
+            self.marks[i] = on
+            self.tree.set(str(i), "mark", self.MARK_ON if on else self.MARK_OFF)
+        self._refresh_ok()
+
+    def _refresh_ok(self) -> None:
+        n = sum(self.marks)
+        self.btn_ok.configure(
+            text=f"この {n} 区間を置き換える" if n else "置き換える",
+            state="normal" if n else "disabled")
+        if not self.rows:
+            return
+        heard = sum(1 for s, m in zip(self.rows, self.marks) if m and s.reviewed)
+        msg = (f"{len(self.rows)} 区間のうち {n} 区間を置き換えます。"
+               "置き換えた区間はすべて △(まとめて適用)になります"
+               "——確かめたのは「その人は居なかった」ことであって、"
+               "1 区間ずつの声ではないためです。")
+        if heard:
+            msg += f" うち {heard} 区間は今 ✓(聴いて確定)で、△ に戻ります。"
+        self.var_status.set(msg)
+
+    # ------------------------------------------------------------------
+    def _ok(self) -> None:
+        before, after = self._id_of(self.cmb_before), self._id_of(self.cmb_after)
+        if after is None:
+            messagebox.showwarning(
+                "付け替える先が未選択です",
+                "「こちらにする」で人を選んでください。", parent=self)
+            return
+        if before == after:
+            messagebox.showwarning(
+                "同じ人です", "違う人を選んでください。", parent=self)
+            return
+        chosen = [segment_key(s) for s, m in zip(self.rows, self.marks) if m]
+        if not chosen:
+            return
+        self.result = (before, after, chosen)
+        self._close()
+
+    def _close(self) -> None:
+        self.grab_release()
+        self.destroy()
 
 
 class ReplaceWordsDialog(tk.Toplevel):

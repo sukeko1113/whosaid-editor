@@ -37,6 +37,7 @@ from src.assign_gui import (  # noqa: E402
     AssignWindow,
     ProposalDialog,
     ReplaceWordsDialog,
+    ReplaceSpeakerDialog,
     fmt_short_time,
     RosterDialog,
     ProposalRow,
@@ -1541,6 +1542,56 @@ def run() -> int:
               ap.segments[1].text_edited is True)
         for _i, _t in enumerate(_keep):
             ap.segments[_i].text = _t
+        awin.reload_tree()
+
+        # --- 話者をまとめて置き換える（途中退席）------------------------
+        # **退席の直前は本人の発言。**「中座させてもらいます」まで
+        # 付け替えると壊れる。
+        _snap = [(x.speaker_id, x.reviewed) for x in ap.segments]
+        _yo, _ni = ap.speakers[0].id, ap.speakers[1].id
+        for _x in ap.segments:
+            _x.speaker_id, _x.reviewed = _yo, False
+        ap.segments[2].reviewed = True          # ✓ が 1 つある状態
+        _sd = ReplaceSpeakerDialog(awin)
+        try:
+            _sd.update()
+            _sd.cmb_before.current(0)
+            _sd.cmb_after.current(1)
+            _sd.var_after_time.set(fmt_short_time(ap.segments[1].start))
+            _sd.search()
+            _sd.update()
+            check("時刻より後だけを拾う",
+                  bool(_sd.rows)
+                  and all(x.start > ap.segments[1].start for x in _sd.rows))
+            check("その時刻以前は入らない（退席の発言は本人）",
+                  ap.segments[1] not in _sd.rows)
+            check("✓ の区間には印が出る",
+                  any(_sd.tree.set(i, "seen") == "✓"
+                      for i in _sd.tree.get_children()))
+            check("△ に戻ることを画面で伝える",
+                  "△" in _sd.var_status.get())
+            _sd._toggle(0)
+            _sd.update()
+            check("×にできる", _sd.marks[0] is False)
+            _sd._mark_all(True)
+            _sd._ok()
+            check("選んだぶんを返す",
+                  _sd.result is not None
+                  and len(_sd.result[2]) == len(_sd.rows))
+        finally:
+            try:
+                _sd.destroy()
+            except tk.TclError:
+                pass
+        _moved = ap.replace_speaker(*_sd.result) if _sd.result else 0
+        check("退席より後だけ付け替わる",
+              _moved == len(_sd.rows)
+              and ap.segments[1].speaker_id == _yo
+              and all(x.speaker_id == _ni for x in _sd.rows))
+        check("付け替えた区間は ✓ を持たない（まとめて適用なので △）",
+              all(x.reviewed is False for x in _sd.rows))
+        for _i, (_sp, _rv) in enumerate(_snap):
+            ap.segments[_i].speaker_id, ap.segments[_i].reviewed = _sp, _rv
         awin.reload_tree()
 
         # --- 本文欄の書き戻しは、読み込んだ区間にだけ効く ----------------

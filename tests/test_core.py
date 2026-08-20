@@ -3085,6 +3085,78 @@ def test_replace_text_does_nothing_without_a_target():
     assert not [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
 
 
+def _for_leave() -> Project:
+    """途中退席の形。32:17 に本人が「中座します」と言って帰る。"""
+    proj = Project(audio_path="a.m4a", duration=4000.0)
+    proj.speakers = parse_roster("吉沢忠一" + chr(10) + "西村香介")
+    yo, ni = proj.speakers[0].id, proj.speakers[1].id
+    proj.segments = [
+        Segment(index=0, start=100.0, end=110.0, text="冒頭のあいさつ",
+                cluster="g:A", speaker_id=yo, reviewed=True),
+        Segment(index=1, start=1937.0, end=1945.0, text="ちょっと中座させて",
+                cluster="g:A", speaker_id=yo, reviewed=True),
+        Segment(index=2, start=2000.0, end=2010.0, text="その後の発言",
+                cluster="g:A", speaker_id=yo, reviewed=False),
+        Segment(index=3, start=3874.0, end=3880.0, text="申し訳ありませんでした。",
+                cluster="g:A", speaker_id=yo, reviewed=True),
+    ]
+    return proj
+
+
+def test_replace_speaker_only_touches_the_chosen_segments():
+    """**退席の直前は本人の発言。**一律に変えると壊れる。"""
+    proj = _for_leave()
+    yo, ni = proj.speakers[0].id, proj.speakers[1].id
+    after = [s for s in proj.segments if s.start > 1950]
+    n = proj.replace_speaker(yo, ni, [segment_key(s) for s in after])
+    assert n == 2
+    assert proj.segments[0].speaker_id == yo   # 冒頭
+    assert proj.segments[1].speaker_id == yo   # 「中座させて」は本人
+    assert proj.segments[2].speaker_id == ni
+    assert proj.segments[3].speaker_id == ni
+
+
+def test_replace_speaker_never_keeps_the_heard_mark():
+    """**✓ のまま残さない。**確かめたのは「居なかった」ことであって声ではない。
+
+    ✓ を残すと「1 区間ずつ聴いて確かめた」という意味になり、`reviewed` の
+    意味論が壊れる（CLAUDE.md）。
+    """
+    proj = _for_leave()
+    yo, ni = proj.speakers[0].id, proj.speakers[1].id
+    heard = proj.segments[3]
+    assert heard.reviewed is True              # この検査の前提
+    proj.replace_speaker(yo, ni, [segment_key(heard)])
+    assert heard.speaker_id == ni
+    assert heard.reviewed is False, "機械が ✓ を立てる経路ができている"
+
+
+def test_replace_speaker_records_one_judgement_with_before():
+    """記録は 1 件。**`before` も残す**（編集履歴 §1.1・§1.2）。"""
+    proj = _for_leave()
+    yo, ni = proj.speakers[0].id, proj.speakers[1].id
+    after = [s for s in proj.segments if s.start > 1950]
+    proj.replace_speaker(yo, ni, [segment_key(s) for s in after])
+    recs = [r for r in proj.edit_log if r.get("op") == "replace_speaker_bulk"]
+    assert len(recs) == 1, proj.edit_log
+    assert recs[0]["before"] == yo and recs[0]["after"] == ni
+    assert recs[0]["count"] == 2
+    # ✓ から △ に落ちたものが分かる（あとで聴き直す手がかり）
+    assert recs[0]["was_reviewed"] == [list(segment_key(proj.segments[3]))]
+    assert "replace_speaker_bulk" in LOG_LABELS
+
+
+def test_replace_speaker_ignores_segments_of_other_people():
+    """指定に他人の区間が混ざっても巻き込まない。"""
+    proj = _for_leave()
+    yo, ni = proj.speakers[0].id, proj.speakers[1].id
+    proj.segments[2].speaker_id = ni           # もう西村になっている
+    n = proj.replace_speaker(yo, ni, [segment_key(s) for s in proj.segments])
+    assert n == 3                               # 吉沢のままの 3 区間だけ
+    assert proj.replace_speaker(yo, yo, [segment_key(proj.segments[0])]) == 0
+    assert proj.replace_speaker(yo, ni, []) == 0
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

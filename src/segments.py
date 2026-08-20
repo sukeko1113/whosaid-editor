@@ -956,6 +956,44 @@ class Project:
         self._log("assign_bulk", after=speaker_id,
                   heard=heard, bulk=bulk, count=len(heard) + len(bulk))
 
+    def replace_speaker(self, before_id: Optional[str], after_id: Optional[str],
+                        keys: Sequence[tuple[float, float]]) -> int:
+        """選ばれた区間の話者を、別の人に付け替える。直した数を返す。
+
+        使いどころは**途中退席**——「32:17 に吉沢さんが帰ったので、それ以降の
+        吉沢忠一は全部西村香介」。実データで 108 区間あった（2026-08-20）。
+
+        **すべて △（まとめて適用）になる。**元が ✓ でも △ に落ちる。
+        人が確かめたのは「その人はもう居なかった」という事実であって、
+        区間ごとの声ではない。✓ のまま残すと「1 区間ずつ聴いて確かめた」
+        という意味になり、`reviewed` の意味論が壊れる（CLAUDE.md）。
+
+        **記録は 1 件。**人の判断は「吉沢は 32:17 に帰った」の 1 回。
+        `before` も残す（何を何に直したかが無ければ検証履歴にならない
+        ——編集履歴設計書 §1.2）。
+        """
+        if before_id == after_id:
+            return 0
+        want = {(round(float(k[0]), 3), round(float(k[1]), 3)) for k in keys}
+        if not want:
+            return 0
+        targets: list[list[float]] = []
+        undone: list[list[float]] = []      # ✓ から △ に落ちたもの
+        for seg in self.segments:
+            if segment_key(seg) not in want or seg.speaker_id != before_id:
+                continue
+            if seg.reviewed:
+                undone.append(self._key(seg))
+            seg.speaker_id = after_id
+            seg.reviewed = False            # 機械が ✓ を立てる経路は作らない
+            targets.append(self._key(seg))
+        if not targets:
+            return 0
+        self._log("replace_speaker_bulk", before=before_id, after=after_id,
+                  targets=targets, count=len(targets),
+                  was_reviewed=undone)
+        return len(targets)
+
     def restore_assignments(
         self, snapshot: Sequence[tuple[int, Optional[str], bool]]
     ) -> None:
@@ -1583,6 +1621,7 @@ LOG_LABELS = {
     "clear_speakers": "名簿から外れた割当",
     "edit_text": "本文",
     "replace_text_bulk": "語句(まとめて)",
+    "replace_speaker_bulk": "話者の置き換え",
     "edit_time": "時刻",
     "apply_times_bulk": "時刻(まとめて)",
     "revert_time": "時刻を戻した",
