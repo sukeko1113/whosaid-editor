@@ -1,14 +1,21 @@
-"""ユーザ設定の保存・読み込み (%APPDATA%\\GeminiTranscriber\\config.json)"""
+"""ユーザ設定の保存・読み込み (%APPDATA%\\WhosaidEditor\\config.json)"""
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 
-APP_NAME = "GeminiTranscriber"
+APP_NAME = "WhosaidEditor"
+
+# **旧名。設定を引き継ぐためだけに残す。**2026-08-21 に改名した
+# （「Gemini 文字起こし」→「Whosaid 反訳エディタ」）。既定はローカルなので
+# Gemini の名を冠するのは事実と違い、他社の商標でもある。
+# **消さないこと**——消すと旧版からの利用者が API キーも名簿も失う。
+LEGACY_APP_NAMES = ("GeminiTranscriber",)
 
 # アプリの版。installer.iss の MyAppVersion と揃えること(現状は手動同期。
 # Day 60 のインストーラ作業で一元化を検討)。Word の検証要約に併記される。
@@ -47,7 +54,35 @@ def config_dir() -> Path:
         base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     d = base / APP_NAME
     d.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy(base, d)
     return d
+
+
+def _migrate_legacy(base: Path, dest: Path) -> None:
+    """旧名のフォルダから設定を引き継ぐ（1 回だけ）。
+
+    改名で `%APPDATA%` の場所が変わるため、そのままだと旧版の利用者が
+    API キーも名簿も失う。**新しい側に config.json が無いときだけ**持ってくる。
+
+    **旧フォルダは消さない。**旧版に戻したい人が残っているかもしれないし、
+    消す理由もない（数 KB）。引き継いだことは印を置いて残す。
+    """
+    if (dest / "config.json").exists():
+        return
+    for old in LEGACY_APP_NAMES:
+        src = base / old / "config.json"
+        if not src.is_file():
+            continue
+        try:
+            shutil.copy2(src, dest / "config.json")
+            (dest / "migrated-from.txt").write_text(
+                f"{old} から設定を引き継ぎました。\n"
+                f"元: {src}\n"
+                "旧フォルダはそのまま残してあります。\n",
+                encoding="utf-8")
+        except OSError:
+            pass        # 引き継げなくても起動は止めない（設定が空になるだけ）
+        return
 
 
 def config_path() -> Path:

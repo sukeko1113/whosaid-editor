@@ -29,7 +29,7 @@ from .transcribe import FatalTranscriptionError
 from .segments import ENGINE_CLOUD, ENGINE_LOCAL, Project
 
 
-APP_TITLE = "Gemini 文字起こし"
+APP_TITLE = "Whosaid 反訳エディタ"
 MODELS = [DEFAULT_CLOUD_MODEL, "gemini-2.5-pro"]
 
 MODE_MANUAL = "manual"

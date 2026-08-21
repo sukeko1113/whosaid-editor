@@ -1,4 +1,4 @@
-# Gemini 文字起こし
+# Whosaid 反訳エディタ
 
 長尺の音声ファイル(m4a / mp3 / wav 等)を文字起こしし、
 **話者を確定させたうえで** 1 つの Word ファイル(.docx)にまとめる Windows デスクトップアプリです。
@@ -36,9 +36,9 @@ Word 上で直すのは、音声と突き合わせる作業になり非常に手
 
 ## クイックスタート
 
-1. [Releases](../../releases) から最新の `GeminiTranscriberSetup-x.y.z.exe` をダウンロード
+1. [Releases](../../releases) から最新の `WhosaidEditorSetup-x.y.z.exe` をダウンロード
 2. インストーラを実行
-3. スタートメニューから「Gemini 文字起こし」を起動
+3. スタートメニューから「Whosaid 反訳エディタ」を起動
 4. 音声ファイル選択 → 出席者を入力 → 「文字起こし → 割当画面へ」
    (既定のローカル処理なら API キーは要りません。クラウドを選ぶ場合だけ貼付)
 
@@ -282,9 +282,9 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
 4. **(任意) アイコンを置く**: `resources\icon.ico`。
 
-5. **`build.bat` をダブルクリック** → `Output\GeminiTranscriberSetup-2.1.0.exe`。
+5. **`build.bat` をダブルクリック** → `Output\WhosaidEditorSetup-2.1.0.exe`。
 
-> Inno Setup を入れずにビルドした場合は、`dist\GeminiTranscriber\` をフォルダごと
+> Inno Setup を入れずにビルドした場合は、`dist\WhosaidEditor\` をフォルダごと
 > コピーすれば動きます(ポータブル運用)。
 
 ### GitHub Actions による自動ビルド
@@ -292,7 +292,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 `main` への push、または `v*` タグの push で Windows ランナー上で自動ビルドが走ります。
 テスト(`tests/`)も同じジョブで実行されます。
 
-- **PR / push**: `Actions` タブから `GeminiTranscriber-Installer` artifact をダウンロード可能
+- **PR / push**: `Actions` タブから `WhosaidEditor-Installer` artifact をダウンロード可能
 - **タグ push** (`git tag v2.1.0 && git push --tags`): 自動で Release を作成し `.exe` を添付
 
 ---

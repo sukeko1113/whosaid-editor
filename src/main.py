@@ -1,4 +1,4 @@
-"""Gemini 文字起こしアプリ - エントリーポイント"""
+"""Whosaid 反訳エディタ - エントリーポイント"""
 import sys
 import traceback
 import tkinter as tk

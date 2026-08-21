@@ -50,7 +50,7 @@ Gemini のタイムスタンプは実音声と局所的にずれる(既知の未
 - 秒 → `"HH:MM:SS.s"` の `fmt_hms_frac()` と、`"HH:MM:SS.s"` / `"MM:SS.s"` / `"SS.s"` のいずれも受ける `parse_hms()` を追加(0.1秒精度)。
 - 旧(schema 2)ファイルは `from_dict` の既定値だけで読める(移行処理不要)。保存は 3 で書く。
 
-**触らないこと**: Day 30 に一括予定の他フィールド(`source_sha256` / 区間ごとの `engine` / `doc_version` / `edit_log`)、および `GeminiTranscriber` 系識別子(APP_NAME / build.spec / installer.iss の AppId 等)の改名。`edit_log` 導入時に時刻編集の記録もそちらへ含める(将来)。
+**触らないこと**: Day 30 に一括予定の他フィールド(`source_sha256` / 区間ごとの `engine` / `doc_version` / `edit_log`)、（`GeminiTranscriber` 系識別子の改名は 2026-08-21 に実施済み）。`edit_log` 導入時に時刻編集の記録もそちらへ含める(将来)。
 
 ---
 

@@ -639,7 +639,7 @@ VAD 有効）は 3〜5 倍を見込めるが、精度への影響が未測定で
 壊れたときにどちらが原因か分からなくなる。2 は「リファクタのみ・出力バイト一致」で確認できる。
 
 - 作業ブランチ: `feature/local-transcribe`（main から新規）。
-- 旧名称（GeminiTranscriber）のリネームは Day 60 のインストーラ作業と同時。**本作業では触らない。**
+- 旧名称（GeminiTranscriber）のリネームは **2026-08-21 に実施済み**（`WhosaidEditor` /「Whosaid 反訳エディタ」）。旧名は `config.LEGACY_APP_NAMES` にだけ残す（設定の引き継ぎに要る）。
 
 ## 14. 決定事項
 

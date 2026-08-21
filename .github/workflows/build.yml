@@ -102,10 +102,10 @@ jobs:
       - name: Smoke test (exe should exist)
         shell: pwsh
         run: |
-          if (-not (Test-Path 'dist/GeminiTranscriber/GeminiTranscriber.exe')) {
+          if (-not (Test-Path 'dist/WhosaidEditor/WhosaidEditor.exe')) {
             throw 'Build artifact not found'
           }
-          Get-ChildItem dist/GeminiTranscriber | Select-Object Name, Length
+          Get-ChildItem dist/WhosaidEditor | Select-Object Name, Length
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -117,15 +117,15 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiTranscriber-Installer
+          name: WhosaidEditor-Installer
           path: Output/*.exe
           if-no-files-found: error
 
       - name: Upload portable build (zip)
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiTranscriber-Portable
-          path: dist/GeminiTranscriber/**
+          name: WhosaidEditor-Portable
+          path: dist/WhosaidEditor/**
 
       - name: Create GitHub Release on tag
         if: startsWith(github.ref, 'refs/tags/v')

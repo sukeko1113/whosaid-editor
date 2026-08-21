@@ -3397,6 +3397,67 @@ def test_no_retry_when_nothing_looks_wrong():
     assert calls == [True], "起こし直してしまっている"
 
 
+def test_config_is_carried_over_from_the_old_name():
+    """**改名で利用者の設定を失わせない。**
+
+    `%APPDATA%` の置き場が変わるので、そのままだと旧版の利用者が
+    API キーも名簿も失う（2026-08-21 の改名: GeminiTranscriber →
+    WhosaidEditor）。
+    """
+    import os
+    import tempfile
+    from unittest import mock
+    import src.config as cfg
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text(
+            '{"api_key": "abc", "local_model": "large-v3"}', encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+        assert got.get("api_key") == "abc", "引き継げていない"
+        assert got.get("local_model") == "large-v3"
+        new_dir = base / cfg.APP_NAME
+        assert (new_dir / "config.json").exists()
+        assert (new_dir / "migrated-from.txt").exists(), "経緯が残っていない"
+        # **旧フォルダは消さない**（旧版に戻したい人がいるかもしれない）
+        assert (old / "config.json").exists()
+
+
+def test_config_migration_never_overwrites_the_new_one():
+    """新しい側に設定があれば、旧名から上書きしない。"""
+    import os
+    import tempfile
+    from unittest import mock
+    import src.config as cfg
+
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text('{"api_key": "古い"}', encoding="utf-8")
+        new_dir = base / cfg.APP_NAME
+        new_dir.mkdir()
+        (new_dir / "config.json").write_text('{"api_key": "新しい"}',
+                                             encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+        assert got.get("api_key") == "新しい", "旧名の設定で上書きされた"
+
+
+def test_app_name_no_longer_claims_gemini():
+    """**名前が事実と食い違わないこと。**既定はローカルで、録音は外に出ない。
+
+    「Gemini」は他社の商標でもある。旧名は引き継ぎのためだけに残す。
+    """
+    import src.config as cfg
+    assert cfg.APP_NAME == "WhosaidEditor"
+    assert "Gemini" not in cfg.APP_NAME
+    assert "GeminiTranscriber" in cfg.LEGACY_APP_NAMES, "引き継ぎ先が消えている"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

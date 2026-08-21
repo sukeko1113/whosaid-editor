@@ -80,7 +80,7 @@ class SegmentPlayer:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._token = 0
-        self._tempdir = Path(tempfile.gettempdir()) / "GeminiTranscriberPlay"
+        self._tempdir = Path(tempfile.gettempdir()) / "WhosaidEditorPlay"
         self._winsound_active = False
         self.on_finished = on_finished
         self.ffplay = find_ffplay()

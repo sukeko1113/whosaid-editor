@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller spec - GeminiTranscriber
+"""PyInstaller spec - WhosaidEditor
 
 ビルド前提:
 - ffmpeg/ffmpeg.exe を配置済み(Windows)
@@ -107,7 +107,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="GeminiTranscriber",
+    name="WhosaidEditor",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -128,5 +128,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="GeminiTranscriber",
+    name="WhosaidEditor",
 )
