@@ -77,19 +77,31 @@ def add_cuda_dll_path() -> None:
     """
     if sys.platform != "win32":
         return                      # Linux/macOS は既定の探索先で見つかる
+
+    dirs: list[Path] = []
+    # **利用者が取ってきたぶん。**配布物には同梱しない(NVIDIA の条件と
+    # 本体の MIT が噛み合わないため。cuda_fetch の冒頭を見よ)。
+    try:
+        from .cuda_fetch import cuda_dir
+        d = cuda_dir()
+        if d.is_dir():
+            dirs.append(d)
+    except Exception:
+        pass
+    # 開発環境で pip 経由で入れているぶん
     try:
         import nvidia
+        dirs.extend(p for root in getattr(nvidia, "__path__", [])
+                    for p in Path(root).glob("*/bin") if p.is_dir())
     except ImportError:
-        return
-    for root in getattr(nvidia, "__path__", []):
-        for d in Path(root).glob("*/bin"):
-            if not d.is_dir():
-                continue
-            os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
-            try:
-                os.add_dll_directory(str(d))
-            except OSError:
-                pass
+        pass
+
+    for d in dirs:
+        os.environ["PATH"] = str(d) + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(str(d))
+        except OSError:
+            pass
 
 
 def cuda_available() -> bool:

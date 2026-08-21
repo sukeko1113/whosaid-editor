@@ -18,6 +18,7 @@ from typing import Optional
 
 from . import align
 from . import asr_fetch
+from . import cuda_fetch
 from .align import AVAILABLE_MODELS as LOCAL_MODELS
 # **既定はこの機械の装置で決まる。**GPU があれば large-v3、無ければ
 # small(CPU で large-v3 は実時間比が数倍で実用外)。呼び出しのたびに
@@ -732,15 +733,27 @@ class App(tk.Tk):
         if not model:
             return
 
+        # **足りないものを両方まとめて聞く。**モデルだけ取っても、GPU で
+        # 動かす部品(cuBLAS)が無ければ CPU に落ちる。2 回に分けて聞くと
+        # 「取得したのに速くならない」になる。
+        need_cuda = not cuda_fetch.is_available()
         mb = asr_fetch.SIZES_MB.get(model, 0)
+        parts = [f"　・{model}（約 {mb:,} MB）"]
+        if need_cuda:
+            parts.append("　・GPU で動かすための部品（約 "
+                         f"{cuda_fetch.WHEEL_SIZE_MB:,} MB）")
+        total = mb + (cuda_fetch.WHEEL_SIZE_MB if need_cuda else 0)
         want = messagebox.askyesno(
             "この PC の GPU を使えます",
             f"{model} を使うと、実測で\n"
             "　・誤字が約 4 割減ります（11.9% → 7.0%）\n"
             "　・聞き取れなかった発言も拾えます（11/34 → 17/34）\n"
             "　・処理も速くなります（67 分の音声に 24 分 → 15 分）\n\n"
-            f"初回だけ 約 {mb:,} MB の取得が要ります。\n"
-            "通信するのは Hugging Face とだけで、録音や本文は送りません。\n\n"
+            "初回だけ、次の取得が要ります。\n"
+            + "\n".join(parts) + f"\n　　合計 約 {total:,} MB\n\n"
+            "取得元は Hugging Face"
+            + ("と NVIDIA（PyPI）" if need_cuda else "")
+            + "で、録音や本文は送りません。\n\n"
             "取得しますか？（あとで設定画面から選ぶこともできます）",
             parent=self)
 
@@ -763,12 +776,17 @@ class App(tk.Tk):
                          "この間もほかの操作はできます。")
 
         def work() -> None:
+            def log(m: str) -> None:
+                self.msg_queue.put(("log", m))
+
+            def prog(a: int, b: int) -> None:
+                self.msg_queue.put(("fetch_progress", (a, b)))
+
             try:
-                asr_fetch.fetch(
-                    model,
-                    on_log=lambda m: self.msg_queue.put(("log", m)),
-                    on_progress=lambda a, b: self.msg_queue.put(
-                        ("fetch_progress", (a, b))))
+                # **部品を先に。**モデルだけあっても GPU では動かない。
+                if not cuda_fetch.is_available():
+                    cuda_fetch.fetch(on_log=log, on_progress=prog)
+                asr_fetch.fetch(model, on_log=log, on_progress=prog)
                 self.msg_queue.put(("fetch_done", model))
             except Exception as e:
                 self.msg_queue.put(("fetch_failed", str(e)))

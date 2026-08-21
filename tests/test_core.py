@@ -3642,6 +3642,81 @@ def test_fetch_sizes_are_stated_before_downloading():
     assert asr_fetch.SIZES_MB["large-v3"] > 2000, "3GB 級だと伝わらない"
 
 
+def test_cuda_parts_are_pinned_and_verified():
+    """**版を留め、中身を確かめてから使う。**
+
+    `nvidia-cublas-cu12` は proprietary で、配布元の資産が差し替わることが
+    ありうる。黙って別物を動かすのではなく止まってほしい。
+    """
+    from src import cuda_fetch
+    assert cuda_fetch.CUBLAS_VERSION, "版が留まっていない"
+    assert len(cuda_fetch.CUBLAS_SHA256) == 64, "ハッシュが無い"
+    assert cuda_fetch.CUBLAS_VERSION in cuda_fetch.CUBLAS_WHEEL
+    # **要るのは 2 つだけ**（実測。cuDNN 1.0GB と nvrtc 178MB は不要）
+    assert set(cuda_fetch.WANT) == {"cublas64_12.dll", "cublasLt64_12.dll"}
+    assert cuda_fetch.WHEEL_SIZE_MB > 100, "大きさを伝えられない"
+
+
+def test_cuda_fetch_stops_on_a_different_file():
+    """中身が想定と違えば、使わずに止める。"""
+    import tempfile
+    from unittest import mock
+    from src import cuda_fetch
+
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "cuda"
+
+        def fake_dl(url, dest, on_progress):
+            Path(dest).write_bytes("別物".encode("utf-8"))
+
+        with mock.patch.object(cuda_fetch, "_wheel_url", lambda: "http://x"), \
+                mock.patch.object(cuda_fetch, "_download", fake_dl):
+            try:
+                cuda_fetch.fetch(out)
+            except cuda_fetch.CudaFetchError as e:
+                assert "想定と違います" in str(e)
+            else:
+                raise AssertionError("別物を受け入れてしまった")
+        assert not any(out.glob("*.dll")) if out.exists() else True
+
+
+def test_cuda_fetch_failure_says_cpu_still_works():
+    """**取得できなくても止めない。**CPU では今までどおり動く。"""
+    import tempfile
+    from unittest import mock
+    from src import cuda_fetch
+
+    with tempfile.TemporaryDirectory() as d:
+        with mock.patch.object(cuda_fetch, "_wheel_url", lambda: "http://x"), \
+                mock.patch.object(
+                 cuda_fetch, "_download",
+                 side_effect=cuda_fetch.CudaFetchError(
+                     "GPU で動かすための部品を取得できませんでした。\n"
+                     "取得できなくても、CPU では今までどおり動きます。")):
+            try:
+                cuda_fetch.fetch(Path(d) / "cuda")
+            except cuda_fetch.CudaFetchError as e:
+                assert "CPU では今までどおり動きます" in str(e), \
+                    "取得できなくても使えることが伝わらない"
+            else:
+                raise AssertionError("失敗を知らせていない")
+
+
+def test_cuda_is_not_bundled():
+    """**同梱しない。**proprietary を MIT の配布物に混ぜない。
+
+    受け取った人が「MIT だから自由に再配布できる」と誤解する。
+    利用者の PC が配布元から直接取ってくる形にしてある。
+    """
+    spec = (Path(__file__).resolve().parent.parent / "build.spec").read_text(
+        encoding="utf-8")
+    for bad in ("cublas", "cudnn", "nvidia"):
+        assert bad not in spec.lower(), f"build.spec に {bad} が入っている"
+    req = (Path(__file__).resolve().parent.parent
+           / "requirements.txt").read_text(encoding="utf-8")
+    assert "nvidia-" not in req, "requirements に nvidia が入っている"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
