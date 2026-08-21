@@ -125,14 +125,36 @@ def pick_device(prefer_gpu: bool = True) -> tuple[str, str]:
 
 
 def default_model(device: Optional[str] = None) -> str:
-    """その装置での既定モデル。GPU なら large-v3、CPU なら small。
+    """その装置での既定モデル。**手元にあるものだけを既定にする。**
+
+    GPU があれば large-v3 のほうが速くて正確だが（§9.5.1）、**同梱して
+    いない**（3GB あり、GitHub Releases の 1 ファイル 2GB に載らない）。
+    無いものを既定にすると、初回の転写でいきなり 3GB の取得が始まる。
+    **断りも入れずに 3GB を落とすことはしない**ので、取得済みのときだけ
+    既定にする。取得を勧めるのは画面側の仕事（一度だけ聞く）。
 
     装置を省くと `pick_device()` で判定する。**利用者が明示的に選んだ
     モデルは尊重する**(ここは「何も選ばなかったとき」の話)。
     """
     if device is None:
         device, _ = pick_device()
-    return GPU_DEFAULT_MODEL if device == GPU_DEVICE else DEFAULT_MODEL
+    if device == GPU_DEVICE and find_bundled_model(GPU_DEFAULT_MODEL):
+        return GPU_DEFAULT_MODEL
+    return DEFAULT_MODEL
+
+
+def suggest_gpu_model() -> Optional[str]:
+    """勧められるのに手元に無いモデル。無ければ None。
+
+    画面が「取得しますか」と聞くために使う。**聞くのは一度だけ**で、
+    断られたら二度と聞かない（その記録は設定側が持つ）。
+    """
+    device, _ = pick_device()
+    if device != GPU_DEVICE:
+        return None
+    if find_bundled_model(GPU_DEFAULT_MODEL):
+        return None
+    return GPU_DEFAULT_MODEL
 
 
 @dataclass
@@ -167,12 +189,21 @@ def asr_model_dirs(model: str) -> list[Path]:
     env = os.environ.get("WHOSAID_ASR_MODELS")
     if env:
         out.append(Path(env) / model)
+    # **あとから取得したものはここ。**同梱先(_MEIPASS)は一時展開なので
+    # 書けないし、実行ファイルの隣は Program Files で管理者権限が要る。
+    out.append(downloaded_model_root() / model)
     if getattr(sys, "frozen", False):           # PyInstaller で固めた実行形式
         out.append(Path(getattr(sys, "_MEIPASS", ".")) / "models" / "asr" / model)
         out.append(Path(sys.executable).parent / "models" / "asr" / model)
     else:
         out.append(Path(__file__).resolve().parent.parent / "models" / "asr" / model)
     return out
+
+
+def downloaded_model_root() -> Path:
+    """あとから取得したモデルの置き場（利用者ごと・書き込める場所）。"""
+    from .config import config_dir       # 循環を避けてここで読む
+    return config_dir() / "models" / "asr"
 
 
 def find_bundled_model(model: str) -> Optional[Path]:

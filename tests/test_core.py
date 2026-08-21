@@ -3502,7 +3502,10 @@ def test_bundled_model_is_used_before_the_network():
         root = Path(d)
         (root / "small").mkdir()
         (root / "small" / "model.bin").write_bytes(b"x")
-        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+        # **探し場所ごと差し替える。**環境変数だけだと、この機械に実際に
+        # 取得済みのモデルがあると拾ってしまい、検査が環境に依存する
+        # （実際にそうなった・2026-08-21）。
+        with mock.patch.object(align, "asr_model_dirs", lambda m: [root / m]):
             assert align.find_bundled_model("small") == root / "small"
             assert align.resolve_model("small") == str(root / "small")
             # 同梱していないものは名前のまま（faster-whisper が取りに行く）
@@ -3523,7 +3526,7 @@ def test_model_dir_still_wins_over_the_bundled_one():
         hand = root / "手で置いた"
         hand.mkdir()
         (hand / "model.bin").write_bytes(b"y")
-        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+        with mock.patch.object(align, "asr_model_dirs", lambda m: [root / m]):
             assert align.resolve_model("small", model_dir=hand) == str(hand)
 
 
@@ -3541,7 +3544,9 @@ def test_bundled_model_needs_the_weights():
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         (root / "small").mkdir()          # model.bin が無い
-        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+        with mock.patch.object(
+                align, "asr_model_dirs",
+                lambda m: [root / m, Path("models/asr") / m]):
             got = align.find_bundled_model("small")
             assert got != root / "small", "中身の無いフォルダを掴んでいる"
         # どこにも無ければ None（名前のまま返り、faster-whisper が取りに行く）
@@ -3549,6 +3554,92 @@ def test_bundled_model_needs_the_weights():
                                lambda m: [root / "small"]):
             assert align.find_bundled_model("small") is None
             assert align.resolve_model("small") == "small"
+
+
+def test_default_model_only_picks_what_is_there():
+    """**無いモデルを既定にしない。**初回の転写でいきなり 3GB は落とさない。
+
+    large-v3 は GPU があれば速くて正確だが（§9.5.1）、3GB あり同梱して
+    いない。取得済みのときだけ既定にする。勧めるのは画面の仕事。
+    """
+    import os
+    import tempfile
+    from unittest import mock
+    from src import align
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}),              mock.patch.object(align, "asr_model_dirs",
+                               lambda m: [root / m]):
+            # まだ無い → small が既定で、large-v3 を勧める
+            assert align.default_model(align.GPU_DEVICE) == align.DEFAULT_MODEL
+            with mock.patch.object(align, "pick_device",
+                                   lambda *a, **k: (align.GPU_DEVICE, "x")):
+                assert align.suggest_gpu_model() == align.GPU_DEFAULT_MODEL
+            # 取得したら既定が上がり、もう勧めない
+            (root / align.GPU_DEFAULT_MODEL).mkdir()
+            (root / align.GPU_DEFAULT_MODEL / "model.bin").write_bytes(b"x")
+            assert align.default_model(align.GPU_DEVICE) == align.GPU_DEFAULT_MODEL
+            with mock.patch.object(align, "pick_device",
+                                   lambda *a, **k: (align.GPU_DEVICE, "x")):
+                assert align.suggest_gpu_model() is None
+        # CPU の機械には勧めない
+        with mock.patch.object(align, "pick_device",
+                               lambda *a, **k: (align.DEVICE, align.COMPUTE_TYPE)):
+            assert align.suggest_gpu_model() is None
+
+
+def test_fetch_leaves_nothing_behind_when_it_fails():
+    """**途中で切れた取得を残さない。**残すと「あるのに動かない」になる。"""
+    import tempfile
+    from unittest import mock
+    from src import asr_fetch
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        with mock.patch("huggingface_hub.snapshot_download",
+                        side_effect=OSError("通信できません")):
+            try:
+                asr_fetch.fetch("small", root)
+            except asr_fetch.AsrFetchError as e:
+                assert "通信が遮断された環境" in str(e), "対処法が書かれていない"
+            else:
+                raise AssertionError("失敗を知らせていない")
+        assert not (root / "small").exists(), "壊れたフォルダが残っている"
+        assert not (root / ".small.part").exists(), "作業用が残っている"
+
+
+def test_fetch_rejects_an_incomplete_download():
+    """核のファイルが欠けたものを置かない（利用者の端末で初めて分かるのは遅い）。"""
+    import tempfile
+    from unittest import mock
+    from src import asr_fetch
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+
+        def fake(**kw):
+            out = Path(kw["local_dir"])
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "config.json").write_text("{}")   # model.bin が無い
+            return str(out)
+
+        with mock.patch("huggingface_hub.snapshot_download", side_effect=fake):
+            try:
+                asr_fetch.fetch("small", root)
+            except asr_fetch.AsrFetchError as e:
+                assert "model.bin" in str(e)
+            else:
+                raise AssertionError("欠けたものを受け入れてしまった")
+        assert not (root / "small").exists()
+
+
+def test_fetch_sizes_are_stated_before_downloading():
+    """**大きさを先に伝える。**断りも入れずに GB 級を落とさない。"""
+    from src import asr_fetch
+    for m in ("small", "medium", "large-v3"):
+        assert asr_fetch.SIZES_MB.get(m, 0) > 0, f"{m} の目安が無い"
+    assert asr_fetch.SIZES_MB["large-v3"] > 2000, "3GB 級だと伝わらない"
 
 
 # ======================================================================

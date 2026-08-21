@@ -1,4 +1,4 @@
-"""転写のモデルを取ってきて models/asr/<名前> に置く。
+"""転写のモデルを取ってきて models/asr/<名前> に置く（同梱用）。
 
     python tools\\fetch_asr_model.py [モデル名] [置き場]
     python tools\\fetch_asr_model.py small          （既定）
@@ -7,25 +7,26 @@
 CI（`.github/workflows/build.yml`）と手作業の両方がこれを使う。
 話者分離の `fetch_diarize_models.py` と同じ形にしてある。
 
+**取得そのものは `src/asr_fetch.py` にある。**ここは同梱先へ置くための
+薄い入口。画面（GPU 利用者への案内）も同じ実装を呼ぶ——二通りに書くと、
+片方だけ直したときに「取れたはずなのに見つからない」になる。
+
 **なぜ同梱するか。**faster-whisper はモデル名を渡すと Hugging Face へ
 取りに行く。同梱していないと**新規インストール直後は通信が要る**——
 画面の「ネットワークを遮断したままでも動きます」が嘘になる。
 中核層は「録音を外に出せない」層で、**初回 DL ができない環境が現実にある**
 （設計書 §9）。
 
-`models/` は `.gitignore` で除外してある（大きく、ライセンスも別なので
-リポジトリに入れない）。取得を忘れやすいので、`build.spec` は
-`small` が無ければビルドを止める。
+`models/` は `.gitignore` で除外してある。取得を忘れやすいので、
+`build.spec` は `small` が無ければビルドを止める。
 
 **同梱するのは float16 のまま。**実行時に `compute_type="int8"` /
 `"int8_float16"` を渡すので、読み込み時に量子化される。あらかじめ int8 に
-変換すれば約半分（461MB → 約 230MB）になるが、変換に `torch` と
-`transformers` が要る（ビルド環境が 2GB 重くなる）。**品質は変わらない**
-ので、まずは変換なしで置く（設計書 §9 の注記）。
+変換すれば約半分になるが、変換に `torch` と `transformers` が要る
+（ビルド環境が 2GB 重くなる）。**品質は変わらない**ので変換しない（§9）。
 """
 from __future__ import annotations
 
-import shutil
 import sys
 from pathlib import Path
 
@@ -35,24 +36,8 @@ for _s in (sys.stdout, sys.stderr):
     if hasattr(_s, "reconfigure"):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
-from src.align import AVAILABLE_MODELS, DEFAULT_MODEL  # noqa: E402
-
-# faster-whisper が既定で見に行く配布元。**ここを変えるとモデルが別物に
-# なる**ので、変えるときは実測し直すこと。
-REPOS = {
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large-v3": "Systran/faster-whisper-large-v3",
-}
-
-# **これが無いと動かない**という核。揃っているかを取得後に確かめる。
-NEEDED = ("model.bin", "config.json", "tokenizer.json")
-
-# **配布元によってファイル構成が違う。**small は vocabulary.txt、
-# large-v3 は vocabulary.json + preprocessor_config.json を持つ。
-# 決め打ちで並べると片方が落ちるので、**要らないものを除く**形にする。
-SKIP = ("README.md", ".gitattributes")
+from src.align import AVAILABLE_MODELS, DEFAULT_MODEL   # noqa: E402
+from src.asr_fetch import REPOS, SIZES_MB, AsrFetchError, fetch  # noqa: E402
 
 
 def main() -> int:
@@ -66,48 +51,29 @@ def main() -> int:
 
     root = Path(sys.argv[2]) if len(sys.argv) > 2 else \
         Path(__file__).resolve().parent.parent / "models" / "asr"
-    dest = root / model
-
-    if (dest / "model.bin").is_file():
-        size = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
-        print(f"すでにあります: {dest}（{size/1e6:.0f} MB）")
+    if (root / model / "model.bin").is_file():
+        print(f"すでにあります: {root / model}")
         return 0
 
+    print(f"{model}（約 {SIZES_MB.get(model, 0):,} MB）を取得します。")
+    last = [-1]
+
+    def progress(done: int, total: int) -> None:
+        if not total:
+            return
+        pct = int(done * 100 / total)
+        if pct != last[0]:                  # 1% ごとにしか出さない（CI のログ対策）
+            last[0] = pct
+            print(f"  {pct:3d}%  {done/1e6:,.0f} / {total/1e6:,.0f} MB",
+                  flush=True)
+
     try:
-        from huggingface_hub import snapshot_download
-    except ImportError:
-        print("huggingface_hub が要ります（faster-whisper と一緒に入ります）。")
-        print("    pip install huggingface_hub")
+        dest = fetch(model, root, on_log=lambda m: print(m, flush=True),
+                     on_progress=progress)
+    except AsrFetchError as e:
+        print(str(e))
         return 1
-
-    repo = REPOS[model]
-    print(f"{repo} を取得します → {dest}")
-    print("（初回は数分かかります。回線によってはもっと）")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        got = snapshot_download(
-            repo_id=repo,
-            # **説明文だけ除く。**float32 の重みや .safetensors が置かれる
-            # ことがあるが、Systran の faster-whisper 系には無い。
-            # 増えたときに黙って落とさないよう、除外は最小限にする。
-            ignore_patterns=list(SKIP),
-            local_dir=str(dest),
-        )
-    except Exception as e:
-        print(f"取得できませんでした: {type(e).__name__}: {e}")
-        print("通信が遮断された環境では、別の PC で取得したフォルダを")
-        print(f"{dest} に置いてください。")
-        return 1
-
-    missing = [n for n in NEEDED if not (Path(got) / n).is_file()]
-    if missing:
-        # **足りないまま配らない。**利用者の端末で初めて分かるのでは遅い。
-        print(f"取得したフォルダに足りないものがあります: {', '.join(missing)}")
-        shutil.rmtree(dest, ignore_errors=True)
-        return 1
-
-    size = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file())
-    print(f"済: {dest}（{size/1e6:.0f} MB）")
+    print(f"済: {dest}")
     return 0
 
 
