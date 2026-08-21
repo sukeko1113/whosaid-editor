@@ -3314,7 +3314,11 @@ def test_retry_replaces_the_run_and_says_so():
     tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
     tr.condition_on_previous_text = True
     calls, logs = [], []
-    good = local_asr.ChunkResult(utterances=_utts("あ", "い", "う", "え"))
+    # **起こし直した側は本文が増える。**実際に起きた形（1,288 字 → 1,723 字）。
+    # 減るなら元を採るべきで、それは別の検査で見る。
+    good = local_asr.ChunkResult(utterances=_utts(
+        "本日はお集まりいただきありがとうございます",
+        "それでは議事に入ります", "資料をご覧ください", "以上です"))
     bad = local_asr.ChunkResult(utterances=_utts(*(["同じ"] * 8)))
 
     def fake_once(path, condition, **kw):
@@ -3328,6 +3332,36 @@ def test_retry_replaces_the_run_and_says_so():
     assert got is good, "直った結果に差し替えていない"
     assert any("暴走" in x for x in logs), logs
     assert any("直りました" in x for x in logs), logs
+
+
+def test_retry_is_rejected_when_the_text_shrinks():
+    """**繰り返しが減っただけでは採らない。**本文が減っていないことも見る。
+
+    引き継ぎを切ると、壊れていない箇所では脱落が増える（実測 2026-08-21:
+    逐語正解 4 帯で脱落 10.4% → 16.6%、落とした発言の回収 18 → 10 件）。
+    閾値ちょうど（3 区間）で発動した chunk_0001 は、起こし直すと繰り返しは
+    3 → 2 に減ったが本文が 1,758 字 → 1,669 字に**減った**。
+    本当に壊れていた chunk_0007 は 1,288 字 → 1,723 字と**増えている**。
+    """
+    from src import local_asr
+    tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
+    tr.condition_on_previous_text = True
+    logs = []
+    # 繰り返しは 3 回あるが、起こし直すと本文が減る
+    bad = local_asr.ChunkResult(
+        utterances=_utts("はい。", "はい。", "はい。", "長い発言をしています"))
+    thin = local_asr.ChunkResult(utterances=_utts("はい。", "はい。"))
+    tr._once = lambda path, condition, **kw: bad if condition else thin
+    got = local_asr.LocalTranscriber.transcribe(
+        tr, __file__, on_log=logs.append)
+    assert got is bad, "本文が減るほうを採ってしまっている"
+    assert any("元のままにします" in x for x in logs), logs
+    # 本文が増えるなら採る（本当に壊れていた場合）
+    fat = local_asr.ChunkResult(utterances=_utts(
+        "そういう経過もありましたね", "確かに経営が悪くなってきているんでしょうね",
+        "だから全然続ける気がないのかなと思っちゃうんですよ"))
+    tr._once = lambda path, condition, **kw: bad if condition else fat
+    assert local_asr.LocalTranscriber.transcribe(tr, __file__) is fat
 
 
 def test_retry_that_fails_is_reported_not_hidden():
