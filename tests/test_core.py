@@ -3458,6 +3458,34 @@ def test_app_name_no_longer_claims_gemini():
     assert "GeminiTranscriber" in cfg.LEGACY_APP_NAMES, "引き継ぎ先が消えている"
 
 
+def test_engine_descriptions_match_reality():
+    """**画面の説明が、実際の動きと矛盾していないこと。**
+
+    話者分離を入れたあとも「声のまとまりは作られず」と書いたままで、
+    同じ画面のチェックボックス（既定 ON）と矛盾していた（2026-08-21 に発覚）。
+    無料公開では「ローカルでは話者が分からない」と誤解され、いちばんの売りが
+    伝わらない。**機能を足したら説明も直す**、を検査で縛る。
+    """
+    from src import gui, pipeline
+    spec = pipeline.EngineSpec(mode=pipeline.ENGINE_LOCAL)
+    assert spec.wants_diarize is True, "この検査の前提（既定で話者分離が入る）"
+    for bad in ("作られず", "作られない"):
+        assert bad not in gui.ENGINE_LOCAL_DESC, (
+            f"話者分離が既定で入るのに「{bad}」と書いてある")
+    assert "話者分離" in gui.ENGINE_LOCAL_DESC, "作れることが書かれていない"
+    # 逐語モードはローカルでは使えない（こちらは今も本当）
+    assert "逐語" in gui.ENGINE_LOCAL_DESC
+
+
+def test_licence_names_a_holder():
+    """**公開する前に著作権者を埋める。**プレースホルダのままにしない。"""
+    text = (Path(__file__).resolve().parent.parent / "LICENSE").read_text(
+        encoding="utf-8")
+    assert "MIT License" in text
+    assert "[Your Name]" not in text, "LICENSE がプレースホルダのまま"
+    assert "Copyright (c)" in text
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
