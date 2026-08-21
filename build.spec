@@ -49,6 +49,29 @@ for rel in (SEG_NAME, EMB_NAME):
     # 相対の階層をそのまま保つ
     diarize_datas.append((str(src), str(Path("models/diarize") / rel).replace("\\", "/").rsplit("/", 1)[0]))
 
+# 転写のモデルの同梱。**これが無いと「通信を遮断したままでも動きます」が
+# 嘘になる**——faster-whisper はモデル名を渡すと Hugging Face へ取りに行く
+# ので、同梱していなければ新規インストール直後に通信が要る(設計書 §9)。
+# 話者分離と同じく、無ければビルドを止める。
+#
+# **同梱するのは CPU 既定の small だけ。**GPU 向けの large-v3 は 3GB あり、
+# GitHub Releases の 1 ファイル 2GB 制限に載らない。GPU を持つ利用者だけが
+# 初回に取得する(設計書 §9.5.8 の案イ)。
+from src.align import DEFAULT_MODEL                      # noqa: E402
+
+asr_datas = []
+_asr_src = ROOT / "models" / "asr" / DEFAULT_MODEL
+if not (_asr_src / "model.bin").is_file():
+    raise SystemExit(
+        f"転写のモデルが見つかりません: {_asr_src}\n"
+        f"    python tools\\fetch_asr_model.py {DEFAULT_MODEL}\n"
+        "で取得してください。これが無いと、利用者の端末は初回に通信が要ります。"
+    )
+for _f in sorted(_asr_src.iterdir()):
+    if _f.is_file():
+        # 実行時は _MEIPASS/models/asr/<名前>/ を見る(align.asr_model_dirs)
+        asr_datas.append((str(_f), f"models/asr/{DEFAULT_MODEL}"))
+
 # ffmpeg / ffplay の同梱(Windows のみ)
 binaries = []
 for name in ("ffmpeg.exe", "ffplay.exe"):
@@ -79,7 +102,7 @@ a = Analysis(
     [str(ROOT / "src" / "main.py")],
     pathex=[str(ROOT)],
     binaries=binaries + whisper_binaries + diarize_binaries,
-    datas=whisper_datas + diarize_datas + credits_datas,
+    datas=whisper_datas + diarize_datas + asr_datas + credits_datas,
     hiddenimports=[
         "google.genai",
         "google.auth",

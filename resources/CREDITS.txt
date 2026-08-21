@@ -44,6 +44,11 @@ whosaid-editor — 同梱している第三者の部品と、その利用条件
 
   Whisper（small）      MIT                   OpenAI
     CTranslate2 形式への変換: SYSTRAN
+    配布元: https://huggingface.co/Systran/faster-whisper-small
+    ※ 同梱しているのはこの small のみです。GPU のある端末では
+       large-v3（同じく OpenAI / MIT）を初回に取得することがあります。
+       取得先は同じ Systran のリポジトリで、通信は Hugging Face とのみ
+       行われます（録音や本文は送りません）。
 
 
 -----------------------------------------------------------

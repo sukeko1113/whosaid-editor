@@ -236,8 +236,9 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 | Python 3.11 以上 | アプリ本体 | https://www.python.org/downloads/ (PATH 追加にチェック) |
 | ffmpeg + ffplay(static build) | 音声分割・区間再生 | https://www.gyan.dev/ffmpeg/builds/ の **release-essentials** |
 | 話者分離のモデル(44MB) | 声のまとまりを作る | `python tools\fetch_diarize_models.py`(手順 3) |
+| 転写のモデル small(486MB) | 本文を作る | `python tools\fetch_asr_model.py small` |
 | Inno Setup 6 | インストーラ作成 | https://jrsoftware.org/isdl.php |
-| Gemini API キー | 文字起こし | https://aistudio.google.com/apikey |
+| Gemini API キー(任意) | クラウド経路を使うときだけ | https://aistudio.google.com/apikey |
 
 ### 手順
 
@@ -259,6 +260,13 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
    ```
    python tools\fetch_diarize_models.py
+
+4. **転写のモデルを取得**します。同梱しないと、利用者の端末が初回に
+   通信を要し、「ネットワークを遮断したままでも動きます」が嘘になります。
+
+   ```
+   python tools\fetch_asr_model.py small
+   ```
    ```
 
    `models\diarize\` に 2 つ（合計 44MB）置かれます。取得元と SHA-256 は

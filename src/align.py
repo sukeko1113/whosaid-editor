@@ -153,6 +153,36 @@ class Word:
                    end=float(d.get("end", 0.0)))
 
 
+def asr_model_dirs(model: str) -> list[Path]:
+    """同梱・手動配置のモデルを探す場所を、優先順に返す。
+
+    話者分離(`diarize.model_dirs`)と同じ形にしてある。二通りに実装すると、
+    片方だけ直したときに「同梱したのに見つからない」になる。
+
+    **これが無いと「通信を遮断したままでも動きます」が嘘になる。**
+    faster-whisper はモデル名を渡すと Hugging Face へ取りに行くので、
+    同梱していなければ新規インストール直後は通信が要る(設計書 §9)。
+    """
+    out: list[Path] = []
+    env = os.environ.get("WHOSAID_ASR_MODELS")
+    if env:
+        out.append(Path(env) / model)
+    if getattr(sys, "frozen", False):           # PyInstaller で固めた実行形式
+        out.append(Path(getattr(sys, "_MEIPASS", ".")) / "models" / "asr" / model)
+        out.append(Path(sys.executable).parent / "models" / "asr" / model)
+    else:
+        out.append(Path(__file__).resolve().parent.parent / "models" / "asr" / model)
+    return out
+
+
+def find_bundled_model(model: str) -> Optional[Path]:
+    """同梱されているモデルのフォルダ。無ければ None。"""
+    for d in asr_model_dirs(model):
+        if (d / "model.bin").is_file():
+            return d
+    return None
+
+
 def resolve_model(model: str = DEFAULT_MODEL,
                   model_dir: Optional[Path | str] = None) -> str:
     """faster-whisper に渡すモデルの指定を決める。
@@ -161,7 +191,11 @@ def resolve_model(model: str = DEFAULT_MODEL,
     機密案件)ではオンライン取得そのものができないので、「別 PC で取った
     モデルフォルダを置けば動く」経路を必ず残す。
 
-    フォルダ指定が無ければモデル名を返す。faster-whisper が既定の置き場に
+    次に**同梱したモデル**を見る。あればそれを使う——渡すのが名前だと
+    faster-whisper が Hugging Face を見に行き、通信を遮断した環境で
+    止まってしまう。
+
+    どちらも無ければモデル名を返す。faster-whisper が既定の置き場に
     無ければ取りに行く(初回のみ)。
     """
     if model_dir:
@@ -179,6 +213,9 @@ def resolve_model(model: str = DEFAULT_MODEL,
                 "入ったもの)を指定してください。"
             )
         return str(p)
+    bundled = find_bundled_model(model)
+    if bundled is not None:
+        return str(bundled)
     return model
 
 

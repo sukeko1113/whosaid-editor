@@ -81,6 +81,12 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      # **転写のモデルを同梱する。**入れないと利用者の端末が初回に通信を
+      # 要し、「ネットワークを遮断したままでも動きます」が嘘になる。
+      # huggingface_hub が要るので、依存を入れたあとに走らせる。
+      - name: Download ASR model (small)
+        run: python tools/fetch_asr_model.py small
+
       - name: Run tests
         shell: pwsh
         run: |

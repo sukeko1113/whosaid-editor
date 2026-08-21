@@ -3486,6 +3486,71 @@ def test_licence_names_a_holder():
     assert "Copyright (c)" in text
 
 
+def test_bundled_model_is_used_before_the_network():
+    """**同梱したモデルがあれば、それを使う。**
+
+    faster-whisper はモデル名を渡すと Hugging Face へ取りに行く。同梱を
+    見に行かないと、新規インストール直後に通信が要り、画面の
+    「ネットワークを遮断したままでも動きます」が嘘になる（設計書 §9）。
+    """
+    import os
+    import tempfile
+    from unittest import mock
+    from src import align
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "small").mkdir()
+        (root / "small" / "model.bin").write_bytes(b"x")
+        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+            assert align.find_bundled_model("small") == root / "small"
+            assert align.resolve_model("small") == str(root / "small")
+            # 同梱していないものは名前のまま（faster-whisper が取りに行く）
+            assert align.resolve_model("large-v3") == "large-v3"
+
+
+def test_model_dir_still_wins_over_the_bundled_one():
+    """手動で置いたフォルダが最優先、という約束を壊さない（設計書 §9）。"""
+    import os
+    import tempfile
+    from unittest import mock
+    from src import align
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "small").mkdir()
+        (root / "small" / "model.bin").write_bytes(b"x")
+        hand = root / "手で置いた"
+        hand.mkdir()
+        (hand / "model.bin").write_bytes(b"y")
+        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+            assert align.resolve_model("small", model_dir=hand) == str(hand)
+
+
+def test_bundled_model_needs_the_weights():
+    """**フォルダだけあって中身が無いものを掴まない。**
+
+    探す場所は複数ある（環境変数 → 同梱 → 手元）。空のフォルダで
+    止まってしまうと、本物が置いてあっても見つけられない。
+    """
+    import os
+    import tempfile
+    from unittest import mock
+    from src import align
+
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        (root / "small").mkdir()          # model.bin が無い
+        with mock.patch.dict(os.environ, {"WHOSAID_ASR_MODELS": str(root)}):
+            got = align.find_bundled_model("small")
+            assert got != root / "small", "中身の無いフォルダを掴んでいる"
+        # どこにも無ければ None（名前のまま返り、faster-whisper が取りに行く）
+        with mock.patch.object(align, "asr_model_dirs",
+                               lambda m: [root / "small"]):
+            assert align.find_bundled_model("small") is None
+            assert align.resolve_model("small") == "small"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
