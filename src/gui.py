@@ -17,6 +17,7 @@ from .config import credits_text, load_config, save_config
 from typing import Optional
 
 from . import align
+from . import asr_fetch
 from .align import AVAILABLE_MODELS as LOCAL_MODELS
 # **既定はこの機械の装置で決まる。**GPU があれば large-v3、無ければ
 # small(CPU で large-v3 は実時間比が数倍で実用外)。呼び出しのたびに
@@ -708,6 +709,99 @@ class App(tk.Tk):
         if path:
             self.var_input.set(path)
             self._on_toggle_use_input_dir()
+            # **音声を選んだ時点で聞く。**起動直後だとまだ使うと決めて
+            # いない人にも出るし、[開始]のあとでは転写を十数分待たせる。
+            self._maybe_offer_gpu_model()
+
+    # ------------------------------------------------------------------
+    # GPU 向けのモデルを勧める（一度だけ）
+    # ------------------------------------------------------------------
+    ASKED_KEY = "asked_gpu_model"
+
+    def _maybe_offer_gpu_model(self) -> None:
+        """GPU があるのに大きいモデルが無ければ、一度だけ取得を勧める。
+
+        **勝手に落とさない。**3GB は断りなく落としてよい量ではない。
+        **断られたら二度と聞かない**——設定に記録する。
+        """
+        if self.cfg.get(self.ASKED_KEY):
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return                      # 転写中に割り込まない
+        model = align.suggest_gpu_model()
+        if not model:
+            return
+
+        mb = asr_fetch.SIZES_MB.get(model, 0)
+        want = messagebox.askyesno(
+            "この PC の GPU を使えます",
+            f"{model} を使うと、実測で\n"
+            "　・誤字が約 4 割減ります（11.9% → 7.0%）\n"
+            "　・聞き取れなかった発言も拾えます（11/34 → 17/34）\n"
+            "　・処理も速くなります（67 分の音声に 24 分 → 15 分）\n\n"
+            f"初回だけ 約 {mb:,} MB の取得が要ります。\n"
+            "通信するのは Hugging Face とだけで、録音や本文は送りません。\n\n"
+            "取得しますか？（あとで設定画面から選ぶこともできます）",
+            parent=self)
+
+        # **聞いたことは、答えに関わらず記録する。**毎回出ては邪魔になる。
+        self.cfg[self.ASKED_KEY] = True
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        if want:
+            self._start_model_fetch(model)
+
+    def _start_model_fetch(self, model: str) -> None:
+        """別スレッドで取得する。**画面は止めない。**
+
+        取得の間も音声を選んだり名簿を入れたりできる。失敗しても
+        **止めない**——small のまま使える、と伝えるだけ。
+        """
+        self._append_log(f"{model} の取得を始めます。"
+                         "この間もほかの操作はできます。")
+
+        def work() -> None:
+            try:
+                asr_fetch.fetch(
+                    model,
+                    on_log=lambda m: self.msg_queue.put(("log", m)),
+                    on_progress=lambda a, b: self.msg_queue.put(
+                        ("fetch_progress", (a, b))))
+                self.msg_queue.put(("fetch_done", model))
+            except Exception as e:
+                self.msg_queue.put(("fetch_failed", str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_fetch_done(self, model: str) -> None:
+        self._append_log(f"{model} を使えるようになりました。")
+        self.progress.configure(value=0)
+        self.var_status.set("待機中")
+        # 取得したので既定に上がる。転写中でなければ画面にも反映する
+        if not (self._worker is not None and self._worker.is_alive()):
+            self._model_by_engine[ENGINE_LOCAL] = model
+            if self.var_engine.get() == ENGINE_LOCAL:
+                self.var_model.set(model)
+            self.cfg["local_model"] = model
+            try:
+                save_config(self.cfg)
+            except OSError:
+                pass
+            self._update_gpu_hint()
+
+    def _on_fetch_failed(self, msg: str) -> None:
+        """**取得できなくても止めない。**small のまま使える。"""
+        self.progress.configure(value=0)
+        self.var_status.set("待機中")
+        # **落ちる先の名前を出す。**DEFAULT_LOCAL_MODEL は起動時に決めた値で、
+        # この機械に大きいモデルが既にあれば large-v3 になっている。それを
+        # 「のまま使えます」と出すと、取得に失敗した当のモデルを勧めることに
+        # なる(検査が捕まえた・2026-08-21)。落ちる先は常に CPU 既定。
+        self._append_log("モデルを取得できませんでした。"
+                         f"{align.DEFAULT_MODEL} のまま使えます。")
+        self._append_log(msg)
 
     def _pick_output(self) -> None:
         initial = self.var_output.get() or os.path.dirname(self.var_input.get() or "")
@@ -994,6 +1088,15 @@ class App(tk.Tk):
                     cur, total = data  # type: ignore[misc]
                     self.progress.configure(maximum=max(1, total), value=cur)
                     self.var_status.set(f"{cur}/{total}")
+                elif kind == "fetch_progress":
+                    cur, total = data  # type: ignore[misc]
+                    self.progress.configure(maximum=max(1, total), value=cur)
+                    self.var_status.set(
+                        f"モデルを取得中… {cur/1e6:,.0f} / {total/1e6:,.0f} MB")
+                elif kind == "fetch_done":
+                    self._on_fetch_done(str(data))
+                elif kind == "fetch_failed":
+                    self._on_fetch_failed(str(data))
                 elif kind == "done":
                     self._on_done(data)  # type: ignore[arg-type]
                 elif kind == "fatal":

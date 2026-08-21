@@ -2301,6 +2301,52 @@ def run_main_window() -> int:
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
 
+            # --- GPU 向けのモデルを一度だけ勧める -------------------------
+            # **勝手に 3GB を落とさない。**断られたら二度と聞かない。
+            from src import align as _al2, asr_fetch as _af
+            _real_sug, _real_fetch = _al2.suggest_gpu_model, _af.fetch
+            try:
+                _asked = {"n": 0, "text": ""}
+
+                def _ask(title, msg, **kw):
+                    _asked["n"] += 1
+                    _asked["text"] = msg
+                    return False            # まず「いいえ」
+
+                main_gui.messagebox.askyesno = _ask
+                main_gui.align.suggest_gpu_model = lambda: "large-v3"
+                app.cfg.pop(app.ASKED_KEY, None)
+                _saved2 = {}
+                main_gui.save_config = lambda d: _saved2.update(d)
+
+                app._maybe_offer_gpu_model()
+                check("GPU があって未取得なら一度は聞く", _asked["n"] == 1)
+                check("大きさを先に伝える", "MB" in _asked["text"])
+                check("録音を送らないと明記する",
+                      "録音" in _asked["text"] and "送りません" in _asked["text"])
+                check("断っても記録に残す", _saved2.get(app.ASKED_KEY) is True)
+
+                # 二度目は聞かない
+                app._maybe_offer_gpu_model()
+                check("断ったら二度と聞かない", _asked["n"] == 1)
+
+                # 取得できなくても止まらない
+                app._on_fetch_failed("通信できません")
+                check("失敗しても small のまま使えると伝える",
+                      "small" in app.txt_log.get("1.0", "end"))
+
+                # 取得できたら既定に上がる
+                app.cfg.pop(app.ASKED_KEY, None)
+                app._on_fetch_done("large-v3")
+                check("取得したら選択に反映される",
+                      app._model_by_engine[main_gui.ENGINE_LOCAL] == "large-v3")
+            finally:
+                main_gui.align.suggest_gpu_model = _real_sug
+                _af.fetch = _real_fetch
+                main_gui.save_config = real_save
+                app._model_by_engine[main_gui.ENGINE_LOCAL] = "small"
+                app.var_model.set("small")
+
             # --- 設定の往復（保存 → 読み直し）-----------------------------
             # **今日の 4 件はここに固まっていた。**設定を扱う場所が 4 つ
             # あり(読み込み・経路の切替・モデルを選んだとき・開始時)、
