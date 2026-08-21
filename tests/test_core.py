@@ -3717,6 +3717,47 @@ def test_cuda_is_not_bundled():
     assert "nvidia-" not in req, "requirements に nvidia が入っている"
 
 
+def test_bundled_ffmpeg_is_lgpl():
+    """**同梱する ffmpeg は LGPL 版でなければならない。**
+
+    本体は MIT。GPL の FFmpeg を同梱すると「同梱物全体を GPL にせよ」と
+    衝突する。別プロセスで起動する使い方なので、LGPL なら MIT のまま配れる。
+
+    2026-08-21 に、手元の ffmpeg が `--enable-gpl` 版だったことが分かった。
+    CI も gyan.dev の release-essentials（GPL 版）を優先しており、コメントには
+    「どちらも LGPL 版」と書いてあった。**誰も確かめていなかった。**
+    """
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    exe = root / "ffmpeg" / "ffmpeg.exe"
+    if not exe.is_file():
+        return          # 未取得の環境では飛ばす（CI 側でも検査している）
+    out = subprocess.run([str(exe), "-version"], capture_output=True,
+                         text=True, encoding="utf-8", errors="replace")
+    cfg = (out.stdout or "") + (out.stderr or "")
+    for bad in ("--enable-gpl", "--enable-nonfree"):
+        assert bad not in cfg, (
+            f"同梱する ffmpeg が {bad} です。CREDITS.txt は LGPL と表示して"
+            "おり、MIT の本体に同梱できません。BtbN の *-lgpl.zip を使うこと")
+    # 表示と実態が合っていること
+    from src.config import credits_text
+    assert "LGPL" in credits_text()
+
+
+def test_bundled_ffplay_is_present():
+    """**区間再生に要る。**無いと簡易再生に落ち、聴き比べができない。
+
+    割当作業は区間を聴き比べるのが中心なので、これが欠けると製品の
+    中心機能が損なわれる。ビルド時に気づけるようにする。
+    """
+    root = Path(__file__).resolve().parent.parent
+    if not (root / "ffmpeg" / "ffmpeg.exe").is_file():
+        return          # ffmpeg ごと未取得の環境では飛ばす
+    assert (root / "ffmpeg" / "ffplay.exe").is_file(), (
+        "ffplay.exe がありません。区間再生が簡易再生に落ちます。"
+        "README のビルド手順を参照してください")
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

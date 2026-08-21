@@ -29,13 +29,15 @@ jobs:
       - name: Download ffmpeg + ffplay
         shell: pwsh
         run: |
-          # 配布元を 1 つに頼らない。gyan.dev は共有ホスト上にあり、
-          # 503 (resource limitation) でビルドが止まる事例が実際にあった。
-          # 失敗したら少し待って再試行し、それでも駄目なら
-          # GitHub 上でホストされている BtbN のビルドに切り替える。
-          # どちらも bin/ 配下に ffmpeg.exe / ffplay.exe を含む LGPL 版。
+          # **LGPL 版でなければならない。**本体は MIT で、GPL の FFmpeg を
+          # 同梱すると「同梱物全体を GPL にせよ」と衝突する。別プロセスで
+          # 起動する使い方なので、LGPL なら MIT のまま配れる。
+          #
+          # 以前ここには gyan.dev の release-essentials を先に書いていたが、
+          # **あれは --enable-gpl でビルドされた GPL 版**だった(2026-08-21 に
+          # 実測して発覚)。コメントには「どちらも LGPL 版」と書いてあり、
+          # 誰も確かめていなかった。**この下で構成を検査する。**
           $sources = @(
-            'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
             'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip'
           )
 
@@ -65,6 +67,17 @@ jobs:
           }
           Get-ChildItem ffmpeg | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
           & ffmpeg/ffmpeg.exe -version
+
+          # **LGPL かをここで確かめる。**コメントに「LGPL 版」と書くだけでは
+          # 配布元が差し替わっても気づけない(実際に GPL 版が入っていた)。
+          # CREDITS.txt は LGPL と表示しており、食い違うと表示が嘘になる。
+          $cfg = (& ffmpeg/ffmpeg.exe -version 2>&1 | Out-String)
+          foreach ($bad in @('--enable-gpl', '--enable-nonfree')) {
+            if ($cfg -match [regex]::Escape($bad)) {
+              throw "取得した ffmpeg は $bad です。CREDITS.txt は LGPL と表示しており、MIT の本体に同梱できません。"
+            }
+          }
+          Write-Host 'ffmpeg は LGPL 構成です。'
 
       - name: Download speaker diarization models
         shell: pwsh
