@@ -3821,6 +3821,57 @@ def test_cuda_dlls_are_loaded_by_full_path():
     assert "except OSError" in src
 
 
+class _Ran:
+    """実際に走った転写器のふり（record に渡すもの）。"""
+
+    def __init__(self, model, device, compute_type):
+        self.model, self.device, self.compute_type = model, device, compute_type
+
+
+def test_engine_records_what_actually_ran():
+    """**記録は「実際に走った値」でなければならない。**
+
+    以前は `pick_device()`（＝使えそうかの判定）を書いていた。GPU の DLL が
+    無くて CPU + small に落ちた実行が、記録には「large-v3 / cuda /
+    int8_float16」と残っていた（実機で発生・2026-08-22）。**キャッシュの
+    ファイル名は `.small.int8.` と正しく書いていたのに、engine だけが嘘を
+    ついていた。**この製品は検証済みの記録を作るものなので、根幹に関わる。
+    """
+    from src.pipeline import EngineSpec, ENGINE_LOCAL
+    spec = EngineSpec(mode=ENGINE_LOCAL, model="large-v3")
+    rec = spec.record(_Ran("small", "cpu", "int8"))
+    assert rec["model"] == "small", "頼んだモデルのほうを書いている"
+    assert rec["device"] == "cpu"
+    assert rec["compute_type"] == "int8"
+    # **落ちたことも残す。**あとから「なぜ small なのか」が分かるように
+    assert rec["requested_model"] == "large-v3"
+    assert "fell_back" in rec
+
+
+def test_engine_record_stays_quiet_when_nothing_changed():
+    """落ちていなければ、余計な印を付けない（読みにくくなる）。"""
+    from src.pipeline import EngineSpec, ENGINE_LOCAL
+    spec = EngineSpec(mode=ENGINE_LOCAL, model="large-v3")
+    rec = spec.record(_Ran("large-v3", "cuda", "int8_float16"))
+    assert rec["model"] == "large-v3" and rec["device"] == "cuda"
+    assert "requested_model" not in rec and "fell_back" not in rec
+
+
+def test_cpu_fallback_says_the_model_changed():
+    """**モデルを落とすことも伝える。**
+
+    「CPU に切り替えます」だけ出して黙って large-v3 → small にしていたため、
+    20 分待ったあとに別物ができていた（実機で発生・2026-08-22）。
+    """
+    import inspect
+    from src import local_asr
+    src = inspect.getsource(local_asr.LocalTranscriber._load)
+    assert "に切り替えます" in src
+    # 落ちた先のモデル名を出しているか（変数で出していること）
+    assert "self.model != was" in src, "モデルが変わったかを見ていない"
+    assert "誤字" in src, "品質が落ちることを伝えていない"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

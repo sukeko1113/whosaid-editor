@@ -109,7 +109,7 @@ class EngineSpec:
             return self.model
         return align.default_model() if self.is_local else DEFAULT_CLOUD_MODEL
 
-    def record(self) -> dict:
+    def record(self, actual=None) -> dict:
         """作業ファイルに残す engine の中身(Word の検証要約に出る処理経路)。
 
         第三者が「どの経路のどのモデルで作られた記録か」を読めるようにする。
@@ -121,12 +121,31 @@ class EngineSpec:
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
         if self.is_local:
-            # **実際に使った装置と精度を残す。**「どの経路のどのモデルで
-            # 作られた記録か」を第三者が読めるようにするのが目的なので、
-            # 固定値ではなく走らせた値を書く(GPU で回れば違う値になる)。
+            # **これは「使えそうか」の見込み。**実際に走った値は
+            # `actual` で上書きする(下の注記)。
             rec["device"], rec["compute_type"] = align.pick_device()
             if self.model_dir:
                 rec["model_dir"] = str(self.model_dir)
+        if actual is not None:
+            # **実際に走った装置・精度・モデルで上書きする。**
+            # 以前は `pick_device()` の戻り値を書いていたが、あれは
+            # 「使えそうか」の判定であって走った値ではない。GPU の DLL が
+            # 無くて CPU + small に落ちた実行が、記録には
+            # 「large-v3 / cuda / int8_float16」と残っていた
+            # (実機で発生・2026-08-22)。**キャッシュのファイル名は
+            # `.small.int8.` と正しく書いていたのに、engine だけが嘘を
+            # ついていた。**この製品は検証済みの記録を作るものなので、
+            # ここが実態と違うのは根幹に関わる。
+            rec["model"] = getattr(actual, "model", rec.get("model"))
+            rec["device"] = getattr(actual, "device", rec.get("device"))
+            rec["compute_type"] = getattr(actual, "compute_type",
+                                          rec.get("compute_type"))
+            asked = self.resolved_model()
+            if rec["model"] != asked:
+                # **落ちたことを残す。**あとから「なぜ small なのか」が
+                # 分からないと、記録として読めない。
+                rec["requested_model"] = asked
+                rec["fell_back"] = "GPU が使えず、CPU 向けのモデルに切り替えた"
         return rec
 
 
@@ -945,7 +964,7 @@ def run_segment_pipeline(
         source_sha256=source_sha,
         # 話者分離を使ったかどうかも処理経路の一部。第三者が「どうやって
         # まとまりが付いたのか」を読めるようにする。
-        engine={**engine.record(),
+        engine={**engine.record(transcriber),
                 **({"diarize": diarize_record} if diarize_record else {})},
         doc_revision=carried_revision,
         edit_log=carried_log,

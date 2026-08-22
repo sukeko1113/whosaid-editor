@@ -375,12 +375,27 @@ class LocalTranscriber:
             if self.device == "cuda":
                 # **GPU が駄目でも止めない。**CPU に落とす。既定モデルも
                 # 戻す——CPU で large-v3 は実時間比が数倍で実用外になる。
-                if on_log:
-                    on_log(f"GPU では動かせませんでした({first})。"
-                           "CPU に切り替えます。")
+                # **モデルを落とすことも必ず伝える。**「CPU に切り替えます」
+                # だけ出して黙って large-v3 → small にしていたため、20 分
+                # 待ったあとに別物ができていた(実機で発生・2026-08-22)。
+                was = self.model
                 self.device, self.compute_type = DEVICE, COMPUTE_TYPE
                 self.model = default_model(self.device)
                 self.target = resolve_model(self.model, self.model_dir)
+                if on_log:
+                    on_log(f"GPU では動かせませんでした({first})。")
+                    if self.model != was:
+                        on_log(
+                            f"  ※ CPU では {was} が実用外のため、"
+                            f"**{self.model} に切り替えます**。"
+                            "固有名詞の誤りが増えます"
+                            f"(実測: 誤字 7.0% → 11.9%)。")
+                        on_log(
+                            "  ※ GPU を使うには、音声を選び直したときに出る"
+                            "案内から部品を取得してください。"
+                            f"{was} で起こし直すと誤字が減ります。")
+                    else:
+                        on_log("  CPU に切り替えます。")
                 try:
                     self._whisper = build(self.device, self.compute_type)
                     return self._whisper
