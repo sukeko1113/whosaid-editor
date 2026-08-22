@@ -3291,21 +3291,58 @@ def test_loop_detection_counts_across_segments():
     assert max_repeat_run([]) == 0
     # 空の本文は数えない（繋がっているように見えてしまう）
     assert max_repeat_run(_utts("同じ", "", "同じ")) == 1
-    assert LOOP_RUN_THRESHOLD == 3
+    # **数え方そのもの**の検査。暴走かどうかの判断は find_runaway が持つ
+    assert LOOP_RUN_THRESHOLD >= 3
 
 
-def test_loop_detection_does_not_fire_on_real_repeats():
-    """**本物の繰り返しを暴走と混同しない。**
+def _run_of(text, durations):
+    """同じ本文を、指定した長さで並べた区間列。"""
+    from src.segments import Utterance
+    out, t = [], 0.0
+    for d in durations:
+        out.append(Utterance(rel_start=t, rel_end=t + d, text=text))
+        t += d + 0.3
+    return out
 
-    同じ音声に「はい。」が 3 回、「吉沢さん。」が 4 回続く箇所があり、
-    どちらも実際にそう言っている。閾値 3 では拾ってしまうが、**ここは
-    検出であって削除ではない**ので、起こし直して同じなら元を採る。
+
+def test_runaway_is_judged_by_count_and_speaking_rate():
+    """**「同じ本文が続く」だけでは暴走と決めない。**
+
+    当初は「3 区間以上」としたが、15 分チャンクで誤発動だらけになった
+    （実機で 5 チャンク中 4 つ・処理時間がほぼ倍。2026-08-21）。1 チャンクに
+    260 区間あると、本物の相づちが 3〜4 回続くのは普通。
+
+    見本は**実データそのもの**（同じ音声から人が見分けた 8 件）。
     """
-    from src.local_asr import max_repeat_run
-    # 拾うこと自体は正しい（そのあと起こし直して確かめる）
-    assert max_repeat_run(_utts("はい。", "はい。", "はい。")) == 3
-    # 2 回では拾わない（相づちの応酬を毎回起こし直すことになる）
-    assert max_repeat_run(_utts("はい。", "はい。")) == 2
+    from src.local_asr import find_runaway
+    # --- 本物（発動してはいけない）---
+    # 「吉澤さん」4 回。人が実際にそう言っている
+    assert find_runaway(_run_of("吉澤さん", [1.0, 1.0, 0.7, 0.5])) is None
+    # 「もちろん。」3 回・中央値 14 字/秒
+    assert find_runaway(_run_of("もちろん。", [0.36, 0.22, 0.5])) is None
+    # 「はい。」4 回。1 つだけ潰れているが本物
+    assert find_runaway(_run_of("はい。", [0.36, 0.36, 0.36, 0.05])) is None
+
+    # --- 暴走（発動してほしい）---
+    # 「ありがとうございます。」8 回。0.1 秒に 11 字は入らない
+    got = find_runaway(_run_of("ありがとうございます。",
+                               [0.4, 0.6, 0.2, 0.6, 0.5, 0.2, 0.1, 0.6]))
+    assert got is not None and got[0] == 8
+    # 「nick」8 回。話速は正常だが回数で拾う
+    assert find_runaway(_run_of("nick", [1.0] * 8)) is not None
+    # 「はい。」6 回・中央値 44 字/秒
+    assert find_runaway(_run_of("はい。", [0.05] * 6)) is not None
+
+    # 2 回では見ない（相づちの応酬を毎回起こし直すことになる）
+    assert find_runaway(_run_of("はい。", [0.05, 0.05])) is None
+
+
+def test_speaking_rate_line_sits_between_the_real_cases():
+    """線の位置を実データで縛る。**本物 13〜14、暴走 23〜44 の間。**"""
+    from src.local_asr import MAX_CHARS_PER_SECOND, LOOP_RUN_THRESHOLD
+    assert 14 < MAX_CHARS_PER_SECOND < 23, "本物と暴走の間から外れている"
+    # 本物の繰り返しは実データで最大 4 回、暴走は 6 回以上
+    assert 4 < LOOP_RUN_THRESHOLD <= 6
 
 
 def test_retry_replaces_the_run_and_says_so():
@@ -3347,9 +3384,9 @@ def test_retry_is_rejected_when_the_text_shrinks():
     tr = local_asr.LocalTranscriber.__new__(local_asr.LocalTranscriber)
     tr.condition_on_previous_text = True
     logs = []
-    # 繰り返しは 3 回あるが、起こし直すと本文が減る
+    # **暴走と判定される形**（6 回以上）だが、起こし直すと本文が減る
     bad = local_asr.ChunkResult(
-        utterances=_utts("はい。", "はい。", "はい。", "長い発言をしています"))
+        utterances=_utts(*(["はい。"] * 6), "長い発言をしています"))
     thin = local_asr.ChunkResult(utterances=_utts("はい。", "はい。"))
     tr._once = lambda path, condition, **kw: bad if condition else thin
     got = local_asr.LocalTranscriber.transcribe(

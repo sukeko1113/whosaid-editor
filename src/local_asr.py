@@ -66,15 +66,42 @@ STYLE_PROMPT = (
 )
 
 
-# **同じ本文が何区間続いたら「暴走」とみなすか。**
+# **同じ本文が続くだけでは「暴走」と決めない。**
 # whisper が同じ文を延々と繰り返し、その間の会話が丸ごと失われる既知の
-# 事故。実データで large-v3 が 00:49:16 から **20 回**繰り返し、4 分ぶんが
-# 消えた(実機の指摘・2026-08-20)。small では起きなかった。
+# 事故がある(実データで 00:49:16 から 20 回・4 分ぶんが消えた)。
 #
-# 3 にしたのは、本物の繰り返しを巻き込まないため。同じ音声で「はい。」が
-# 3 回、「吉沢さん。」が 4 回続く箇所があり、**どちらも実際にそう言っている**。
-# ここは検出であって削除ではないので、拾いすぎても起こし直すだけで済む。
-LOOP_RUN_THRESHOLD = 3
+# 当初は「3 区間以上続いたら暴走」としたが、**15 分チャンクで誤発動だらけに
+# なった**(実機で 5 チャンク中 4 つ・処理時間がほぼ倍の 30 分。2026-08-21)。
+# 1 チャンクに 260 区間あると、本物の相づちが 3〜4 回続くのは普通である。
+#
+# 実データ 8 件を人が見分けたうえで線を引き直した。
+#
+#   時刻       回 中央値字/秒 実際   「本文」
+#   00:11:31    8      5      暴走   nick
+#   00:12:33    4     13      暴走   はい          ← この線では取りこぼす
+#   00:34:19    6     44      暴走   はい。
+#   00:42:11    4      5      本物   吉澤さん
+#   00:58:48    3     14      本物   もちろん。
+#   01:04:06    4      8      本物   はい。
+#   01:05:49    3     13      本物   失礼いたします。
+#   01:05:53    8     23      暴走   ありがとうございます。
+#
+# **回数か、話速か。**本物の繰り返しは 4 回までで、暴走は 6 回以上。
+# また 0.1 秒の区間に「ありがとうございます」(11 字)は入らない——
+# 日本語は速くても毎秒 12 字程度なので、3 割の余裕を見て 15 で切る。
+# 本物は 13〜14、暴走は 23〜44 で、間に線が引ける。
+#
+# 8 件中 7 件を正しく分けられる。取りこぼす「はい」4 回は本文が 2 文字で、
+# 聴けばすぐ直せる。**誤発動が 0 になることのほうが大事**——誤発動 1 回に
+# つきチャンク 1 本ぶんの時間が無駄になる。
+LOOP_RUN_THRESHOLD = 6
+
+# 話速の上限(字/秒)。これを超える区間は、時刻が潰れているか本文が水増し
+# されている。**繰り返しの中央値**で見る(1 つだけ潰れた区間は本物にもある)。
+MAX_CHARS_PER_SECOND = 15
+
+# 長さがこれ未満の区間は、割り算が暴れるので下限を当てる
+_MIN_SECONDS = 0.05
 
 
 def max_repeat_run(utterances: Sequence[Utterance]) -> int:
@@ -93,6 +120,45 @@ def max_repeat_run(utterances: Sequence[Utterance]) -> int:
             run, prev = 1, t
         best = max(best, run)
     return best
+
+
+def _runs(utterances: Sequence[Utterance]) -> list[list[Utterance]]:
+    """同じ本文が 3 区間以上続いたかたまりを集める。"""
+    out: list[list[Utterance]] = []
+    cur: list[Utterance] = []
+    for u in utterances:
+        t = (u.text or "").strip()
+        if not t:
+            cur = []
+            continue
+        if cur and (cur[-1].text or "").strip() == t:
+            cur.append(u)
+        else:
+            if len(cur) >= 3:
+                out.append(cur)
+            cur = [u]
+    if len(cur) >= 3:
+        out.append(cur)
+    return out
+
+
+def find_runaway(utterances: Sequence[Utterance]) -> Optional[tuple[int, str]]:
+    """暴走とみなせる繰り返しがあれば (回数, 本文) を返す。無ければ None。
+
+    **「同じ本文が続く」だけでは決めない**(上の表を見よ)。回数が多いか、
+    話速が人の限界を超えているかで判断する。
+    """
+    worst: Optional[tuple[int, str]] = None
+    for run in _runs(utterances):
+        n = len(run[0].text.strip())
+        rates = sorted(n / max(_MIN_SECONDS, u.rel_end - u.rel_start)
+                       for u in run)
+        median = rates[len(rates) // 2] if len(rates) % 2 else (
+            (rates[len(rates) // 2 - 1] + rates[len(rates) // 2]) / 2)
+        if len(run) >= LOOP_RUN_THRESHOLD or median > MAX_CHARS_PER_SECOND:
+            if worst is None or len(run) > worst[0]:
+                worst = (len(run), run[0].text.strip())
+    return worst
 
 
 class LocalAsrUnavailable(AlignUnavailable):
@@ -358,19 +424,21 @@ class LocalTranscriber:
 
         # **暴走していないか見る。**同じ本文が続くのは、その間の会話が
         # 丸ごと失われているということ。**黙って通してはいけない。**
-        n = max_repeat_run(result.utterances)
-        if n < LOOP_RUN_THRESHOLD or not self.condition_on_previous_text:
+        found = find_runaway(result.utterances)
+        if found is None or not self.condition_on_previous_text:
             return result
+        n, what = found
 
         if on_log:
-            on_log(f"  ※ 同じ本文が {n} 区間続いています(転写の暴走)。"
+            on_log(f"  ※ 「{what[:20]}」が {n} 区間続いています(転写の暴走)。"
                    "引き継ぎを切って起こし直します。")
         retry = self._once(audio_path, False, on_log=None,
                            on_progress=on_progress, is_cancelled=is_cancelled,
                            word_timestamps=word_timestamps)
         if retry is None:
             return None
-        n2 = max_repeat_run(retry.utterances)
+        again = find_runaway(retry.utterances)
+        n2 = again[0] if again else 0
         before = sum(len(u.text) for u in result.utterances)
         after = sum(len(u.text) for u in retry.utterances)
         # **繰り返しが減っただけでは採らない。本文が減っていないことも見る。**
@@ -380,14 +448,14 @@ class LocalTranscriber:
         # 3 → 2 に減ったが**本文が 1,758 字 → 1,669 字に減った**。
         # 本当に壊れていた chunk_0007 は 1,288 字 → 1,723 字と**増えている**。
         # **増えたときだけ採る**なら、両方とも正しく分かれる。
-        if n2 < n and after >= before:
+        if again is None and after >= before:
             if on_log:
                 on_log(f"  → 直りました({n} 区間 → {n2} 区間の繰り返し / "
                        f"本文 {before:,} 字 → {after:,} 字)。")
             return retry
-        if n2 < n:
-            # 繰り返しは減ったが本文も減った。**元を採る**——起こし直しの
-            # ほうが失っているので、繰り返しを消すために本文を捨てることになる。
+        if again is None:
+            # 暴走は消えたが本文も減った。**元を採る**——起こし直しのほうが
+            # 失っているので、繰り返しを消すために本文を捨てることになる。
             if on_log:
                 on_log(f"  → 起こし直すと本文が減る"
                        f"({before:,} 字 → {after:,} 字)ので、元のままにします"
