@@ -1436,6 +1436,20 @@ def run() -> int:
               <= _have)
         check("行を分けてある（1 行に詰めない）", len(_rows) >= 4)
 
+        # **注記をチェックボックスの文字列に埋めない。**埋めたら 353px に
+        # なり、右端の[取り消し]を押し出した(要 734px / 幅 713px。実機の
+        # 指摘・2026-08-21)。§10.3.6・GPU の注記と同じ種類の失敗で 3 度目。
+        _opts = awin.chk_apply_cluster.master
+        _kids = [c for c in _opts.winfo_children() if c.winfo_ismapped()]
+        _need = sum(c.winfo_reqwidth() for c in _kids) + 20
+        check(f"確定の行が収まる（要 {_need} / 幅 {_opts.master.winfo_width()}）",
+              _opts.master.winfo_width() >= _need)
+        check("チェックの文字列に注記を埋めていない",
+              len(str(awin.chk_apply_cluster.cget("text"))) <= 32)
+        check("[取り消し]が窓の右端をはみ出さない",
+              all(c.winfo_rootx() + c.winfo_reqwidth()
+                  <= awin.winfo_rootx() + awin.winfo_width() for c in _kids))
+
         # 候補を出した状態でも収まること（説明文と排他にしてある）
         from src.diarize import SpeakerTurn as _ST
         _real_turns2 = awin._load_turns
@@ -2300,6 +2314,28 @@ def run_main_window() -> int:
             main_gui.messagebox.askyesno = lambda *a, **k: True
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
+
+            # --- 話者分離を切ったまま始めようとしたら止める ---------------
+            # **注意文 1 行では気づけない。**実機で 30 分待ったあとに
+            # 「1000 区間を 1 件ずつ」と分かった(2026-08-21)。
+            _warned = {"n": 0, "text": ""}
+
+            def _warn(title, msg, **kw):
+                _warned["n"] += 1
+                _warned["text"] = msg
+                return False            # 「いいえ」= 始めない
+
+            main_gui.messagebox.askyesno = _warn
+            app.var_engine.set(main_gui.ENGINE_LOCAL)
+            app.var_mode.set(main_gui.MODE_MANUAL)
+            app.var_diarize_local.set(False)
+            app._start()
+            check("話者分離が切れていたら開始前に止める", _warned["n"] >= 1)
+            check("何が起きるかを伝える",
+                  "1 件ずつ" in _warned["text"])
+            check("直し方も伝える", "話者分離" in _warned["text"])
+            app.var_diarize_local.set(True)
+            main_gui.messagebox.askyesno = lambda *a, **k: True
 
             # --- GPU 向けのモデルを一度だけ勧める -------------------------
             # **勝手に 3GB を落とさない。**断られたら二度と聞かない。

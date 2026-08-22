@@ -685,9 +685,15 @@ class AssignWindow(tk.Toplevel):
         # 警告が出る——1219 区間なら 1219 回になる。最初から外しておく。
         if not self.has_real_clusters():
             self.var_apply_cluster.set(False)
-            self.chk_apply_cluster.configure(
-                state="disabled",
-                text="同じ声のまとまり全体に適用 (このファイルには声のまとまりがありません)")
+            self.chk_apply_cluster.configure(state="disabled")
+            # **どうすればよいかまで書く。**「ありません」で終わると、
+            # 打つ手が分からないまま 1 件ずつ確定することになる。
+            self.lbl_cluster_note.configure(text=(
+                f"※ このファイルには声のまとまりがありません。"
+                f"{len(self.proj.segments):,} 区間を 1 件ずつ確定することに"
+                "なります。転写のやり直しで［声のまとまりを端末内で分ける"
+                "（話者分離）］を入れると、まとめて当てられます"
+                "（転写はキャッシュが効くので、やり直しは短く済みます）。"))
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(4000, self._autosave_tick)
@@ -988,6 +994,14 @@ class AssignWindow(tk.Toplevel):
             .pack(side="right")
         ttk.Button(opts, text="未確定に戻す (D)", command=self.unassign).pack(side="right", padx=6)
         ttk.Button(opts, text="取り消し (Ctrl+Z)", command=self.undo).pack(side="right")
+
+        # **注記はチェックボックスの文字列に埋めない。**埋めたら 353px になり、
+        # 右端の[取り消し]を押し出した(要 734px / 幅 713px。2026-08-21 に実測)。
+        # §10.3.6・GPU の注記と同じ種類の失敗。**別の行に置く。**
+        self.lbl_cluster_note = ttk.Label(frm_cand, foreground="#B26500",
+                                          wraplength=700, justify="left", text="")
+        self.lbl_cluster_note.grid(row=3, column=0, sticky="w",
+                                   padx=8, pady=(0, 4))
 
         # --- 下部: ボタン ----------------------------------------------
         bottom = ttk.Frame(self, padding=(10, 4, 10, 10))
