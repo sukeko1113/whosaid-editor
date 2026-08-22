@@ -27,6 +27,7 @@ from typing import Optional, Sequence
 
 from .align import (
     AlignUnavailable,
+    add_cuda_dll_path,
     COMPUTE_TYPE,
     DEFAULT_MODEL,
     DEVICE,
@@ -37,6 +38,7 @@ from .align import (
     pick_device,
     resolve_model,
 )
+from .config import config_dir
 from .segments import PSEUDO_UNKNOWN, Utterance
 
 
@@ -395,6 +397,12 @@ class LocalTranscriber:
                 self.target = resolve_model(self.model, self.model_dir)
                 if on_log:
                     on_log(f"GPU では動かせませんでした({first})。")
+                    # **どこを見て何があったかを必ず出す。**これが無いと、
+                    # 手元で再現しない不具合を推測で追うことになる
+                    # (実機で 2 度やって 2 度とも外した・2026-08-22)。
+                    for line in add_cuda_dll_path():
+                        on_log(f"    {line}")
+                    on_log(f"    設定の置き場: {config_dir()}")
                     if self.model != was:
                         on_log(
                             f"  ※ CPU では {was} が実用外のため、"

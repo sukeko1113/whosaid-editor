@@ -3869,6 +3869,38 @@ def test_engine_records_what_actually_ran():
     assert "fell_back" in rec
 
 
+def test_model_advice_never_recommends_a_smaller_model():
+    """**「small なら誤字が 4 割減る」は嘘。**逆さまの案内を出さない。
+
+    large-v3 を選んでいるのに large-v3 が見つからないと `default_model()`
+    が small を返し、案内文が「いまの設定は large-v3 ですが、small なら
+    誤字が約 4 割減り…」になっていた（実機で発生・2026-08-22）。
+    勧めてよいのは large-v3 へ上げるときだけ。
+    """
+    import inspect
+    from src import pipeline
+    src = inspect.getsource(pipeline.run_segment_pipeline)
+    i = src.index("誤字が約 4 割減り")
+    cond = src[max(0, i - 700):i]
+    assert "best == align.GPU_DEFAULT_MODEL" in cond,         "小さいモデルを勧める経路が残っている"
+
+
+def test_gpu_failure_says_where_it_looked():
+    """**GPU が使えないとき、どこを見て何があったかを出す。**
+
+    「cublas64_12.dll is not found」だけでは、開発機で再現しない不具合を
+    推測で追うことになる（実機で 2 度外した・2026-08-22）。
+    """
+    from src import align
+    report = align.add_cuda_dll_path()
+    assert isinstance(report, list)
+    import inspect
+    from src import local_asr
+    src = inspect.getsource(local_asr.LocalTranscriber._load)
+    assert "add_cuda_dll_path()" in src, "失敗時に探索結果を出していない"
+    assert "config_dir()" in src, "設定の置き場を出していない"
+
+
 def test_engine_does_not_claim_a_device_it_never_used():
     """**キャッシュが全部当たった実行で、装置を名乗らない。**
 

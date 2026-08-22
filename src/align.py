@@ -66,7 +66,7 @@ class AlignUnavailable(RuntimeError):
     """
 
 
-def add_cuda_dll_path() -> None:
+def add_cuda_dll_path() -> list[str]:
     """pip で入れた CUDA の DLL を探索先に足す(あれば)。
 
     `nvidia-cublas-cu12` / `nvidia-cudnn-cu12` は DLL を site-packages の
@@ -76,8 +76,9 @@ def add_cuda_dll_path() -> None:
     無い環境では何もしない。同梱ビルドで別の場所に置く場合もここを直す。
     """
     if sys.platform != "win32":
-        return                      # Linux/macOS は既定の探索先で見つかる
+        return []                   # Linux/macOS は既定の探索先で見つかる
 
+    report: list[str] = []
     dirs: list[Path] = []
     # **利用者が取ってきたぶん。**配布物には同梱しない(NVIDIA の条件と
     # 本体の MIT が噛み合わないため。cuda_fetch の冒頭を見よ)。
@@ -118,9 +119,16 @@ def add_cuda_dll_path() -> None:
             if f.is_file():
                 try:
                     ctypes.WinDLL(str(f))
-                except OSError:
-                    pass        # 読めなくても止めない(CPU に落ちるだけ)
+                    report.append(f"読み込み成功 {f}")
+                except OSError as e:
+                    # **黙って落とさない。**読めなかったことが分からないと、
+                    # あとで「GPU が使えない」理由に辿り着けない。
+                    report.append(f"読み込み失敗 {f} — {e}")
                 break
+        else:
+            report.append(f"見つからない {name}(探した先: "
+                          + " / ".join(str(d) for d in dirs) + ")")
+    return report
 
 
 def cuda_available() -> bool:
