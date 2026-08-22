@@ -3345,6 +3345,22 @@ def test_speaking_rate_line_sits_between_the_real_cases():
     assert 4 < LOOP_RUN_THRESHOLD <= 6
 
 
+def test_the_real_runaway_greeting_is_caught():
+    """**実データそのもの。**01:05:48「失礼いたします。」3 区間（暴走）。
+
+    2026-08-22 に利用者が音声を聴いて確かめた。実際の音声は
+    「失礼いたします。これで失礼いたします」の 2 発言だけで、3 区間は
+    同じ音声を 3 回書いたもの。長さは実際の値（0.36 / 0.44 / 0.48 秒・8 字）
+    で、中央値 18.2 字/秒。
+
+    **一度これを「本物」と誤解して線を 25 へ上げかけた。**聴いた人の判定が
+    入って初めて分かったので、耳で確かめた事実だけを根拠にすること。
+    """
+    from src.local_asr import find_runaway
+    got = find_runaway(_run_of("失礼いたします。", [0.36, 0.44, 0.48]))
+    assert got is not None and got[0] == 3
+
+
 def test_retry_replaces_the_run_and_says_so():
     """暴走したら引き継ぎを切って起こし直し、**直ったことを利用者に伝える**。"""
     from src import local_asr
