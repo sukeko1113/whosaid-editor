@@ -1709,22 +1709,22 @@ def test_write_text_carries_the_style(tmp_path=None):
         assert CONTINUE_MARK not in body2, body2
 
 
-def test_remove_added_utterance_only_removes_added_ones():
-    """**音声認識が出した区間には削除の入口を作らない。**
+def test_remove_added_utterance_tells_the_two_apart():
+    """**足した区間と、転写が出した区間を、記録の上で区別する。**
 
-    短い相づちの自動削除をしない原則(CLAUDE.md)はそのまま。
+    どちらも人が明示的に消せる（自動削除をしない原則は「自動」に対する
+    もの・2026-08-22 に実機の指摘で見直した）。ただし意味が違う——
+    前者は自分の入力の取り消し、後者は機械の出力を人の判断で落とすこと。
     """
     proj = _splittable()
     seg = proj.add_utterance(105.0, 105.8, "はい")
-    try:
-        proj.remove_added_utterance(0)               # ASR 由来の区間
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("ASR の区間を消せてしまった")
+    proj.remove_added_utterance(0)                   # ASR 由来の区間
+    assert proj.edit_log[-1]["op"] == "remove_segment"
+    assert "text" in proj.edit_log[-1], "消した中身が残っていない"
+    seg = next(s for s in proj.segments if proj.is_added_utterance(s))
     proj.remove_added_utterance(seg.index)
-    assert len(proj.segments) == 3
-    assert [s.index for s in proj.segments] == [0, 1, 2]
+    assert proj.edit_log[-1]["op"] == "remove_added_utterance"
+    assert [s.index for s in proj.segments] == list(range(len(proj.segments)))
     # 消したら鍵も落ちる(再実行の引き継ぎが古い鍵を掴まないように)
     assert proj.added_utterance_keys() == set()
 
@@ -2944,13 +2944,11 @@ def test_transcribed_segment_is_not_mistaken_for_an_added_one():
     proj.renumber()
 
     assert proj.is_added_utterance(added) is True
-    assert proj.is_added_utterance(ghost) is False, "転写の区間を消せてしまう"
-    try:
-        proj.remove_added_utterance(ghost.index)
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("転写の区間が消せてしまった")
+    assert proj.is_added_utterance(ghost) is False, "転写の区間を足したものと誤認"
+    # 消すこと自体はできる（人が明示的に消すのは許す）。**記録の上で
+    # 取り違えないこと**がここの要点——消したときの op が別になる。
+    proj.remove_added_utterance(ghost.index)
+    assert proj.edit_log[-1]["op"] == "remove_segment"
 
 
 def test_two_added_at_the_same_time_both_reach_the_output():
@@ -4023,6 +4021,54 @@ def test_inproc_escape_hatch_exists():
     src = inspect.getsource(diarize._run)
     assert "WHOSAID_DIARIZE_INPROC" in src
     assert "_diarize_here" in src
+
+
+def test_a_person_can_remove_a_transcribed_segment():
+    """**聴いて確かめた人は、転写が出した区間も消せる。**
+
+    禁じているのは**自動**削除であって、音声を聴いて機械の重複だと判断した
+    人が消すことは別のこと。実機で「同じ音声が 3 区間に書かれた」場面に
+    当たり、結合を 2 回してから分割する遠回りを強いられた（2026-08-22）。
+    """
+    proj = _make_project()
+    n = len(proj.segments)
+    seg = proj.segments[1]
+    assert not proj.is_added_utterance(seg), "前提: 転写が出した区間"
+    proj.remove_added_utterance(1)
+    assert len(proj.segments) == n - 1
+
+
+def test_removing_a_transcribed_segment_keeps_what_was_removed():
+    """**消した中身を履歴に残す。**
+
+    足した区間を消すのは「自分の入力の取り消し」だが、こちらは機械の出力を
+    人の判断で落とすこと。第三者が「ここで何が消されたか」を追えなければ、
+    検証済みの記録にならない。
+    """
+    proj = _make_project()
+    seg = proj.segments[1]
+    text, start = seg.text, seg.start
+    proj.remove_added_utterance(1)
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "remove_segment", "足した区間と同じ扱いになっている"
+    assert rec["actor"] == "user", "自動処理として残っている"
+    assert rec["text"] == text, "消した本文が残っていない"
+    assert rec["start"] == start
+    from src.segments import LOG_LABELS
+    assert "remove_segment" in LOG_LABELS, "履歴の表示名が無い"
+
+
+def test_removing_an_added_utterance_stays_the_same():
+    """足した区間を消したときの記録は、これまでどおり。"""
+    proj = _make_project()
+    seg = proj.segments[0]
+    proj.add_utterance(start=seg.end + 0.1, end=seg.end + 0.5,
+                       text="はい", cluster=seg.cluster)
+    added = next(s for s in proj.segments if proj.is_added_utterance(s))
+    proj.remove_added_utterance(added.index)
+    rec = proj.edit_log[-1]
+    assert rec["op"] == "remove_added_utterance"
+    assert "text" not in rec, "取り消しなのに中身まで残している"
 
 
 # ======================================================================

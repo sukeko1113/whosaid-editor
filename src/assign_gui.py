@@ -786,12 +786,18 @@ class AssignWindow(tk.Toplevel):
         sb.grid(row=2, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
-        self.tree.tag_configure("unassigned", background="#FFF8E1")
-        self.tree.tag_configure("bulk", background="#F1F6FB")
-        self.tree.tag_configure("special", foreground="#8A8A8A")
+        # **背景の色と文字の色で、タグを分ける。**1 行に複数のタグが付くと
+        # どれが効くかは Tk の実装次第で、確かめる手立てもない。同じ種類の
+        # 色を 2 つ以上付けないようにして、当てにならない優先順に頼らない。
+        self.tree.tag_configure("bg_unassigned", background="#FFF8E1")
+        self.tree.tag_configure("bg_bulk", background="#F1F6FB")
+        self.tree.tag_configure("fg_special", foreground="#8A8A8A")
         # 人が足した発話。**一覧で見分けられないと、あとから消す対象を
-        # 探せない**(実機の指摘・2026-08-18)。
-        self.tree.tag_configure("added", background="#FFF3E0")
+        # 探せない**(実機の指摘・2026-08-18)。薄い橙では埋もれて分からない
+        # という指摘を受けたので(2026-08-22)、**背景・文字色・括弧の 3 つ**で
+        # 示す。色だけでは印刷や色覚の条件で消える。
+        self.tree.tag_configure("bg_added", background="#FFE0B2")
+        self.tree.tag_configure("fg_added", foreground="#BF360C")
 
         right = ttk.Frame(body)
         body.add(right, weight=4)
@@ -1414,14 +1420,14 @@ class AssignWindow(tk.Toplevel):
     def _row_values(self, seg) -> tuple[tuple, tuple]:
         name = self.proj.speaker_name(seg.speaker_id)
         mark = ""
-        tags: list[str] = []
+        bg = fg = ""
         if not seg.speaker_id:
-            tags.append("unassigned")
+            bg = "bg_unassigned"
         else:
             if seg.speaker_id in (SPECIAL_UNKNOWN, SPECIAL_MULTI, SPECIAL_NOISE):
-                tags.append("special")
+                fg = "fg_special"
             if not seg.reviewed:
-                tags.append("bulk")
+                bg = "bg_bulk"
                 mark = "△"      # まとめて適用しただけ(自分の耳では未確認)
             else:
                 mark = "✓"
@@ -1434,11 +1440,13 @@ class AssignWindow(tk.Toplevel):
         # 色覚の条件で消えるので、文字でも分かるようにする。
         body = seg.preview(70)
         if self.proj.is_added_utterance(seg):
-            tags.append("added")
-            body = f"＋ {body}"
+            # **足した発話は背景・文字色・括弧の 3 つで示す。**
+            # 「＋」だけでは一覧に埋もれて分からない(実機の指摘・2026-08-22)。
+            bg, fg = "bg_added", "fg_added"
+            body = f"＋（{body}）"
         values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", body)
-        return values, tuple(tags)
+        return values, tuple(t for t in (bg, fg) if t)
 
     def _insert_row(self, seg) -> str:
         values, tags = self._row_values(seg)
@@ -1605,12 +1613,11 @@ class AssignWindow(tk.Toplevel):
         self._rebuild_candidates()      # 話者の候補(suggest.py)
         self._show_voice_candidates()   # 声の候補(candidates.py・§10.3)
         self._draw_timeline()
-        # 消せるのは人が足した区間だけ。**音声認識が出した区間には削除の
-        # 入口を作らない**(短い相づちの自動削除をしない原則)。
+        # **人が明示的に消すのは許す。**禁じているのは自動削除で、音声を
+        # 聴いて機械の重複だと判断した人が消すのは別のこと(実機の指摘・
+        # 2026-08-22)。転写が出した区間を消したときは中身を履歴に残す。
         if hasattr(self, "btn_del_added"):
-            self.btn_del_added.configure(
-                state="normal" if self.proj.is_added_utterance(seg)
-                else "disabled")
+            self.btn_del_added.configure(state="normal")
 
     def _update_seginfo(self) -> None:
         """区間ヘッダ(右ペイン最上段)を書き直す。"""
@@ -2289,13 +2296,21 @@ class AssignWindow(tk.Toplevel):
         if not self.proj.segments:
             return
         seg = self.proj.segments[self.current]
-        if not self.proj.is_added_utterance(seg):
-            self._set_action("この区間は人が足したものではないので消せません。")
-            return
+        if self.proj.is_added_utterance(seg):
+            title, extra = "足した発話を消す", ""
+        else:
+            # **転写が出した区間。**取り消しにくい操作なので、何が起きるかを
+            # はっきり書いてから消す。
+            title = "転写した区間を消す"
+            extra = ("\n\nこれは転写が出した区間です。"
+                     "同じ音声が二重に書かれたときのために消せるように"
+                     "してあります。\n"
+                     "聴いて確かめたときだけ消してください"
+                     "(消したことと中身は編集履歴に残ります)。")
         if not messagebox.askyesno(
-                "足した発話を消す",
+                title,
                 f"{fmt_hms_frac(seg.start)}「{seg.preview(30)}」を消します。"
-                "よろしいですか。", parent=self):
+                f"よろしいですか。{extra}", parent=self):
             return
         index = seg.index
         self.proj.remove_added_utterance(index)

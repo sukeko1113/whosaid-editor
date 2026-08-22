@@ -1259,24 +1259,39 @@ class Project:
         return max(times) if times else ""
 
     def remove_added_utterance(self, index: int) -> None:
-        """人が足した区間を消す。**それ以外は消せない。**
+        """区間を消す。**人が明示的に消すときだけ。**
 
-        短い相づちの自動削除をしない原則（CLAUDE.md）はそのまま。
-        ここで消せるのは人がいま足したものだけで、音声認識が出した区間には
-        削除の入口を作らない。
+        短い相づちの**自動**削除をしない原則（CLAUDE.md）はそのまま。
+        禁じているのは自動処理で、**音声を聴いて機械の重複だと判断した人が
+        消すことは別のこと**。実機で「同じ音声が 3 区間に書かれた」場面に
+        当たり、結合を 2 回してから分割する遠回りを強いられた
+        （2026-08-22）。
+
+        転写が出した区間を消したときは、**消した中身を編集履歴に残す**。
+        第三者が「ここで何が消されたか」を追えなければ、検証済みの記録に
+        ならない。
         """
         if not (0 <= index < len(self.segments)):
             raise ValueError("その区間はありません。")
         seg = self.segments[index]
-        if not self.is_added_utterance(seg):
-            raise ValueError("人が足した区間ではないので消せません。")
+        added = self.is_added_utterance(seg)
         del self.segments[index]
         self.renumber()
         self.edit_log.append({
-            "op": "remove_added_utterance",
+            "op": "remove_added_utterance" if added else "remove_segment",
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "actor": "user",
             "orig_start": float(seg.orig_start),
+            # **転写が出した区間を消したときは、中身も残す。**
+            # 足した区間を消すのは「自分の入力の取り消し」だが、こちらは
+            # 機械の出力を人の判断で落とすこと。第三者が「ここで何が
+            # 消されたか」を追えなければ、検証済みの記録にならない。
+            **({} if added else {
+                "start": float(seg.start),
+                "end": float(seg.end),
+                "text": seg.text,
+                "cluster": str(seg.cluster),
+            }),
         })
 
     def merge_segments(self, index: int) -> Segment:
@@ -1665,6 +1680,7 @@ LOG_LABELS = {
     "undo_times": "時刻の取り消し",
     "add_utterance": "相づちを足した",
     "remove_added_utterance": "相づちを消した",
+    "remove_segment": "区間を消した(転写の重複)",
     "restore_lost_segments": "消えた区間を戻した",
     "split": "区間の分割",
     "merge": "区間の結合",

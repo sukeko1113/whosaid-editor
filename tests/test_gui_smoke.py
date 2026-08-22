@@ -1237,8 +1237,21 @@ def run() -> int:
         awin.var_autoplay.set(False)
         awin.update()
 
-        check("足した区間でなければ消せない",
-              str(awin.btn_del_added.cget("state")) == "disabled")
+        # **転写が出した区間でも押せる。**禁じているのは自動削除であって、
+        # 聴いて機械の重複だと判断した人が消すのは別のこと（実機の指摘・
+        # 2026-08-22。結合を 2 回してから分割する遠回りを強いられた）。
+        check("転写の区間でも消すボタンが押せる",
+              str(awin.btn_del_added.cget("state")) == "normal")
+
+        # --- 足した発話は一覧で目立つか ------------------------------
+        # 「＋」だけでは埋もれて分からないという指摘（2026-08-22）。
+        # **背景・文字色・括弧の 3 つ**で示す。色だけでは印刷や色覚の
+        # 条件で消える。
+        _asr_vals, _asr_tags = awin._row_values(ap.segments[0])
+        check("転写の区間は括弧で囲まない", "＋（" not in _asr_vals[3])
+        check("同じ種類の色を 2 つ付けない",
+              sum(1 for t in _asr_tags if t.startswith("bg_")) <= 1
+              and sum(1 for t in _asr_tags if t.startswith("fg_")) <= 1)
 
         # 小窓は差し替える(開くと応答待ちで止まる)
         real_ask_utt = awin._ask_utterance
@@ -1264,6 +1277,13 @@ def run() -> int:
             check("足した区間へ移動している", awin.current == a.index)
             check("消すボタンが押せるようになる",
                   str(awin.btn_del_added.cget("state")) == "normal")
+            _vals, _tags = awin._row_values(a)
+            check("足した発話は括弧で囲んで示す", _vals[3].startswith("＋（"))
+            check("足した発話は背景と文字色でも示す",
+                  "bg_added" in _tags and "fg_added" in _tags)
+            check("足した行も同じ種類の色は 1 つずつ",
+                  sum(1 for t in _tags if t.startswith("bg_")) == 1
+                  and sum(1 for t in _tags if t.startswith("fg_")) == 1)
             # 消す(確認ダイアログは「はい」に差し替える)
             real_ask = assign_gui.messagebox.askyesno
             assign_gui.messagebox.askyesno = lambda *a2, **k2: True
