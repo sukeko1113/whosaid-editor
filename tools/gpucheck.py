@@ -19,6 +19,10 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+if "--diarize" in sys.argv[1:]:
+    from src.diarize import child_main
+    sys.exit(child_main(sys.argv[sys.argv.index("--diarize") + 1:]))
+
 print("frozen           :", getattr(sys, "frozen", False))
 print("_MEIPASS         :", getattr(sys, "_MEIPASS", "(なし)"))
 print("APPDATA          :", os.environ.get("APPDATA"))
@@ -53,3 +57,60 @@ try:
     print("  loaded :", t.loaded, "/", t.device, t.compute_type, t.model)
 except Exception:
     traceback.print_exc()
+
+
+# ======================================================================
+# 話者分離が「親→子」で回るか（固めた状態で確かめる）
+#
+# **開発環境で動いても意味がない。**固めた実行ファイルでは自分自身を
+# 呼び直す形になり、`__file__` も `sys.executable` も別物になる。
+# この確認そのものが子役も兼ねる（--diarize を受ける）ので、
+# 本体アプリと同じ経路を通る。
+# ======================================================================
+def _check_diarize():
+    import threading
+    import time
+    from src import diarize
+
+    wav = os.path.join(os.environ.get("TEMP", "."), "child60.wav")
+    if not os.path.exists(wav):
+        print("確認用の音声が無いので飛ばします:", wav)
+        return
+
+    def measure(inproc):
+        if inproc:
+            os.environ["WHOSAID_DIARIZE_INPROC"] = "1"
+        else:
+            os.environ.pop("WHOSAID_DIARIZE_INPROC", None)
+        ticks, stop, got = [], threading.Event(), {}
+
+        def work():
+            try:
+                got["t"] = diarize.diarize(wav, num_speakers=3)
+            except Exception as e:
+                got["err"] = e
+            stop.set()
+
+        t0 = time.perf_counter()
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        while not stop.is_set():
+            ticks.append(time.perf_counter() - t0)
+            time.sleep(0.02)
+        th.join()
+        el = time.perf_counter() - t0
+        gaps = sorted(b - a for a, b in zip(ticks, ticks[1:]))
+        return (got.get("t"), got.get("err"), el,
+                len(ticks) / max(1, int(el / 0.02)),
+                (gaps[-1] * 1000 if gaps else 0.0))
+
+    for label, inproc in (("子プロセス", False), ("同居", True)):
+        t, err, el, ratio, gap = measure(inproc)
+        print(f"  [{label}] {el:.1f} 秒 / 主スレッド {ratio*100:.0f}% / "
+              f"最長の空白 {gap:.0f} ms / 区間 {len(t or [])}"
+              + (f" / エラー {err}" if err else ""))
+
+
+if "--diarize-check" in sys.argv:
+    print("--- 話者分離（親→子）---")
+    _check_diarize()
