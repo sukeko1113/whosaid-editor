@@ -3337,12 +3337,31 @@ def test_runaway_is_judged_by_count_and_speaking_rate():
     assert find_runaway(_run_of("はい。", [0.05, 0.05])) is None
 
 
-def test_speaking_rate_line_sits_between_the_real_cases():
-    """線の位置を実データで縛る。**本物 13〜14、暴走 23〜44 の間。**"""
+def test_speaking_rate_line_sits_above_every_real_case():
+    """線の位置を実データで縛る。**本物の最大 18.2 より上、44 より下。**
+
+    2026-08-22 に利用者が音声を聴いて確かめたところ、01:05:48 の
+    「失礼いたします。」3 回は本物だった（3 人が続けて挨拶していた）。
+    そこで分かったのは、**同じ音声・同じモデルでも走らせるたびに
+    字/秒が動く**こと（本物の同じ発言が 13.3 → 18.2）。15 という線は
+    測定の揺れの中に埋まっていた。
+    """
     from src.local_asr import MAX_CHARS_PER_SECOND, LOOP_RUN_THRESHOLD
-    assert 14 < MAX_CHARS_PER_SECOND < 23, "本物と暴走の間から外れている"
+    assert MAX_CHARS_PER_SECOND > 18.2, "本物(実測 18.2)を暴走と呼んでしまう"
+    assert MAX_CHARS_PER_SECOND < 43, "44 字/秒の明らかな暴走まで見逃す"
     # 本物の繰り返しは実データで最大 4 回、暴走は 6 回以上
     assert 4 < LOOP_RUN_THRESHOLD <= 6
+
+
+def test_the_real_greeting_is_not_called_a_runaway():
+    """**実データそのもの。**01:05:48「失礼いたします。」3 回（本物）。
+
+    利用者が音声を聴いて確かめた唯一の正解。長さは実際の値
+    （0.36 / 0.44 / 0.48 秒・8 字）。ここが発動したら、また 2 分ぶんの
+    起こし直しが無駄になる。
+    """
+    from src.local_asr import find_runaway
+    assert find_runaway(_run_of("失礼いたします。", [0.36, 0.44, 0.48])) is None
 
 
 def test_retry_replaces_the_run_and_says_so():
