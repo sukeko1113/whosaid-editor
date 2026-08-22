@@ -2387,6 +2387,55 @@ def run_main_window() -> int:
             # 戻すのは、この関数の最後の一箇所だけ。
             main_gui.save_config = lambda d: saved.update(d)
 
+            # --- 出力先は覚える / 押す前に見える -----------------------
+            # **起動のたびに空へ戻っていた。**毎回選び直しになり、
+            # ［参照...］が「前回エクスプローラで開いた場所」を出すため、
+            # 関係のないプロジェクトのフォルダへ書き出しかけた
+            # （実機で発生・2026-08-22）。
+            import tempfile as _tf4
+            with _tf4.TemporaryDirectory() as _d4:
+                app.var_use_input_dir.set(False)
+                app._on_toggle_use_input_dir()
+                app.var_output.set(_d4)
+                app.update()
+                check("開始ボタンのそばに出力先が出る",
+                      _d4 in app.lbl_dest.cget("text"))
+                check("出力先の表示は開始ボタンと同じ入れ物にある",
+                      app.lbl_dest.master is app.btn_start.master)
+
+                _saved4 = {}
+                main_gui.save_config = lambda x: _saved4.update(x)
+                app.cfg[app.OUTPUT_KEY] = _d4
+                app.cfg[app.USE_INPUT_DIR_KEY] = False
+                _app4 = main_gui.App.__new__(main_gui.App)
+                main_gui.load_config = lambda: dict(app.cfg)
+                try:
+                    _app4.__init__()
+                    _app4.update()
+                    check("次に起動したとき出力先が戻る",
+                          _app4.var_output.get() == _d4)
+                    check("戻したときも表示に出ている",
+                          _d4 in _app4.lbl_dest.cget("text"))
+                finally:
+                    _app4.destroy()
+                    main_gui.load_config = lambda: {}
+
+                # **消えていたら戻さない。**外したドライブや別 PC の設定を
+                # そのまま使うと、書けない場所へ書きにいく。
+                app.cfg[app.OUTPUT_KEY] = str(Path(_d4) / "無い場所")
+                _app5 = main_gui.App.__new__(main_gui.App)
+                main_gui.load_config = lambda: dict(app.cfg)
+                try:
+                    _app5.__init__()
+                    check("消えていた出力先は戻さない",
+                          "無い場所" not in _app5.var_output.get())
+                finally:
+                    _app5.destroy()
+                    main_gui.load_config = lambda: {}
+                main_gui.save_config = lambda d: saved.update(d)
+                app.var_use_input_dir.set(True)
+                app._on_toggle_use_input_dir()
+
             # 名前が実態と合っているか（作業ファイルもここに置かれる）
             check("フォルダの名前が「出力」だけになっていない",
                   "作業" in str(app.entry_output.master.cget("text")))

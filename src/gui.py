@@ -410,6 +410,13 @@ class App(tk.Tk):
         # === 操作ボタン ===
         frm_btn = ttk.Frame(body)
         frm_btn.grid(row=6, column=0, sticky="ew", **pad)
+        # **押す前に、どこへ作られるかが目に入るようにする。**
+        # 出力先の欄は画面のいちばん上、開始ボタンはいちばん下にあるため、
+        # 押すときに出力先が見えない。実機で関係のないプロジェクトの
+        # フォルダへ書き出しかけた(2026-08-22)。
+        self.lbl_dest = ttk.Label(frm_btn, foreground="#333", justify="left")
+        self.lbl_dest.pack(side="top", anchor="w", pady=(0, 4))
+        self.var_output.trace_add("write", lambda *_: self._refresh_dest())
         self.btn_start = ttk.Button(frm_btn, text="文字起こし開始", command=self._start)
         self.btn_start.pack(side="left")
         self.btn_cancel = ttk.Button(frm_btn, text="キャンセル", command=self._cancel, state="disabled")
@@ -476,7 +483,16 @@ class App(tk.Tk):
         if last_in := self.cfg.get("last_input"):
             if Path(last_in).exists():
                 self.var_input.set(last_in)
+        if self.USE_INPUT_DIR_KEY in self.cfg:
+            self.var_use_input_dir.set(bool(self.cfg.get(self.USE_INPUT_DIR_KEY)))
         self._on_toggle_use_input_dir()
+        # **消えていたら黙って戻さない。**別の PC で作った設定や、外した
+        # ドライブを指したまま開始すると、書けない場所へ書きにいく。
+        if not self.var_use_input_dir.get():
+            last_out = str(self.cfg.get(self.OUTPUT_KEY) or "")
+            if last_out and os.path.isdir(last_out):
+                self.var_output.set(last_out)
+        self._refresh_dest()
         # 経路を反映してからモデル欄と有効/無効を整える(mode の状態もここで揃う)
         self._update_engine_state()
 
@@ -860,6 +876,23 @@ class App(tk.Tk):
                          f"{align.DEFAULT_MODEL} のまま使えます。")
         self._append_log(msg)
 
+    OUTPUT_KEY = "last_output"
+    USE_INPUT_DIR_KEY = "use_input_dir"
+
+    def _refresh_dest(self) -> None:
+        """開始ボタンのそばに「どこへ作られるか」を出す。
+
+        出力先の欄は画面のいちばん上、開始ボタンはいちばん下にあるので、
+        押すときに出力先が見えない。実機で関係のないプロジェクトの
+        フォルダへ書き出しかけた(2026-08-22)。
+        """
+        d = (self.var_output.get() or "").strip()
+        if not d:
+            d = os.path.dirname(self.var_input.get() or "")
+        self.lbl_dest.configure(
+            text=f"ここに作られます: {d}" if d
+            else "ここに作られます: (音声ファイルを選んでください)")
+
     def _pick_output(self) -> None:
         initial = self.var_output.get() or os.path.dirname(self.var_input.get() or "")
         path = filedialog.askdirectory(title="出力フォルダを選択", initialdir=initial or None)
@@ -1054,6 +1087,11 @@ class App(tk.Tk):
                         else self._verbatim_for_cloud,
             "roster": roster,
             "last_input": in_path,
+            # **出力先も覚える。**起動のたびに空へ戻るので毎回選び直しに
+            # なり、［参照...］が「前回エクスプローラで開いた場所」を出す
+            # ため、関係のないフォルダが選ばれやすかった(2026-08-22)。
+            self.OUTPUT_KEY: out_dir,
+            self.USE_INPUT_DIR_KEY: bool(self.var_use_input_dir.get()),
         })
         save_config(self.cfg)
 
