@@ -2315,6 +2315,34 @@ def run_main_window() -> int:
             app._start()
             check("話者分離を切れば人数を聞かない", asked["n"] == 0)
 
+            # --- 前回どこで作業したかを覚える -----------------------------
+            # **覚えていないと毎回ちがう場所が開く。**実機で、G ドライブで
+            # 作業したのに C ドライブが開いた(2026-08-22)。「出力フォルダ」は
+            # いま選んでいる音声の出力先で、前回の作業場所とは関係がない。
+            import tempfile as _tf
+            with _tf.TemporaryDirectory() as _d:
+                _proj = Path(_d) / "どこか" / "x.speakers.json"
+                _proj.parent.mkdir()
+                _proj.write_text("{}", encoding="utf-8")
+                _saved3 = {}
+                main_gui.save_config = lambda x: _saved3.update(x)
+                app._remember_project(str(_proj))
+                check("開いた作業ファイルを覚える",
+                      app.cfg.get(app.LAST_PROJECT_KEY) == str(_proj))
+                check("設定にも書く", app.LAST_PROJECT_KEY in _saved3)
+                check("次に開くときはその場所",
+                      app._last_project_dir() == str(_proj.parent))
+                # 覚えた場所が消えていたら、出力フォルダに戻る
+                app.cfg[app.LAST_PROJECT_KEY] = str(Path(_d) / "無い" / "y.json")
+                app.var_output.set(_d)
+                check("消えていたら出力フォルダに戻る",
+                      app._last_project_dir() == _d)
+            main_gui.save_config = real_save
+
+            # 名前が実態と合っているか（作業ファイルもここに置かれる）
+            check("フォルダの名前が「出力」だけになっていない",
+                  "作業" in str(app.entry_output.master.cget("text")))
+
             # --- 話者分離を切ったまま始めようとしたら止める ---------------
             # **注意文 1 行では気づけない。**実機で 30 分待ったあとに
             # 「1000 区間を 1 件ずつ」と分かった(2026-08-21)。

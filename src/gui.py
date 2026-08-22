@@ -187,7 +187,11 @@ class App(tk.Tk):
         ttk.Button(frm_in, text="参照...", command=self._pick_input).grid(row=0, column=1, padx=(0, 6), pady=6)
 
         # === 出力フォルダ ===
-        frm_out = ttk.LabelFrame(body, text="出力フォルダ")
+        # **名前を実態に合わせる。**「出力フォルダ」だと Word の出力先だけを
+        # 指すように読めるが、**割当作業ファイル(.speakers.json)もここに
+        # 置かれる**。どこで作業しているのか分からない、という指摘を受けた
+        # (2026-08-22)。
+        frm_out = ttk.LabelFrame(body, text="作業フォルダ（出力先）")
         frm_out.grid(row=1, column=0, sticky="ew", **pad)
         frm_out.columnconfigure(0, weight=1)
         self.var_output = tk.StringVar()
@@ -198,10 +202,15 @@ class App(tk.Tk):
         self.btn_pick_out.grid(row=0, column=1, padx=(0, 6), pady=6)
         ttk.Checkbutton(
             frm_out,
-            text="音声ファイルと同じフォルダに出力する",
+            text="音声ファイルと同じフォルダに置く",
             variable=self.var_use_input_dir,
             command=self._on_toggle_use_input_dir,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 2))
+        ttk.Label(
+            frm_out, foreground="#666", wraplength=700, justify="left",
+            text="※ 割当作業ファイル（.speakers.json）と Word の出力が、ここに"
+                 "作られます。作業を再開するときも、このフォルダから開きます。",
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 6))
 
         # === 処理経路(どこで転写するか) ===
         # 既定はローカル。クラウドは明示的に選んだときだけ使う。
@@ -249,7 +258,8 @@ class App(tk.Tk):
             frm_mode, text="", foreground="#888", wraplength=700)
         self.lbl_auto_note.grid(row=4, column=0, sticky="w", padx=28, pady=(0, 6))
         ttk.Button(
-            frm_mode, text="保存済みの割当作業を開く...", command=self._open_saved_project,
+            frm_mode, text="保存済みの作業を開く...（転写せずに続きから）",
+            command=self._open_saved_project,
         ).grid(row=5, column=0, sticky="w", padx=6, pady=(0, 8))
 
         # === 詳細設定 ===
@@ -626,7 +636,7 @@ class App(tk.Tk):
                          "あとの割当画面で 1 区間ずつ確定します。"
                 )
             self.tbl_roster.set_enabled(True)
-            self.btn_start.configure(text="文字起こし → 割当画面へ")
+            self.btn_start.configure(text="文字起こしを開始（終わると割当画面へ）")
         else:
             self.chk_diarization.configure(state="normal")
             self.lbl_diar_note.configure(
@@ -649,12 +659,37 @@ class App(tk.Tk):
             self.tbl_roster.set_enabled(False)
 
     # ------------------------------------------------------------------
+    LAST_PROJECT_KEY = "last_project"
+
+    def _last_project_dir(self) -> str:
+        """前回、割当作業を開いた（または作った）場所。
+
+        **ここを覚えていないと、毎回ちがう場所が開く。**「出力フォルダ」は
+        いま選んでいる音声の出力先であって、前回どこで作業したかとは
+        関係がない。実機で C ドライブが開いて迷わせた（2026-08-22）。
+        """
+        last = str(self.cfg.get(self.LAST_PROJECT_KEY) or "")
+        if last:
+            d = os.path.dirname(last)
+            if os.path.isdir(d):
+                return d
+        return self.var_output.get() or os.path.dirname(self.var_input.get() or "")
+
+    def _remember_project(self, path: str) -> None:
+        """開いた（作った）作業ファイルを覚える。次に開くときの初期位置。"""
+        if not path:
+            return
+        self.cfg[self.LAST_PROJECT_KEY] = str(path)
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+
     def _open_saved_project(self) -> None:
         """既存の <音声名>.speakers.json を開いて割当作業を再開する。"""
-        initial = self.var_output.get() or os.path.dirname(self.var_input.get() or "")
         path = filedialog.askopenfilename(
             title="割当作業ファイルを選択",
-            initialdir=initial or None,
+            initialdir=self._last_project_dir() or None,
             filetypes=[("割当作業ファイル", "*.speakers.json"), ("JSON", "*.json"), ("すべて", "*.*")],
         )
         if not path:
@@ -666,6 +701,7 @@ class App(tk.Tk):
             return
         if not self._warn_if_audio_changed(proj):
             return
+        self._remember_project(path)
         self._open_assign(proj)
 
     def _warn_if_audio_changed(self, proj: Project) -> bool:
@@ -691,6 +727,9 @@ class App(tk.Tk):
         )
 
     def _open_assign(self, proj: Project) -> None:
+        # **転写で作ったものも覚える。**次に[保存済みの作業を開く]を押した
+        # ときに、いま作った場所が開く。
+        self._remember_project(str(proj.json_path or ""))
         try:
             self._assign_win = open_assign_window(self, proj)
         except Exception:
