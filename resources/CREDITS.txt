@@ -33,6 +33,16 @@ whosaid-editor — 同梱している第三者の部品と、その利用条件
   google-genai          Apache License 2.0    Google LLC
 
 
+■ GPU 用の部品（CTranslate2 に同梱されているもの）
+
+  cuDNN ランタイム      NVIDIA Proprietary    NVIDIA Corporation
+    cudnn64_9.dll（呼び出し口だけの 0.3MB。演算本体は含みません）。
+    CTranslate2 の配布物に元から入っており、外すと GPU で動きません。
+    NVIDIA の再頒布条件に従って同梱しています。本ソフトウェア本体の
+    MIT ライセンスは、この部品には及びません。
+    条件: https://docs.nvidia.com/deeplearning/cudnn/sla/
+
+
 ■ 音声の変換・再生
 
   FFmpeg / ffplay       LGPL v2.1 以降        FFmpeg 開発者

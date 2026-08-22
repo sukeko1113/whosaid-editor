@@ -3754,6 +3754,26 @@ def test_cuda_is_not_bundled():
     assert "nvidia-" not in req, "requirements に nvidia が入っている"
 
 
+def test_every_bundled_nvidia_dll_is_named_in_credits():
+    """**同梱物と CREDITS を突き合わせる。**
+
+    build.spec に書いていなくても、PyInstaller は依存パッケージの中身を
+    そのまま拾う。実際 CTranslate2 の配布物に cudnn64_9.dll が入っていて、
+    CREDITS が「NVIDIA の部品は同梱していない」と読める状態のまま
+    配布物に混ざっていた（2026-08-22 に発覚）。**書いてあることと
+    実物が違う**のは、この製品でいちばん避けたい種類の欠陥。
+    """
+    import ctranslate2
+    pkg = Path(ctranslate2.__file__).parent
+    credits = (Path(__file__).resolve().parent.parent
+               / "resources" / "CREDITS.txt").read_text(encoding="utf-8")
+    found = [f.name for f in pkg.glob("*.dll")
+             if f.name.lower().startswith(("cudnn", "cublas", "cuda", "nvrtc"))]
+    assert found, "NVIDIA の dll が 1 つも無い（配布物が変わった可能性）"
+    for dll in found:
+        assert dll in credits, f"{dll} を同梱しているのに CREDITS に無い"
+
+
 def test_bundled_ffmpeg_is_lgpl():
     """**同梱する ffmpeg は LGPL 版でなければならない。**
 
