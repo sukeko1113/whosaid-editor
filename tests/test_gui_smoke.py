@@ -16,6 +16,51 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# ======================================================================
+# **利用者の設定に触れないようにする（src を読み込む前に）。**
+#
+# 差し替えの戻し忘れが 1 箇所あっただけで、実際に利用者の config.json が
+# 上書きされ、API キーと名簿が消えた（2026-08-22）。個々の差し替えに頼らず、
+# 設定の置き場そのものをテスト用に振り替える。`config_dir()` は毎回
+# 環境変数を読むので、ここで変えれば全部の経路に効く。
+# ======================================================================
+import os                                                   # noqa: E402
+
+REAL_APPDATA = os.environ.get("APPDATA", "")
+_SANDBOX = tempfile.mkdtemp(prefix="whosaid-test-appdata-")
+os.environ["APPDATA"] = _SANDBOX
+os.environ["XDG_CONFIG_HOME"] = _SANDBOX        # Linux/CI 側も同じく
+
+
+def real_config_path() -> Path | None:
+    """本物の config.json（触っていないことを確かめるために使う）。"""
+    if not REAL_APPDATA:
+        return None
+    return Path(REAL_APPDATA) / "WhosaidEditor" / "config.json"
+
+
+_REAL_CONFIG_STAMP = (real_config_path().stat().st_mtime
+                      if real_config_path() and real_config_path().exists()
+                      else None)
+
+
+def run_user_config_untouched() -> int:
+    """**本物の設定を書き換えていないこと。**
+
+    実害が出た欠陥なので、毎回確かめる。ここが落ちたら、どこかの
+    差し替えが漏れている。
+    """
+    print("\n[利用者の設定]")
+    p = real_config_path()
+    if p is None or _REAL_CONFIG_STAMP is None:
+        print("  ok   本物の設定が無いので確かめようがない（素通り）")
+        return 0
+    now = p.stat().st_mtime if p.exists() else None
+    ok = now == _REAL_CONFIG_STAMP
+    print(f"  {'ok  ' if ok else 'FAIL'} 本物の config.json を書き換えていない")
+    return 0 if ok else 1
+
+
 # Windows の既定コンソールは cp932 / cp1252 なので、日本語のラベルを print した
 # 時点で UnicodeEncodeError になる(テストの中身とは無関係に落ちる)。
 # 出力先のエンコーディングをここで固定しておく。
@@ -2337,7 +2382,10 @@ def run_main_window() -> int:
                 app.var_output.set(_d)
                 check("消えていたら出力フォルダに戻る",
                       app._last_project_dir() == _d)
-            main_gui.save_config = real_save
+            # **本物には戻さない。**ここで real_save に戻したせいで、
+            # 続きの操作が利用者の config.json を書いた（2026-08-22）。
+            # 戻すのは、この関数の最後の一箇所だけ。
+            main_gui.save_config = lambda d: saved.update(d)
 
             # 名前が実態と合っているか（作業ファイルもここに置かれる）
             check("フォルダの名前が「出力」だけになっていない",
@@ -2407,7 +2455,7 @@ def run_main_window() -> int:
             finally:
                 main_gui.align.suggest_gpu_model = _real_sug
                 _af.fetch = _real_fetch
-                main_gui.save_config = real_save
+                main_gui.save_config = lambda d: saved.update(d)
                 app._model_by_engine[main_gui.ENGINE_LOCAL] = "small"
                 app.var_model.set("small")
 
@@ -2474,4 +2522,5 @@ if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
     rc_main = run_main_window()
-    sys.exit(rc_assign or rc_main)
+    rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
+    sys.exit(rc_assign or rc_main or rc_cfg)
