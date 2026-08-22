@@ -3943,6 +3943,72 @@ def test_cpu_fallback_says_the_model_changed():
     assert "誤字" in src, "品質が落ちることを伝えていない"
 
 
+def test_diarize_runs_in_a_child_process():
+    """**話者分離は子プロセスで回す。**
+
+    sherpa-onnx は計算中に GIL を握るので、同じプロセスで回すと画面が
+    まったく描けない。実測(2026-08-22・音声 7 分):
+
+        同居       主スレッドが動けた割合 15% / 最長の空白 17.9 秒
+        子プロセス 同 98% / 最長の空白 23 ミリ秒
+
+    67 分では空白が 3 分以上になり、Windows が「応答なし」を付ける。
+    利用者には落ちたようにしか見えない(実機で報告を受けた)。
+    """
+    argv = diarize._child_argv(Path("a.wav"), Path("o.json"), 9, None)
+    assert "--diarize" in argv and "a.wav" in argv and "o.json" in argv
+    assert "--speakers" in argv and "9" in argv
+    assert "--model-dir" not in argv, "指定していないのに渡している"
+    with_dir = diarize._child_argv(Path("a.wav"), Path("o.json"), 6, "C:/m")
+    assert "--model-dir" in with_dir and "C:/m" in with_dir
+
+
+def test_child_entry_is_checked_before_the_window():
+    """**画面を作る前に見る。**あとに置くと、子プロセスまで窓を出す。"""
+    import inspect
+    from src import main as main_mod
+    src = inspect.getsource(main_mod.main)
+    assert src.index("--diarize") < src.index("from src.gui import App")
+
+
+def test_progress_file_is_read_loosely():
+    """進捗が読めなくても止めない(書きかけの瞬間に当たることがある)。"""
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "x.progress"
+        assert diarize._read_progress(p) is None        # まだ無い
+        p.write_text("", encoding="utf-8")
+        assert diarize._read_progress(p) is None        # 書きかけ
+        p.write_text("12.5 420.0", encoding="utf-8")
+        assert diarize._read_progress(p) == (12.5, 420.0)
+
+
+def test_child_failure_leaves_a_message():
+    """子が失敗したら理由をファイルに残す。**標準出力は使えない。**
+
+    画面付きで固めた実行ファイルでは `sys.stdout` が None になり、
+    書いた時点で落ちる。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d) / "turns.json"
+        rc = diarize.child_main([str(Path(d) / "無い.wav"), str(out),
+                                 "--speakers", "4"])
+        assert rc != 0, "失敗したのに 0 を返している"
+        assert not out.exists(), "失敗したのに結果を書いている"
+        assert out.with_suffix(".err").exists(), "理由が残っていない"
+        assert out.with_suffix(".err").read_text(encoding="utf-8").strip()
+
+
+def test_inproc_escape_hatch_exists():
+    """子プロセスで動かせない環境のために、同居で走らせる道を残す。
+
+    **機能ごと失うよりは、固まっても動くほうがまし。**
+    """
+    import inspect
+    src = inspect.getsource(diarize._run)
+    assert "WHOSAID_DIARIZE_INPROC" in src
+    assert "_diarize_here" in src
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================

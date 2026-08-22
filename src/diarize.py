@@ -249,6 +249,32 @@ def diarize(
                        f"({len(cached)} 区間)。")
             return cached
 
+    got = _run(audio_path, num_speakers=num_speakers, model_dir=model_dir,
+               on_log=on_log, on_progress=on_progress,
+               is_cancelled=is_cancelled)
+    if got is None:
+        return None
+    turns, total = got
+    save_turns(cache, turns, num_speakers=num_speakers,
+               fingerprint=fingerprint, duration=total)
+    return turns
+
+
+def _diarize_here(
+    audio_path: Path,
+    *,
+    num_speakers: int,
+    model_dir: Optional[Path | str] = None,
+    on_log=None,
+    on_progress=None,
+    is_cancelled=None,
+) -> Optional[tuple[list[SpeakerTurn], float]]:
+    """**この場で**話者分離を回す(キャッシュには触らない)。
+
+    子プロセス側からも呼ぶ。計算中は sherpa-onnx が GIL を握るので、
+    親の画面から直接呼ぶと固まる(実測: 7 分の音声で 17 秒間まったく
+    描けない・2026-08-22)。親は `_run` 経由で子プロセスに任せる。
+    """
     ensure_available(model_dir)
     seg_model, emb_model = resolve_models(model_dir)
     import sherpa_onnx as so
@@ -300,6 +326,198 @@ def diarize(
     if on_log:
         found = len({t.speaker for t in turns})
         on_log(f"話者の分離が終わりました({len(turns)} 区間 / {found} 人ぶん)。")
-    save_turns(cache, turns, num_speakers=num_speakers,
-               fingerprint=fingerprint, duration=total)
-    return turns
+    return turns, total
+
+
+# ======================================================================
+# 子プロセスで回す
+#
+# **sherpa-onnx は計算中に GIL を握る。**同じプロセスで回すと、画面を
+# 描く側がまったく動けない。実測(2026-08-22):
+#
+#   音声 1 分 → 処理 7.3 秒 / 最長 2.3 秒まったく描けない
+#   音声 7 分 → 処理 58 秒  / 最長 17.2 秒まったく描けない
+#
+# 空白は音声の長さに比例するので、67 分では 3 分以上になる。Windows は
+# 5 秒で「応答なし」を付けるため、利用者には**落ちたようにしか見えない**
+# (実機で「途中で落ちたようです」と報告を受けた)。進捗表示を足しても
+# 直らない——描く側が動けないため。**別プロセスに出すしかない。**
+#
+# やり取りはファイルで行う。標準出力は使わない——画面付きで固めた
+# 実行ファイルでは `sys.stdout` が None になり、書いた時点で落ちる。
+# ======================================================================
+
+# 子が進捗を書く間隔。細かすぎるとディスクを叩きすぎる。
+_PROGRESS_EVERY = 0.25
+
+
+def _child_argv(audio: Path, out: Path, num_speakers: int,
+                model_dir: Optional[Path | str]) -> list[str]:
+    """子プロセスの起動コマンド。
+
+    固めた実行ファイルなら自分自身を、開発環境なら `python -m src.main` を
+    呼ぶ。**同じソースが動く**ので、親と子で結果がずれることはない。
+    """
+    argv = ([sys.executable] if getattr(sys, "frozen", False)
+            else [sys.executable, "-m", "src.main"])
+    argv += ["--diarize", str(audio), str(out), "--speakers", str(num_speakers)]
+    if model_dir:
+        argv += ["--model-dir", str(model_dir)]
+    return argv
+
+
+def _run_child(
+    audio_path: Path,
+    *,
+    num_speakers: int,
+    model_dir: Optional[Path | str] = None,
+    on_progress=None,
+    is_cancelled=None,
+) -> Optional[tuple[list[SpeakerTurn], float]]:
+    """子プロセスで回す。起動できなければ None(呼び出し側が同居で走らせる)。"""
+    with tempfile.TemporaryDirectory(prefix="whosaid-diarize-") as d:
+        out = Path(d) / "turns.json"
+        prog = out.with_suffix(".progress")
+        err = out.with_suffix(".err")
+        kw: dict[str, Any] = {}
+        if sys.platform == "win32":
+            # 黒い窓を出さない(固めた実行ファイルでも開発環境でも)
+            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            proc = subprocess.Popen(
+                _child_argv(audio_path, out, num_speakers, model_dir),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd=str(Path(__file__).resolve().parent.parent), **kw)
+        except OSError:
+            return None                 # 起動できない = 同居で走らせる
+
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if is_cancelled and is_cancelled():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    return None
+                if on_progress:
+                    got = _read_progress(prog)
+                    if got:
+                        on_progress(*got)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+        if is_cancelled and is_cancelled():
+            return None
+        if proc.returncode != 0 or not out.exists():
+            msg = ""
+            try:
+                msg = err.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if not msg:
+                # **起動しただけで落ちた場合は、同居で走らせ直す。**
+                # 配布の形が噛み合わないときに機能ごと失わないための逃げ道
+                # (固まるが、動きはする)。
+                return None
+            raise DiarizeUnavailable(msg)
+        data = json.loads(out.read_text(encoding="utf-8"))
+        turns = [SpeakerTurn.from_dict(t) for t in data.get("turns", [])]
+        return turns, float(data.get("duration", 0.0))
+
+
+def _read_progress(path: Path) -> Optional[tuple[float, float]]:
+    """子が書いた進捗を読む。読めなければ None(次の周回で読み直す)。"""
+    try:
+        done, total = path.read_text(encoding="utf-8").split()
+        return float(done), float(total)
+    except (OSError, ValueError):
+        return None
+
+
+def _run(
+    audio_path: Path,
+    *,
+    num_speakers: int,
+    model_dir: Optional[Path | str] = None,
+    on_log=None,
+    on_progress=None,
+    is_cancelled=None,
+) -> Optional[tuple[list[SpeakerTurn], float]]:
+    """子プロセスで回す。無理なら同じプロセスで回す。"""
+    if os.environ.get("WHOSAID_DIARIZE_INPROC"):
+        return _diarize_here(audio_path, num_speakers=num_speakers,
+                             model_dir=model_dir, on_log=on_log,
+                             on_progress=on_progress,
+                             is_cancelled=is_cancelled)
+    got = _run_child(audio_path, num_speakers=num_speakers,
+                     model_dir=model_dir, on_progress=on_progress,
+                     is_cancelled=is_cancelled)
+    if got is not None:
+        if on_log:
+            found = len({t.speaker for t in got[0]})
+            on_log(f"話者の分離が終わりました"
+                   f"({len(got[0])} 区間 / {found} 人ぶん)。")
+        return got
+    if is_cancelled and is_cancelled():
+        return None
+    if on_log:
+        on_log("  ※ 別プロセスで動かせなかったので、この画面で処理します"
+               "(終わるまで画面が止まって見えます)。")
+    return _diarize_here(audio_path, num_speakers=num_speakers,
+                         model_dir=model_dir, on_log=on_log,
+                         on_progress=on_progress, is_cancelled=is_cancelled)
+
+
+def child_main(argv: list[str]) -> int:
+    """子プロセスの入口。`main.py` が `--diarize` を見つけたら呼ぶ。
+
+    **画面は作らない。**結果はファイルに書く(標準出力は使えない)。
+    """
+    import argparse
+    ap = argparse.ArgumentParser(prog="--diarize", add_help=False)
+    ap.add_argument("audio")
+    ap.add_argument("out")
+    ap.add_argument("--speakers", type=int, default=DEFAULT_NUM_SPEAKERS)
+    ap.add_argument("--model-dir", default=None)
+    args = ap.parse_args(argv)
+
+    out = Path(args.out)
+    prog = out.with_suffix(".progress")
+    last = [0.0]
+
+    def on_progress(done: float, total: float) -> None:
+        import time
+        now = time.monotonic()
+        if now - last[0] < _PROGRESS_EVERY:
+            return
+        last[0] = now
+        try:
+            prog.write_text(f"{done} {total}", encoding="utf-8")
+        except OSError:
+            pass                # 進捗が書けなくても分離は続ける
+
+    try:
+        got = _diarize_here(Path(args.audio), num_speakers=args.speakers,
+                            model_dir=args.model_dir, on_progress=on_progress)
+        if got is None:
+            return 1
+        turns, total = got
+        out.write_text(json.dumps({
+            "diarize_ver": DIARIZE_VER,
+            "duration": total,
+            "turns": [t.to_dict() for t in turns],
+        }, ensure_ascii=False), encoding="utf-8")
+        return 0
+    except Exception as e:
+        try:
+            out.with_suffix(".err").write_text(str(e), encoding="utf-8")
+        except OSError:
+            pass
+        return 1

@@ -19,6 +19,7 @@ import difflib
 import json
 import re
 import subprocess
+import os
 import sys
 import tempfile
 import time
@@ -33,6 +34,7 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.audio import audio_fingerprint  # noqa: E402
 from src.align import (  # noqa: E402
+    find_bundled_model,
     ALIGN_VER,
     DEFAULT_MODEL,
     AlignUnavailable,
@@ -125,7 +127,18 @@ def run() -> int:
           hf is not None and hf.parent.name == "align"
           and "/" not in hf.name and "\\" not in hf.name)
 
-    check("モデル名はそのまま渡す", resolve_model("small") == "small")
+    # **同梱していればそちらを使う。**名前を渡すと faster-whisper が
+    # Hugging Face を見に行き、通信を遮断した環境で止まる(設計書 §9)。
+    # 同梱を始めた 2026-08-22 に「名前をそのまま返す」ではなくなった。
+    bundled = find_bundled_model("small")
+    if bundled is not None:
+        check("同梱していれば、その置き場を渡す",
+              resolve_model("small") == str(bundled))
+    else:
+        check("同梱が無ければモデル名をそのまま渡す",
+              resolve_model("small") == "small")
+    check("同梱していないモデルは名前のまま",
+          resolve_model("no-such-model-xyz") == "no-such-model-xyz")
     try:
         resolve_model("small", model_dir="C:/no/such/folder")
         check("無いフォルダを指すと知らせる", False)
@@ -271,8 +284,14 @@ def run() -> int:
             # 設計の要（§5.3）: 本文と単語時刻が同じ 1 回の転写から取れる。
             # ここが崩れると words キャッシュを兼ねる前提が成り立たない。
             check("単語時刻も同時に取れる", bool(result.words))
-            check("単語時刻が align.py の実測と一致する",
-                  flatten(result.words) == flatten(words))
+            # **align.py と一致する必要はない。**local_asr は句読点のための
+            # 例文(initial_prompt)を渡すが align.py は渡さないので、転写が
+            # 変わる。§5.3 が言うのは「本文と単語時刻が**同じ 1 回の転写**
+            # から取れる」こと——つまり本文と単語が食い違わないこと。
+            joined = _STRIP.sub("", flatten(result.words))
+            check("単語をつなぐと本文になる(同じ 1 回の転写から取れている)",
+                  bool(joined) and difflib.SequenceMatcher(
+                      None, joined, body, autojunk=False).ratio() > 0.9)
 
         # --------------------------------------------------------------
         # 話者分離(diarize.py)。合成音声は 1 人が読み上げているだけなので、
@@ -325,5 +344,92 @@ def run() -> int:
     return 1 if failures else 0
 
 
+def run_diarize_child() -> int:
+    """**話者分離の間、画面が動けているか。**
+
+    sherpa-onnx は計算中に GIL を握る。同じプロセスで回すと、画面を描く側が
+    まったく動けない。実機で「途中で落ちたようです」と報告を受けた
+    （67 分の音声で 11 分間「応答なし」・2026-08-22）。
+
+    子プロセスへ出して直したが、**直ったことを数字で見張らないと元に戻る。**
+    主スレッドが 20ms ごとに回れるかを数える（Tk のイベントループと同じ役）。
+    """
+    import threading
+    import time
+
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'NG  '} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[話者分離の間、画面が動けるか]")
+    try:
+        diarize.ensure_available()
+    except diarize.DiarizeUnavailable as e:
+        print(f"  -- 話者分離の部品が無いので飛ばします: {e}")
+        return 0
+
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        wav = tmp / "sample.wav"
+        if not synth_wav(wav, KNOWN_TEXT):
+            print("  -- 音声を合成できないので飛ばします。")
+            return 0
+
+        def measure(inproc: bool):
+            """(区間, 主スレッドが回れた割合, 最長の空白ミリ秒)"""
+            if inproc:
+                os.environ["WHOSAID_DIARIZE_INPROC"] = "1"
+            else:
+                os.environ.pop("WHOSAID_DIARIZE_INPROC", None)
+            ticks: list[float] = []
+            stop = threading.Event()
+            got: dict = {}
+
+            def work() -> None:
+                try:
+                    got["turns"] = diarize.diarize(wav, num_speakers=2)
+                except Exception as e:                  # noqa: BLE001
+                    got["err"] = e
+                stop.set()
+
+            t0 = time.perf_counter()
+            th = threading.Thread(target=work, daemon=True)
+            th.start()
+            while not stop.is_set():
+                ticks.append(time.perf_counter() - t0)
+                time.sleep(0.02)
+            th.join()
+            el = time.perf_counter() - t0
+            gaps = sorted(b - a for a, b in zip(ticks, ticks[1:]))
+            ratio = len(ticks) / max(1, int(el / 0.02))
+            return got.get("turns"), ratio, (gaps[-1] * 1000 if gaps else 0.0)
+
+        turns_c, ratio_c, gap_c = measure(inproc=False)
+        turns_i, ratio_i, gap_i = measure(inproc=True)
+        print(f"  子プロセス: 主スレッド {ratio_c * 100:.0f}% / "
+              f"最長の空白 {gap_c:.0f} ms")
+        print(f"  同居      : 主スレッド {ratio_i * 100:.0f}% / "
+              f"最長の空白 {gap_i:.0f} ms")
+
+        check("子プロセスなら主スレッドが 8 割以上動ける", ratio_c >= 0.8)
+        # 5 秒で Windows が「応答なし」を付ける。合成音声は数秒しかないので
+        # 空白も小さいが、**同居との差が出ていること**が要点。
+        check("子プロセスなら 1 秒以上止まらない", gap_c < 1000)
+        check("同居より明らかに良い", ratio_c > ratio_i)
+        check("結果は同じ",
+              turns_c is not None and turns_i is not None
+              and [t.to_dict() for t in turns_c] == [t.to_dict()
+                                                     for t in turns_i])
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
+    rc_align = run()
+    rc_child = run_diarize_child()
+    sys.exit(rc_align or rc_child)
