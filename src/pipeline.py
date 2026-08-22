@@ -137,9 +137,15 @@ class EngineSpec:
             # ついていた。**この製品は検証済みの記録を作るものなので、
             # ここが実態と違うのは根幹に関わる。
             rec["model"] = getattr(actual, "model", rec.get("model"))
-            rec["device"] = getattr(actual, "device", rec.get("device"))
             rec["compute_type"] = getattr(actual, "compute_type",
                                           rec.get("compute_type"))
+            if getattr(actual, "loaded", True):
+                rec["device"] = getattr(actual, "device", rec.get("device"))
+            else:
+                # **一度もモデルを読んでいない。**全区間がキャッシュから
+                # 来たので、どの装置で走ったかは今回分からない。見込みを
+                # そのまま「cuda で走った」と書くと嘘になる。
+                rec["device"] = "(未実行・キャッシュから読んだ)"
             asked = self.resolved_model()
             if rec["model"] != asked:
                 # **落ちたことを残す。**あとから「なぜ small なのか」が

@@ -344,6 +344,17 @@ class LocalTranscriber:
                 f"--- 詳細 ---\n{e}"
             ) from e
 
+    @property
+    def loaded(self) -> bool:
+        """**本当にモデルを読んだか。**
+
+        キャッシュが全区間当たると `_load` は一度も走らない。そのとき
+        `self.device` は「使えそうか」の見込みのままなので、これを見て
+        記録に書き分ける（本文はキャッシュの鍵が持っているモデルと精度で
+        作られたものなので、そちらは名乗ってよい）。
+        """
+        return self._whisper is not None
+
     def _load(self, on_log=None):
         """初回の転写のときにモデルを読む(生成そのものは軽くしておく)。"""
         if self._whisper is not None:

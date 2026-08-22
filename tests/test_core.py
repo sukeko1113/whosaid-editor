@@ -3846,6 +3846,7 @@ class _Ran:
 
     def __init__(self, model, device, compute_type):
         self.model, self.device, self.compute_type = model, device, compute_type
+        self.loaded = True
 
 
 def test_engine_records_what_actually_ran():
@@ -3866,6 +3867,24 @@ def test_engine_records_what_actually_ran():
     # **落ちたことも残す。**あとから「なぜ small なのか」が分かるように
     assert rec["requested_model"] == "large-v3"
     assert "fell_back" in rec
+
+
+def test_engine_does_not_claim_a_device_it_never_used():
+    """**キャッシュが全部当たった実行で、装置を名乗らない。**
+
+    `_load` が一度も走らないと `device` は「使えそうか」の見込みのまま。
+    それを「cuda で走った」と書くのは、直したはずの嘘の別経路。
+    本文の素性（モデル・精度）はキャッシュの鍵が持っているので名乗ってよい。
+    """
+    from src.pipeline import EngineSpec, ENGINE_LOCAL
+    spec = EngineSpec(mode=ENGINE_LOCAL, model="large-v3")
+    ran = _Ran("large-v3", "cuda", "int8_float16")
+    ran.loaded = False
+    rec = spec.record(ran)
+    assert rec["model"] == "large-v3", "本文の素性は鍵から分かる"
+    assert rec["compute_type"] == "int8_float16"
+    assert "cuda" not in rec["device"], "使っていない装置を名乗っている"
+    assert "キャッシュ" in rec["device"]
 
 
 def test_engine_record_stays_quiet_when_nothing_changed():
