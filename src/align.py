@@ -103,6 +103,25 @@ def add_cuda_dll_path() -> None:
         except OSError:
             pass
 
+    # **フルパスで先に読み込む。**PATH も add_dll_directory も、凍結した
+    # exe では CTranslate2 の DLL 読み込みに効かなかった(実機で
+    # 「cublas64_12.dll is not found」・2026-08-22)。開発環境では動いていた
+    # ——シェルの PATH に入っていたためで、仕組みが効いていたのではない。
+    #
+    # 一度プロセスに読み込ませてしまえば、あとから名前で LoadLibrary された
+    # ときに既読のものが使われる。**依存の順に読む**(cublas は cublasLt を
+    # 必要とする)。
+    import ctypes
+    for name in ("cublasLt64_12.dll", "cublas64_12.dll"):
+        for d in dirs:
+            f = d / name
+            if f.is_file():
+                try:
+                    ctypes.WinDLL(str(f))
+                except OSError:
+                    pass        # 読めなくても止めない(CPU に落ちるだけ)
+                break
+
 
 def cuda_available() -> bool:
     """GPU で回せそうか。**これは目安であって保証ではない。**

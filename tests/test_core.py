@@ -3795,6 +3795,32 @@ def test_bundled_ffplay_is_present():
         "README のビルド手順を参照してください")
 
 
+def test_cuda_dlls_are_loaded_by_full_path():
+    """**フルパスで先に読み込む。**PATH も add_dll_directory も凍結した exe
+    では効かなかった（実機で「cublas64_12.dll is not found」・2026-08-22）。
+
+    開発環境では動いていたが、それは**シェルの PATH に入っていたため**で、
+    仕組みが効いていたのではない。手元で試すだけでは気づけない種類。
+
+    一度プロセスに読み込ませれば、あとから名前で LoadLibrary されたときに
+    既読のものが使われる。
+    """
+    import inspect
+    import re
+    from src import align
+    src = inspect.getsource(align.add_cuda_dll_path)
+    assert "ctypes" in src and "WinDLL" in src, (
+        "フルパスでの読み込みが無い。PATH だけでは凍結した exe で落ちる")
+    # **依存の順**（cublas は cublasLt を必要とする）。docstring にも
+    # 名前が出るので、位置の比較ではなく**読み込む並びそのもの**を見る。
+    order = re.search(r'for name in \(([^)]*)\)', src)
+    assert order, "読み込む並びが見つからない"
+    names = re.findall(r'"([^"]+)"', order.group(1))
+    assert names == ["cublasLt64_12.dll", "cublas64_12.dll"], names
+    # 読めなくても止めない（CPU に落ちるだけ）
+    assert "except OSError" in src
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
