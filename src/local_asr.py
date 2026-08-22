@@ -39,6 +39,7 @@ from .align import (
     resolve_model,
 )
 from .config import config_dir
+from .cuda_fetch import cuda_dir
 from .segments import PSEUDO_UNKNOWN, Utterance
 
 
@@ -368,6 +369,18 @@ class LocalTranscriber:
         if on_log:
             on_log(f"ローカル転写の準備をしています"
                    f"(モデル {self.model} / {where})。")
+            # **成功したときも、何をどこから読んだかを残す。**失敗のときだけ
+            # 出す作りにしていたら、「同じ実行ファイルなのに前は落ちた」が
+            # 起きたときに手掛かりが何も無かった(2026-08-22)。1 行で済む。
+            if self.device == "cuda":
+                rep = add_cuda_dll_path()
+                ok = sum(1 for r in rep if r.startswith("読み込み成功"))
+                on_log(f"  GPU の部品: {ok}/{len(rep)} 読み込み済み"
+                       f"({cuda_dir()})")
+                for r in rep:
+                    if not r.startswith("読み込み成功"):
+                        on_log(f"    {r}")
+            on_log(f"  モデルの場所: {self.target}")
 
         def build(device: str, ctype: str):
             m = WhisperModel(self.target, device=device, compute_type=ctype)
