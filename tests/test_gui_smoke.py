@@ -2064,6 +2064,83 @@ def run() -> int:
 # 利用者の config.json を書き換えないようにする。
 # ======================================================================
 
+def run_multi_select() -> int:
+    """**複数選択で話者をまとめて指定できるか。**
+
+    Shift で並び、Ctrl で飛び飛びに選び、一度に変える（実機の要望・
+    2026-08-23）。**選んだ全部が △ になること**が要点——Shift+クリックで
+    20 区間を一度に選べる操作で ✓ を立てると、「✓＝人が耳で聴いて確定」
+    が崩れる（CLAUDE.md）。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[複数選択で話者を一括指定]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            proj = make_project(tmp)
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+
+            check("一覧が複数選択できる",
+                  str(win.tree.cget("selectmode")) == "extended")
+
+            sid = proj.speakers[0].id
+            iids = [f"s{i}" for i in (0, 2, 3)]
+            win.tree.selection_set(iids)
+            win.tree.focus(iids[0])
+            win.update()
+            check("選んだ数を取り出せる",
+                  win.selected_indices() == [0, 2, 3])
+
+            win.assign(sid)
+            win.update()
+            got = [proj.segments[i] for i in (0, 2, 3)]
+            check("選んだ全部に話者が入る",
+                  all(s.speaker_id == sid for s in got))
+            check("選ばなかった区間は変わらない",
+                  not proj.segments[1].speaker_id)
+            # **ここが要点**
+            check("選んだ全部が △（未確認）になる",
+                  all(s.reviewed is False for s in got))
+
+            check("編集履歴は 1 件の判断として残る",
+                  proj.edit_log[-1]["op"] == "assign_bulk"
+                  and proj.edit_log[-1]["count"] == 3)
+
+            check("適用しても選択が外れない",
+                  set(win.tree.selection()) == set(iids))
+
+            win.undo()
+            win.update()
+            check("Ctrl+Z で 3 件まとめて戻る",
+                  all(not proj.segments[i].speaker_id for i in (0, 2, 3)))
+
+            # 1 つだけ選んだときは、これまでどおり ✓
+            win.tree.selection_set("s1")
+            win.tree.focus("s1")
+            win.update()
+            win.assign(sid)
+            check("1 つだけ選べば ✓ のまま",
+                  proj.segments[1].reviewed is True)
+
+            win.destroy()
+    finally:
+        root.destroy()
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 def run_main_window() -> int:
     failures: list[str] = []
 
@@ -2633,6 +2710,7 @@ def run_main_window() -> int:
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
+    rc_multi = run_multi_select()
     rc_main = run_main_window()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
-    sys.exit(rc_assign or rc_main or rc_cfg)
+    sys.exit(rc_assign or rc_multi or rc_main or rc_cfg)

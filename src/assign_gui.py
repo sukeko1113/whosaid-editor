@@ -772,7 +772,11 @@ class AssignWindow(tk.Toplevel):
                    command=self.jump_to_time).pack(side="left")
 
         cols = ("time", "cluster", "speaker", "text")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse")
+        # **複数選べるようにする。**Shift で並び、Ctrl で飛び飛び。同じ人が
+        # 続けて話す帯をまとめて指定できないと、区間ごとに同じ操作を
+        # 繰り返すことになる(実機の要望・2026-08-23)。
+        self.tree = ttk.Treeview(left, columns=cols, show="headings",
+                                 selectmode="extended")
         self.tree.heading("time", text="時刻")
         self.tree.heading("cluster", text="声")
         self.tree.heading("speaker", text="話者")
@@ -1514,12 +1518,31 @@ class AssignWindow(tk.Toplevel):
             if scroll:
                 self.tree.see(iid)
 
+    def selected_indices(self) -> list[int]:
+        """いま選ばれている区間の番号（画面の並び順）。
+
+        複数選択に対応したので、割当は**選ばれている全部**に効く。
+        1 つだけ選んでいるときは、これまでどおり 1 件だけ。
+        """
+        out: list[int] = []
+        for iid in self.tree.selection():
+            try:
+                i = int(iid[1:])
+            except ValueError:
+                continue
+            if 0 <= i < len(self.proj.segments):
+                out.append(i)
+        return sorted(out)
+
     def _on_tree_select(self, event=None) -> None:
         sel = self.tree.selection()
         if not sel:
             return
+        # **右ペインに出すのは「いま focus のある行」。**複数選んでいる
+        # ときに先頭へ飛ぶと、聴きながら選べない。
+        focused = self.tree.focus() or sel[0]
         try:
-            index = int(sel[0][1:])
+            index = int(focused[1:])
         except ValueError:
             return
         if index == self.current:
@@ -2449,6 +2472,14 @@ class AssignWindow(tk.Toplevel):
         self._commit_text()
         seg = self.proj.segments[self.current]
 
+        # **複数選んでいるなら、そちらを優先する。**明示的に選んだ範囲より
+        # 「同じまとまり全体」が勝つと、意図しない区間まで変わる。
+        picked = self.selected_indices()
+        if len(picked) > 1:
+            targets = [self.proj.segments[i] for i in picked]
+            self._assign_many(targets, speaker_id)
+            return
+
         bulk = self.var_apply_cluster.get() and speaker_id is not None
         if bulk and seg.is_pseudo_cluster:
             messagebox.showwarning(
@@ -2493,6 +2524,46 @@ class AssignWindow(tk.Toplevel):
             self._set_action(f"[{fmt_hms(seg.start)}] を「{name}」に確定しました。")
 
         self._after_change()
+
+    def _assign_many(self, targets, speaker_id: Optional[str]) -> None:
+        """選んだ複数の区間に、まとめて話者を当てる。
+
+        **全部 △（一括適用で埋めただけ）になる。**Shift+クリックで 20 区間を
+        一度に選べる操作は、聴かずに選ぶことを容易にする。ここで ✓ を立てると
+        「✓＝人が耳で聴いて確定」が崩れる（CLAUDE.md）。聴いて確定したい
+        区間は、1 つずつ選べばこれまでどおり ✓ になる。
+
+        取り消しは 1 回で全部戻る（Ctrl+Z）。編集履歴にも 1 件の判断として
+        残る——50 区間変えても、人がした判断は 1 回だから。
+        """
+        snapshot = [(s.index, s.speaker_id, s.reviewed) for s in targets]
+        self._undo.append(snapshot)
+        del self._undo[:-200]
+
+        # heard_index を渡さない = 全部 △。**ここが要点。**
+        self.proj.apply_speaker_to([s.index for s in targets], speaker_id)
+        self._dirty = True
+
+        self.suggester.refresh()
+        for s in targets:
+            self._update_row(s.index)
+        self.update_status()
+        self._draw_timeline()
+        # **選択は保ったまま右ペインを描き直す。**goto() を使うと選択が
+        # 1 件に戻ってしまい、続けて別の人へ変えられない。
+        self.show_current()
+
+        if speaker_id:
+            name = self.proj.speaker_name(speaker_id) or "未確定"
+            note = ("すべて未確認（△）です。聴いて確かめた区間は、"
+                    "1 つずつ選んで確定してください")
+            self._set_action(
+                f"選んだ {len(targets)} 区間を「{name}」にしました"
+                f"（{note}）。取り消しは Ctrl+Z。")
+        else:
+            self._set_action(
+                f"選んだ {len(targets)} 区間を未確定に戻しました。"
+                "取り消しは Ctrl+Z。")
 
     def unassign(self) -> None:
         """未確定に戻す。一括適用を間違えたときの復旧に使う。"""
