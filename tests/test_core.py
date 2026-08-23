@@ -8,6 +8,7 @@ GUI・Gemini API・ffmpeg には依存しない。
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tempfile
@@ -4069,6 +4070,122 @@ def test_removing_an_added_utterance_stays_the_same():
     rec = proj.edit_log[-1]
     assert rec["op"] == "remove_added_utterance"
     assert "text" not in rec, "取り消しなのに中身まで残している"
+
+
+def test_uploaded_audio_is_deleted_even_on_failure():
+    """**失敗しても、クラウドへ上げた音声を必ず消す。**
+
+    正常終了のときだけ消していたので、途中でエラーになると Gemini 側に
+    残っていた（48 時間後に自動削除されるが、録音は機微情報なので待たない）。
+    公開前チェック v01 の指摘（2026-08-23 に対応）。
+    """
+    import inspect
+    from src import transcribe
+    src = inspect.getsource(transcribe)
+    i = src.index("files.delete")
+    head = src[max(0, i - 600):i]
+    assert "finally:" in head, "finally の中で消していない"
+    assert "uploaded = None" in src, "上げる前に初期化していない"
+
+
+def test_installer_names_a_real_publisher():
+    """**インストーラの発行者を空欄のままにしない。**
+
+    LICENSE は実名に直したのに installer.iss は「Your Name」のままで、
+    インストール画面にそう表示される状態だった（2026-08-23 に対応）。
+    """
+    iss = (Path(__file__).resolve().parent.parent
+           / "installer.iss").read_text(encoding="utf-8")
+    assert "Your Name" not in iss, "発行者が差し込み文字のまま"
+    m = re.search(r'#define\s+MyAppPublisher\s+"([^"]+)"', iss)
+    assert m and m.group(1).strip(), "発行者が空"
+
+
+def test_api_key_is_not_stored_in_the_clear():
+    """**API キーを平文で置かない。**
+
+    設定ファイルは %APPDATA% にあり、そのままだと中を開けば読める。
+    Windows の DPAPI で包み、そのパソコンのその利用者でしか復号できない
+    形にする（公開前チェック v01 の指摘・2026-08-23 に対応）。
+    """
+    from src import config as cfg
+    key = "AIzaSyTESTKEY-1234567890abcdefghij"
+    with tempfile.TemporaryDirectory() as d:
+        real = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = d
+        try:
+            cfg.save_config({"api_key": key, "roster": "佐藤"})
+            raw = cfg.config_path().read_text(encoding="utf-8")
+            if sys.platform == "win32":
+                assert key not in raw, "設定ファイルに平文で書かれている"
+                assert cfg._ENC_PREFIX in raw, "包んだ印が無い"
+            # 包んでも、読み直せば元に戻る
+            assert cfg.load_config().get("api_key") == key
+            # 秘密でない項目は包まない（読めなくなると困る）
+            assert "佐藤" in raw
+        finally:
+            if real is not None:
+                os.environ["APPDATA"] = real
+
+
+def test_old_plaintext_key_still_loads():
+    """**旧版の平文の設定を読めなくしない。**移行で鍵を失わせない。"""
+    from src import config as cfg
+    key = "AIzaSyOLDPLAINTEXTKEY-0987654321"
+    with tempfile.TemporaryDirectory() as d:
+        real = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = d
+        try:
+            p = cfg.config_path()
+            p.write_text(json.dumps({"api_key": key}), encoding="utf-8")
+            assert cfg.load_config().get("api_key") == key
+        finally:
+            if real is not None:
+                os.environ["APPDATA"] = real
+
+
+def test_secret_round_trip_and_idempotence():
+    """包む・ほどくが往復する。二重に包まない。"""
+    from src.config import protect_secret, unprotect_secret, is_protected
+    v = "sk-test-abcdefghijklmnopqrstuvwxyz"
+    enc = protect_secret(v)
+    assert unprotect_secret(enc) == v
+    assert protect_secret(enc) == enc, "二重に包んでいる"
+    assert unprotect_secret(v) == v, "平文を壊している"
+    if sys.platform == "win32":
+        assert is_protected(enc) and not is_protected(v)
+
+
+def test_public_documents_exist_and_say_the_truth():
+    """**公開に必要な文書を、実態と揃えたまま保つ。**
+
+    無料配布にあたって用意した（2026-08-23）。消したり、実装と食い違ったまま
+    放置したりしないよう、機械に見張らせる。
+    """
+    root = Path(__file__).resolve().parent.parent
+    for name in ("PRIVACY.md", "TERMS_OF_USE.md", "SECURITY.md", "LICENSE"):
+        f = root / name
+        assert f.is_file(), f"{name} が無い"
+        assert f.stat().st_size > 200, f"{name} が中身のない状態"
+
+    lic = (root / "LICENSE").read_text(encoding="utf-8")
+    assert "[Your Name]" not in lic, "著作権表示が差し込み文字のまま"
+
+    # **PRIVACY が「暗号化する」と書くなら、実装がそうなっていること。**
+    priv = (root / "PRIVACY.md").read_text(encoding="utf-8")
+    if "DPAPI" in priv:
+        from src import config as cfg
+        assert hasattr(cfg, "protect_secret"), "書いてあるのに実装が無い"
+        assert "api_key" in cfg.SECRET_KEYS
+
+    # **README が「既定では端末から出ない」と書くなら、既定がローカルであること。**
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert "端末から出ません" in readme
+    from src.segments import ENGINE_LOCAL
+    import inspect
+    from src import gui
+    src = inspect.getsource(gui.App._build_ui)
+    assert "既定はローカル" in src, "README と既定が食い違う"
 
 
 # ======================================================================

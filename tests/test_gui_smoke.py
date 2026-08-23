@@ -2456,6 +2456,49 @@ def run_main_window() -> int:
                 app.var_use_input_dir.set(True)
                 app._on_toggle_use_input_dir()
 
+            # --- API キー: 消せる / 保存しないを選べる -------------------
+            # 保存できるのに消せないのは片手落ちで、共有のパソコンで
+            # 使ったあとに困る（公開前チェック・2026-08-23）。
+            check("鍵を消すボタンがある", hasattr(app, "btn_api_del"))
+            check("保存しないを選べる", hasattr(app, "var_keep_api"))
+
+            _saved_api = {}
+            main_gui.save_config = lambda x: _saved_api.update(x)
+            _real_yes = assign_gui.messagebox.askyesno
+            _real_info = main_gui.messagebox.showinfo
+            main_gui.messagebox.askyesno = lambda *a2, **k2: True
+            main_gui.messagebox.showinfo = lambda *a2, **k2: None
+            try:
+                app.var_keep_api.set(True)
+                app.var_api.set("AIzaSyTEST-0123456789")
+                app._save_api_key()
+                check("保存すると設定に載る", _saved_api.get("api_key"))
+
+                app._delete_api_key()
+                check("消すと設定から落ちる", not app.cfg.get("api_key"))
+                check("消すと入力欄も空になる", app.var_api.get() == "")
+
+                # **保存しない側へ倒したら、その場で消す**
+                app.cfg["api_key"] = "AIzaSyTEST-0123456789"
+                app.var_keep_api.set(False)
+                app._on_keep_api_toggled()
+                check("保存しないに倒すとその場で消える",
+                      not app.cfg.get("api_key"))
+                app.var_keep_api.set(True)
+            finally:
+                main_gui.messagebox.askyesno = _real_yes
+                main_gui.messagebox.showinfo = _real_info
+                main_gui.save_config = lambda d: saved.update(d)
+
+            # **開始の経路からも漏らさない。**設定を扱う場所が複数あるので、
+            # 画面のチェックだけ直しても、こちらから書けば元の木阿弥になる。
+            import inspect as _insp
+            _start = _insp.getsource(main_gui.App._start)
+            check("開始時も「保存しない」を見ている",
+                  "var_keep_api" in _start)
+            check("保存しないときは鍵を書かない",
+                  'self.cfg.pop("api_key", None)' in _start)
+
             # 名前が実態と合っているか（作業ファイルもここに置かれる）
             check("フォルダの名前が「出力」だけになっていない",
                   "作業" in str(app.entry_output.master.cget("text")))

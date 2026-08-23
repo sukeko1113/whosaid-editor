@@ -275,9 +275,32 @@ class App(tk.Tk):
         self.btn_api_show = ttk.Button(frm_adv, text="表示", command=self._toggle_api_visibility)
         self.btn_api_show.grid(row=0, column=2, padx=(0, 4), pady=4)
         self.btn_api_save = ttk.Button(frm_adv, text="保存", command=self._save_api_key)
-        self.btn_api_save.grid(row=0, column=3, padx=(0, 6), pady=4)
+        self.btn_api_save.grid(row=0, column=3, padx=(0, 4), pady=4)
+        # **消す入口を必ず置く。**保存できるのに消せないのは片手落ちで、
+        # 共有のパソコンで使ったあとに困る(公開前チェック・2026-08-23)。
+        self.btn_api_del = ttk.Button(frm_adv, text="消す",
+                                      command=self._delete_api_key)
+        self.btn_api_del.grid(row=0, column=4, padx=(0, 6), pady=4)
 
-        ttk.Label(frm_adv, text="モデル:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        # **保存しない選択肢。**共有のパソコンでは、鍵をファイルに残さない
+        # ほうが安全。起動のたびに入力する形になる。
+        self.var_keep_api = tk.BooleanVar(value=True)
+        self.chk_keep_api = ttk.Checkbutton(
+            frm_adv, variable=self.var_keep_api,
+            text="API キーをこのパソコンに保存する"
+                 "（外すと、起動のたびに入力します）",
+            command=self._on_keep_api_toggled)
+        self.chk_keep_api.grid(row=1, column=1, columnspan=4, sticky="w",
+                               padx=6, pady=(0, 2))
+        self.lbl_api_note = ttk.Label(
+            frm_adv, foreground="#666", wraplength=700, justify="left",
+            text="※ 保存する鍵は Windows の仕組みで暗号化します"
+                 "（このパソコンの、このユーザーでしか読めません）。"
+                 "共有のパソコンでは保存しないことを勧めます。")
+        self.lbl_api_note.grid(row=2, column=1, columnspan=4, sticky="w",
+                               padx=6, pady=(0, 4))
+
+        ttk.Label(frm_adv, text="モデル:").grid(row=3, column=0, sticky="w", padx=6, pady=4)
         # クラウドで選んでいた逐語モードの控え(ローカルの間は外しておく)
         self._verbatim_for_cloud = False
         self.var_model = tk.StringVar(value=DEFAULT_LOCAL_MODEL)
@@ -291,7 +314,7 @@ class App(tk.Tk):
         # 直接置いたら重なった(実機で発生・2026-08-20)。枠にしておけば
         # 他の行の番号を触らずに済み、注記が空のときは高さも取らない。
         model_box = ttk.Frame(frm_adv)
-        model_box.grid(row=1, column=1, columnspan=3, sticky="ew",
+        model_box.grid(row=3, column=1, columnspan=4, sticky="ew",
                        padx=6, pady=4)
         model_box.columnconfigure(0, weight=1)
         self.cmb_model = ttk.Combobox(
@@ -309,15 +332,15 @@ class App(tk.Tk):
         self.cmb_model.bind("<<ComboboxSelected>>",
                             lambda e: self._on_model_chosen())
 
-        ttk.Label(frm_adv, text="チャンク長(分):").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(frm_adv, text="チャンク長(分):").grid(row=4, column=0, sticky="w", padx=6, pady=4)
         # 長いほど声のまとまりが減り、割当の手数も減る。既定を 15 分にしている。
         self.var_chunk = tk.IntVar(value=15)
         self.spin_chunk = ttk.Spinbox(
             frm_adv, from_=1, to=30, textvariable=self.var_chunk, width=6)
-        self.spin_chunk.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        self.spin_chunk.grid(row=4, column=1, sticky="w", padx=6, pady=4)
         self.spin_chunk.bind("<MouseWheel>", self._on_wheel_over_value)
         ttk.Label(frm_adv, text="(長いほど割当の手数が減りますが、転写の失敗率は上がります)",
-                  foreground="#666").grid(row=2, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+                  foreground="#666").grid(row=4, column=2, columnspan=3, sticky="w", padx=6, pady=4)
 
         # タイムスタンプ・チェックボックス
         self.var_timestamps = tk.BooleanVar(value=False)
@@ -451,6 +474,8 @@ class App(tk.Tk):
         self.txt_log.configure(yscrollcommand=sb.set)
 
     def _populate_from_config(self) -> None:
+        if self.KEEP_API_KEY in self.cfg:
+            self.var_keep_api.set(bool(self.cfg.get(self.KEEP_API_KEY)))
         if api := self.cfg.get("api_key"):
             self.var_api.set(api)
         # 経路ごとにモデルを覚える。旧来の "model" はクラウドのモデル。
@@ -573,7 +598,8 @@ class App(tk.Tk):
         self.var_model.set(remembered if remembered in values else values[0])
 
         state = "disabled" if local else "normal"
-        for w in (self.lbl_api, self.entry_api, self.btn_api_show, self.btn_api_save):
+        for w in (self.lbl_api, self.entry_api, self.btn_api_show,
+                  self.btn_api_save, self.btn_api_del, self.chk_keep_api):
             w.configure(state=state)
         self.chk_verbatim.configure(state=state)
         # 話者分離はローカル経路だけの設定(クラウドは Gemini が A/B/C を出す)
@@ -918,14 +944,62 @@ class App(tk.Tk):
         current = self.entry_api.cget("show")
         self.entry_api.configure(show="" if current else "●")
 
+    KEEP_API_KEY = "keep_api_key"
+
     def _save_api_key(self) -> None:
         api = self.var_api.get().strip()
         if not api:
             messagebox.showwarning("API キー", "API キーが空です。")
             return
+        if not self.var_keep_api.get():
+            messagebox.showinfo(
+                "API キー",
+                "「このパソコンに保存する」が外れています。\n"
+                "保存するには、先にチェックを入れてください。")
+            return
         self.cfg["api_key"] = api
         save_config(self.cfg)
-        messagebox.showinfo("API キー", "API キーを保存しました。")
+        messagebox.showinfo(
+            "API キー",
+            "API キーを保存しました。\n"
+            "Windows の仕組みで暗号化してあります"
+            "（このパソコンの、このユーザーでしか読めません）。")
+
+    def _delete_api_key(self) -> None:
+        """**保存した鍵を消す。**保存できるのに消せないのは片手落ち。"""
+        had = bool(self.cfg.get("api_key"))
+        if not had and not self.var_api.get().strip():
+            self._append_log("保存されている API キーはありません。")
+            messagebox.showinfo("API キー", "保存されている API キーはありません。")
+            return
+        if not messagebox.askyesno(
+                "API キーを消す",
+                "このパソコンに保存した API キーを消します。\n"
+                "入力欄も空にします。よろしいですか。"):
+            return
+        self.cfg.pop("api_key", None)
+        try:
+            save_config(self.cfg)
+        except OSError as e:
+            messagebox.showerror("API キー", f"消せませんでした: {e}")
+            return
+        self.var_api.set("")
+        messagebox.showinfo("API キー", "API キーを消しました。")
+
+    def _on_keep_api_toggled(self) -> None:
+        """保存しない側へ倒したら、**その場で消す**（次の起動まで残さない）。"""
+        keep = bool(self.var_keep_api.get())
+        self.cfg[self.KEEP_API_KEY] = keep
+        if not keep and self.cfg.get("api_key"):
+            self.cfg.pop("api_key", None)
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        if not keep:
+            self._append_log(
+                "API キーはこのパソコンに保存しません"
+                "（起動のたびに入力してください）。")
 
     def _show_credits(self) -> None:
         """同梱している部品と、その利用条件を出す。
@@ -1071,8 +1145,16 @@ class App(tk.Tk):
 
         # 経路ごとのモデルを両方覚えておく(切り替えて戻したときのため)
         self._model_by_engine[engine_mode] = self.var_model.get()
+        # **「保存しない」を選んでいたら、開始時にも書かない。**画面の
+        # チェックだけ直しても、ここから漏れれば元の木阿弥になる
+        # (設定を扱う場所が複数あるのは既知の落とし穴)。
+        keep_api = bool(self.var_keep_api.get())
+        if keep_api:
+            self.cfg["api_key"] = api
+        else:
+            self.cfg.pop("api_key", None)
         self.cfg.update({
-            "api_key": api,
+            self.KEEP_API_KEY: keep_api,
             "engine": engine_mode,
             "diarize": bool(self.var_diarize_local.get()),
             "model": self._model_by_engine[ENGINE_CLOUD],

@@ -394,6 +394,7 @@ def transcribe_audio(
             time.sleep(rest)
 
     for attempt in range(max_retries):
+        uploaded = None
         try:
             check_cancel()
             # 再試行時はアップロードからやり直すので、何回目かを添えないと
@@ -435,11 +436,6 @@ def transcribe_audio(
                 log("  ※ 再生成でも暴走が解消しませんでした。このチャンクは要確認です。")
                 text = f"【警告: このチャンクの出力は不安定でした。原音声を確認してください】\n{text}"
 
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
-
             return text
 
         except CancelledError:
@@ -463,6 +459,16 @@ def transcribe_audio(
                 log(f"  通信エラー: {type(e).__name__}: {str(e)[:200]}")
                 log(f"  {wait}秒後に再試行します ({attempt + 2}/{max_retries}回目)...")
                 sleep_cancellable(wait)
+
+        finally:
+            # **失敗しても、上げた音声を必ず消す。**正常終了のときだけ
+            # 消していたので、途中でエラーになると Gemini 側に残っていた
+            # (48 時間後に自動削除されるが、録音は機微情報なので待たない)。
+            if uploaded is not None:
+                try:
+                    client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
 
     assert last_error is not None
     raise last_error

@@ -1,12 +1,13 @@
 """ユーザ設定の保存・読み込み (%APPDATA%\\WhosaidEditor\\config.json)"""
 from __future__ import annotations
 
+import base64
 import json
 import os
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 APP_NAME = "WhosaidEditor"
@@ -89,16 +90,101 @@ def config_path() -> Path:
     return config_dir() / "config.json"
 
 
+# ======================================================================
+# API キーの保存
+#
+# **平文で置かない。**設定ファイルは %APPDATA% にあり、そのままだと
+# 中を開けば読める。Windows の DPAPI で包むと、**そのパソコンの、その
+# 利用者アカウントでしか復号できない**形になる(鍵の管理は OS に任せる)。
+#
+# 完全な防御ではない。同じアカウントで動く別のプログラムからは復号できる。
+# それでも、設定ファイルを取り出して持ち去られたときに読めないことには
+# 意味がある。**共有パソコンでは「保存しない」を選べるようにしてある。**
+# ======================================================================
+
+# 包んだ値の頭に付ける印。これが無ければ平文(旧版の設定)とみなす。
+_ENC_PREFIX = "dpapi:"
+
+
+def _dpapi(data: bytes, unprotect: bool) -> Optional[bytes]:
+    """DPAPI で包む/ほどく。使えない環境では None(呼び出し側が平文に落ちる)。"""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    src = BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data),
+                                      ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    fn = (ctypes.windll.crypt32.CryptUnprotectData if unprotect
+          else ctypes.windll.crypt32.CryptProtectData)
+    args = ([ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)]
+            if not unprotect else
+            [ctypes.byref(src), None, None, None, None, 0, ctypes.byref(out)])
+    try:
+        if not fn(*args):
+            return None
+        got = ctypes.string_at(out.pbData, out.cbData)
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+        return got
+    except Exception:
+        return None
+
+
+def protect_secret(value: str) -> str:
+    """保存する形にする。包めなければ平文のまま返す(保存自体は成立させる)。"""
+    if not value or value.startswith(_ENC_PREFIX):
+        return value
+    got = _dpapi(value.encode("utf-8"), unprotect=False)
+    if got is None:
+        return value
+    return _ENC_PREFIX + base64.b64encode(got).decode("ascii")
+
+
+def unprotect_secret(value: str) -> str:
+    """読める形に戻す。**平文で入っていたらそのまま返す**(旧版の設定)。"""
+    if not value or not value.startswith(_ENC_PREFIX):
+        return value
+    try:
+        raw = base64.b64decode(value[len(_ENC_PREFIX):])
+    except Exception:
+        return ""
+    got = _dpapi(raw, unprotect=True)
+    return got.decode("utf-8", "replace") if got is not None else ""
+
+
+def is_protected(value: str) -> bool:
+    """包まれているか(画面の表示に使う)。"""
+    return bool(value) and value.startswith(_ENC_PREFIX)
+
+
+# 包んで保存する項目。増やすときはここに足す。
+SECRET_KEYS = ("api_key",)
+
+
 def load_config() -> dict[str, Any]:
     p = config_path()
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    for k in SECRET_KEYS:
+        if isinstance(data.get(k), str):
+            data[k] = unprotect_secret(data[k])
+    return data
 
 
 def save_config(data: dict[str, Any]) -> None:
+    """**秘密の項目は包んでから書く。**呼び出し側は平文のまま渡してよい。"""
+    out = dict(data)
+    for k in SECRET_KEYS:
+        if isinstance(out.get(k), str):
+            out[k] = protect_secret(out[k])
     p = config_path()
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
