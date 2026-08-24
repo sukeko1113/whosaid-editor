@@ -249,6 +249,14 @@ def diarize(
                        f"({len(cached)} 区間)。")
             return cached
 
+    if on_log:
+        # **始めたことは、親が出す。**この行は _diarize_here の中にあり、
+        # 子プロセスへ移したときに親のログから消えた。結果、転写が終わって
+        # から 10 分以上まったく無反応に見えた(別 PC の実機で発覚・
+        # 2026-08-23)。**「落ちたと思われる」問題を直したはずが、別の形で
+        # 再発していた。**
+        on_log(f"話者を分けています(話者数 {num_speakers} を上限として指定)..."
+               "。音声の長さの 2 割ほど時間がかかります。")
     got = _run(audio_path, num_speakers=num_speakers, model_dir=model_dir,
                on_log=on_log, on_progress=on_progress,
                is_cancelled=is_cancelled)
@@ -279,8 +287,6 @@ def _diarize_here(
     seg_model, emb_model = resolve_models(model_dir)
     import sherpa_onnx as so
 
-    if on_log:
-        on_log(f"話者を分けています(話者数 {num_speakers} を上限として指定)...")
     samples = _load_16k_mono(audio_path)
     total = len(samples) / 16000.0
 

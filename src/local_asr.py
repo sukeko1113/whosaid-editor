@@ -357,6 +357,24 @@ class LocalTranscriber:
                 f"--- 詳細 ---\n{e}"
             ) from e
 
+    def _why_not_gpu(self) -> str:
+        """CPU で回す理由を一言で。**利用者が次にすることが変わる。**"""
+        try:
+            import ctranslate2
+        except ImportError:
+            return "GPU を使う部品が入っていません"
+        try:
+            if ctranslate2.get_cuda_device_count() <= 0:
+                return "この機械では、対応する GPU が見つかりません"
+        except Exception:
+            return "この機械では、対応する GPU が見つかりません"
+        # ドライバはある。部品が足りない場合
+        from .cuda_fetch import is_available
+        if not is_available():
+            return ("GPU はありますが、動かす部品がありません。"
+                    "音声を選び直すと取得の案内が出ます")
+        return "GPU はありますが、使わない設定になっています"
+
     @property
     def loaded(self) -> bool:
         """**本当にモデルを読んだか。**
@@ -390,6 +408,12 @@ class LocalTranscriber:
                 for r in rep:
                     if not r.startswith("読み込み成功"):
                         on_log(f"    {r}")
+            else:
+                # **CPU のときは、なぜ GPU を使わないのかを言う。**
+                # 「GPU が無い」のか「あるが部品が足りない」のかで、利用者が
+                # することが変わる。別 PC で動かしたときに、遅い理由が
+                # 分からなかった(実機・2026-08-23)。
+                on_log(f"  GPU は使いません（{self._why_not_gpu()}）。")
             on_log(f"  モデルの場所: {self.target}")
 
         def build(device: str, ctype: str):

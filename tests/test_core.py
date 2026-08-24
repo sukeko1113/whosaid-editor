@@ -4188,6 +4188,38 @@ def test_public_documents_exist_and_say_the_truth():
     assert "既定はローカル" in src, "README と既定が食い違う"
 
 
+def test_diarize_start_is_logged_by_the_parent():
+    """**話者分離を始めたことを、親のログに出す。**
+
+    この行は `_diarize_here` の中にあり、子プロセスへ移したときに親の
+    ログから消えた。結果、転写が終わってから 10 分以上まったく無反応に
+    見えた（別 PC の実機で発覚・2026-08-23）。**「落ちたと思われる」問題を
+    直したはずが、別の形で再発していた。**
+    """
+    import inspect
+    from src import diarize
+    outer = inspect.getsource(diarize.diarize)
+    inner = inspect.getsource(diarize._diarize_here)
+    assert "話者を分けています" in outer, "親が始まりを告げていない"
+    assert "話者を分けています" not in inner, "子と二重に出る"
+    assert "2 割" in outer, "どれくらいかかるかを伝えていない"
+
+
+def test_cpu_run_says_why_gpu_is_not_used():
+    """**CPU で回すときは、その理由を言う。**
+
+    「GPU が無い」のか「あるが部品が足りない」のかで、利用者がすることが
+    変わる。別 PC で動かしたときに、遅い理由が分からなかった（2026-08-23）。
+    """
+    import inspect
+    from src import local_asr
+    src = inspect.getsource(local_asr.LocalTranscriber._load)
+    assert "GPU は使いません" in src
+    why = inspect.getsource(local_asr.LocalTranscriber._why_not_gpu)
+    for phrase in ("見つかりません", "部品がありません"):
+        assert phrase in why, f"理由の場合分けに「{phrase}」が無い"
+
+
 # ======================================================================
 # pytest が無い環境向けの簡易ランナー
 # ======================================================================
