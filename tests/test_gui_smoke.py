@@ -2064,6 +2064,82 @@ def run() -> int:
 # 利用者の config.json を書き換えないようにする。
 # ======================================================================
 
+def run_candidate_scroll() -> int:
+    """**出席者が多くても、全員を選べるか。**
+
+    候補のボタンは人数ぶん作られていたのに、入れ物の高さが足りず下が
+    切れていた。9 人のうち 6 人しか出ず、残りを選べなかった（実機の指摘・
+    2026-08-24）。**画面からは「そもそも居ない」ようにしか見えない**種類の
+    欠陥なので、数だけでなく「送れば見える」ことまで確かめる。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[候補が多いときのスクロール]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            proj = make_project(tmp)
+            names = ["三ツ林", "志村", "山口", "山本", "高原", "山下",
+                     "梅田", "吉沢", "西村", "佐藤", "田中", "鈴木"]
+            proj.speakers = parse_roster("\n".join(names))
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+
+            check(f"候補が人数ぶん作られる（{len(names)} 人）",
+                  len(win._candidates) == len(names))
+
+            win.update_idletasks()
+            inner = win.cand_holder.winfo_height()
+            view = win.cand_canvas.winfo_height()
+            check("入れ物より中身が高い（切れる状況を再現できている）",
+                  inner > view)
+            check("スクロールできる",
+                  win.cand_canvas.yview()[1] < 1.0)
+            check("要るときはスクロールバーが出る",
+                  win.cand_scroll.winfo_ismapped())
+
+            # **いちばん下の候補まで届く**
+            win.cand_canvas.yview_moveto(1.0)
+            win.update_idletasks()
+            check("下端まで送れる", win.cand_canvas.yview()[1] >= 0.999)
+
+            # 選ばれている候補が隠れていたら、見える位置へ送る
+            last = win._candidates[-1]
+            here = win.current          # 割当後は自動で次へ進む
+            win.assign(last.speaker.id)
+            win.update()
+            check("最後の人も選べる",
+                  proj.segments[here].speaker_id == last.speaker.id)
+
+            # **隠れている候補は、見える位置へ送る。**割当後は並び順が
+            # 学習で変わる（選んだ人が上に来る）ので、送る処理そのものを
+            # 直接確かめる。
+            win.cand_canvas.yview_moveto(0.0)
+            win.update_idletasks()
+            before = win.cand_canvas.yview()[0]
+            bottom_btn = win._cand_widgets[len(win._candidates) - 1]
+            win._scroll_candidate_into_view(bottom_btn)
+            win.update_idletasks()
+            check("隠れている候補は見える位置へ送られる",
+                  win.cand_canvas.yview()[0] > before)
+
+            win.destroy()
+    finally:
+        root.destroy()
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 def run_multi_select() -> int:
     """**複数選択で話者をまとめて指定できるか。**
 
@@ -2710,7 +2786,8 @@ def run_main_window() -> int:
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
+    rc_cand = run_candidate_scroll()
     rc_multi = run_multi_select()
     rc_main = run_main_window()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
-    sys.exit(rc_assign or rc_multi or rc_main or rc_cfg)
+    sys.exit(rc_assign or rc_cand or rc_multi or rc_main or rc_cfg)

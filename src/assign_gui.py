@@ -232,6 +232,10 @@ COLOR_SPECIAL = "#9A9A9A"
 
 QUICK_KEYS = "123456789"
 
+# 候補欄の最低の高さ(px)。**画面が小さくても、ここは潰さない。**
+# 潰れると候補が 1〜2 人しか出ず、選べなくなる。
+CAND_MIN_HEIGHT = 190
+
 # 一覧の絞り込み
 FILTER_ALL = "all"
 FILTER_UNASSIGNED = "unassigned"
@@ -975,9 +979,40 @@ class AssignWindow(tk.Toplevel):
         frm_cand.grid(row=4, column=0, sticky="nsew", padx=4, pady=2)
         frm_cand.columnconfigure(0, weight=1)
         frm_cand.rowconfigure(0, weight=1)
-        self.cand_holder = ttk.Frame(frm_cand)
-        self.cand_holder.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
+        # **候補は縦にスクロールできるようにする。**入れ物の高さが足りないと
+        # 下の候補が黙って切れる。出席者 9 人で 6 人しか出ず、残りを選べ
+        # なかった(実機の指摘・2026-08-24)。ボタン自体は 9 個とも作られて
+        # いたので、**画面からは「そもそも居ない」ようにしか見えなかった。**
+        cand_wrap = ttk.Frame(frm_cand)
+        cand_wrap.grid(row=0, column=0, sticky="nsew", padx=6, pady=4)
+        cand_wrap.columnconfigure(0, weight=1)
+        cand_wrap.rowconfigure(0, weight=1)
+
+        self.cand_canvas = tk.Canvas(cand_wrap, highlightthickness=0,
+                                     height=CAND_MIN_HEIGHT)
+        self.cand_canvas.grid(row=0, column=0, sticky="nsew")
+        self.cand_scroll = ttk.Scrollbar(cand_wrap, orient="vertical",
+                                         command=self.cand_canvas.yview)
+        self.cand_canvas.configure(yscrollcommand=self._on_cand_scroll)
+
+        self.cand_holder = ttk.Frame(self.cand_canvas)
+        self._cand_window = self.cand_canvas.create_window(
+            (0, 0), window=self.cand_holder, anchor="nw")
         self.cand_holder.columnconfigure(0, weight=1)
+        self.cand_holder.bind(
+            "<Configure>",
+            lambda e: self.cand_canvas.configure(
+                scrollregion=self.cand_canvas.bbox("all")))
+        self.cand_canvas.bind(
+            "<Configure>",
+            lambda e: self.cand_canvas.itemconfigure(self._cand_window,
+                                                    width=e.width))
+        # ホイールは、この上にいるときだけ拾う(一覧のスクロールを食わない)
+        self.cand_canvas.bind(
+            "<Enter>",
+            lambda e: self.cand_canvas.bind_all("<MouseWheel>", self._cand_wheel))
+        self.cand_canvas.bind(
+            "<Leave>", lambda e: self.cand_canvas.unbind_all("<MouseWheel>"))
 
         # **特別な選択肢は名簿と別枠に、横一列で置く。**名簿に入れると、
         # 出席者が多いときに下から押し出されて画面から切れる(9 人で
@@ -2415,6 +2450,34 @@ class AssignWindow(tk.Toplevel):
     # ==================================================================
     # 候補者リスト
     # ==================================================================
+    def _on_cand_scroll(self, first: str, last: str) -> None:
+        """**要るときだけスクロールバーを出す。**常に出すと候補が横に狭まる。"""
+        self.cand_scroll.set(first, last)
+        need = not (float(first) <= 0.0 and float(last) >= 1.0)
+        if need and not self.cand_scroll.winfo_ismapped():
+            self.cand_scroll.grid(row=0, column=1, sticky="ns")
+        elif not need and self.cand_scroll.winfo_ismapped():
+            self.cand_scroll.grid_remove()
+
+    def _cand_wheel(self, event) -> None:
+        self.cand_canvas.yview_scroll(int(-event.delta / 120), "units")
+
+    def _scroll_candidate_into_view(self, widget) -> None:
+        """選ばれている候補が隠れていたら、見える位置まで送る。"""
+        try:
+            self.cand_canvas.update_idletasks()
+            top = widget.winfo_y()
+            bottom = top + widget.winfo_height()
+            view_h = self.cand_canvas.winfo_height()
+            total = max(1, self.cand_holder.winfo_height())
+            cur = self.cand_canvas.canvasy(0)
+            if top < cur:
+                self.cand_canvas.yview_moveto(top / total)
+            elif bottom > cur + view_h:
+                self.cand_canvas.yview_moveto(max(0.0, (bottom - view_h) / total))
+        except Exception:
+            pass        # 描画前などは何もしない(選べなくなるほうが困る)
+
     def _rebuild_candidates(self) -> None:
         for w in self._cand_widgets:
             w.destroy()
@@ -2443,6 +2506,8 @@ class AssignWindow(tk.Toplevel):
             )
             btn.grid(row=i, column=0, sticky="ew", pady=1)
             self._cand_widgets.append(btn)
+            if seg.speaker_id == cand.speaker.id:
+                self.after_idle(self._scroll_candidate_into_view, btn)
 
         # **特別な選択肢は別枠に横一列。**名簿に混ぜると出席者が多いときに
         # 下から切れる(実機の指摘 2026-08-19)。
