@@ -57,6 +57,8 @@ from .segments import (
     fmt_hms,
     fmt_hms_frac,
     has_inserted_utterances,
+    inserted_marks,
+    marks_for_segment,
     parse_hms,
     parse_roster,
     speaker_label,
@@ -658,6 +660,11 @@ class AssignWindow(tk.Toplevel):
         # 一括適用は既定で ON。これが推奨の進め方で、これを使わないと
         # 90 分の会議で数百回の判断が必要になる。
         self.var_apply_cluster = tk.BooleanVar(value=True)
+        # **既定は埋め込み。**足した発話は割り込んだ位置で親の本文に入るので、
+        # 行としても出すと同じものが 2 か所に見える(実機の要望・2026-08-24)。
+        self.var_added_rows = tk.BooleanVar(value=False)
+        # 候補を見える位置へ送る予約(窓を閉じるときに取り消す)
+        self._cand_scroll_after = None
         self.var_filter = tk.StringVar(value=FILTER_ALL)
         # 聴く順(取りこぼしを見つけやすい順)。**既定は時間順のまま**——
         # 並びが黙って変わると「上から順に聴いた」という作業の前提が崩れる。
@@ -909,6 +916,12 @@ class AssignWindow(tk.Toplevel):
             text="（本文に無い発話を、位置を指して足します）")
         self.lbl_cand.pack(side="left", padx=(10, 0))
 
+        # **埋め込みにすると、足した発話に行が無くなる。**直す・消す入口を
+        # ここに置かないと、届かなくなる(実機の要望・2026-08-24)。
+        # 中身があるときだけ出す。行を占有し続けると右ペインが詰まる。
+        self.row_inserted = ttk.Frame(frm_time)
+        self._inserted_widgets: list = []
+
         self.frm_cand = ttk.Frame(row_add)
         ttk.Label(self.frm_cand, text="別の声:").pack(side="left", padx=(8, 3))
         self.cmb_cand = ttk.Combobox(self.frm_cand, textvariable=self.var_cand,
@@ -1035,6 +1048,9 @@ class AssignWindow(tk.Toplevel):
         self.chk_apply_cluster.pack(side="left")
         ttk.Checkbutton(opts, text="確定したら次へ", variable=self.var_advance,
                         takefocus=False).pack(side="left", padx=12)
+        ttk.Checkbutton(opts, text="足した発言も行で出す",
+                        variable=self.var_added_rows, takefocus=False,
+                        command=self._on_added_rows_toggled).pack(side="left")
         ttk.Button(opts, text="不明 (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))\
             .pack(side="right")
         ttk.Button(opts, text="未確定に戻す (D)", command=self.unassign).pack(side="right", padx=6)
@@ -1383,11 +1399,32 @@ class AssignWindow(tk.Toplevel):
         except Exception:
             return None
 
+    def _refresh_inserted(self) -> None:
+        """「どの区間に、どの追加発話が入るか」を数え直す。
+
+        **Word の出力とまったく同じ計算を使う**(segments.inserted_marks)。
+        別々に実装すると「画面ではここ、出力では別のところ」になる。
+        """
+        self._marks_by_parent, placed = inserted_marks(self.proj)
+        self._inlined = {s.index for s in self.proj.segments
+                         if self.proj.is_added_utterance(s) and id(s) in placed}
+
+    def inserted_in(self, seg) -> list:
+        """その区間に重なって入っている発話。[(何文字目, 区間), ...]"""
+        return marks_for_segment(getattr(self, "_marks_by_parent", {}), seg)
+
     def _visible_indexes(self) -> list[int]:
+        self._refresh_inserted()
+        # **足した発言に行を作らない。**割り込んだ位置で親の本文に埋め込む
+        # ので、行が増えると同じものが 2 か所に出る。行として見たいときは
+        # 下のチェックで戻せる(実機の要望・2026-08-24)。
+        hide = (not self.var_added_rows.get()) and self._inlined
         if self.var_filter.get() == FILTER_ALL:
             out = [s.index for s in self.proj.segments]
         else:
             out = [s.index for s in self.proj.segments if self._match_filter(s)]
+        if hide:
+            out = [i for i in out if i not in self._inlined]
         if self.var_listen_order.get() and self._listen_hints:
             # 点数の高い順、同点は時間順。順番が付かない区間(分割で増えた側
             # など)は末尾に時間順で置く——**外すと「安全」に見えてしまう。**
@@ -1477,15 +1514,108 @@ class AssignWindow(tk.Toplevel):
         time_cell = time_mark + fmt_hms(seg.start)
         # 人が足した発話は本文の頭に印を付ける。色だけだと印刷や
         # 色覚の条件で消えるので、文字でも分かるようにする。
-        body = seg.preview(70)
+        body = self._body_with_inserts(seg)
         if self.proj.is_added_utterance(seg):
             # **足した発話は背景・文字色・括弧の 3 つで示す。**
             # 「＋」だけでは一覧に埋もれて分からない(実機の指摘・2026-08-22)。
             bg, fg = "bg_added", "fg_added"
             body = f"＋（{body}）"
+        elif not self.var_added_rows.get() and self.inserted_in(seg):
+            # 重なりを埋め込んだ行にも印を付ける。**括弧が主、色は従。**
+            # 色だけでは印刷や色覚の条件で消える。
+            bg = "bg_added"
         values = (time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", body)
         return values, tuple(t for t in (bg, fg) if t)
+
+    def _refresh_inserted_row(self, seg) -> None:
+        """「この発言に重なって入っているもの」を右ペインに出す。
+
+        埋め込み表示のときは一覧に行が無いので、**ここが唯一の入口**になる。
+        """
+        for w in self._inserted_widgets:
+            w.destroy()
+        self._inserted_widgets = []
+
+        marks = [] if self.var_added_rows.get() else self.inserted_in(seg)
+        if not marks:
+            self.row_inserted.pack_forget()
+            return
+        self.row_inserted.pack(side="top", anchor="w", pady=(3, 0))
+
+        lbl = ttk.Label(self.row_inserted, text="重なって入っている発言:",
+                        foreground="#BF360C")
+        lbl.pack(side="left")
+        self._inserted_widgets.append(lbl)
+        for _cut, add in marks:
+            who = self.proj.speaker_name(add.speaker_id) or "？"
+            box = ttk.Frame(self.row_inserted)
+            box.pack(side="left", padx=(8, 0))
+            self._inserted_widgets.append(box)
+            ttk.Label(box, text=f"（{who}：{add.preview(16)}）"
+                                f" {fmt_hms_frac(add.start)}").pack(side="left")
+            ttk.Button(box, text="直す", width=5, takefocus=False,
+                       command=lambda i=add.index: self._goto_inserted(i)
+                       ).pack(side="left", padx=(4, 0))
+            ttk.Button(box, text="消す", width=5, takefocus=False,
+                       command=lambda i=add.index: self._remove_inserted(i)
+                       ).pack(side="left", padx=(2, 0))
+
+    def _goto_inserted(self, index: int) -> None:
+        """重なって入っている発話へ移る。**行が無くても届くようにする。**"""
+        if not (0 <= index < len(self.proj.segments)):
+            return
+        if not self.var_added_rows.get():
+            # 行を出さない設定のままでは選べないので、その場で行表示へ倒す
+            self.var_added_rows.set(True)
+            self.reload_tree()
+        self.goto(index)
+        self._set_action(
+            "重なって入っている発言に移りました。"
+            "本文と話者を直せます（［足した発言も行で出す］を外すと、"
+            "また埋め込みに戻ります）。")
+
+    def _remove_inserted(self, index: int) -> None:
+        """重なって入っている発話を消す。"""
+        if not (0 <= index < len(self.proj.segments)):
+            return
+        here = self.current
+        self.current = index
+        try:
+            self.remove_added()
+        finally:
+            self.current = min(here, len(self.proj.segments) - 1)
+        self.reload_tree()
+        self._select_index(self.current, scroll=True)
+        self.show_current()
+
+    def _on_added_rows_toggled(self) -> None:
+        """行で出すかを切り替える。いま見ている区間は見失わない。"""
+        here = self.current
+        self.reload_tree()
+        self._select_index(here, scroll=True)
+        self.show_current()
+
+    def _body_with_inserts(self, seg) -> str:
+        """一覧に出す本文。**重なって入った発話を、その位置に埋め込む。**
+
+        Word の「埋め込む形」と同じ書き方(BTSJ 3.2.3)。一覧だけ別の見せ方に
+        すると、画面と出力が食い違う。
+        """
+        marks = self.inserted_in(seg) if not self.var_added_rows.get() else []
+        if not marks:
+            return seg.preview(70)
+        text = seg.text or ""
+        out, pos = [], 0
+        for cut, add in marks:
+            cut = max(0, min(int(cut), len(text)))
+            out.append(text[pos:cut])
+            who = self.proj.speaker_name(add.speaker_id) or "？"
+            out.append(f"（{who}：{(add.text or '').strip()}）")
+            pos = cut
+        out.append(text[pos:])
+        joined = "".join(out)
+        return joined if len(joined) <= 70 else joined[:69] + "…"
 
     def _insert_row(self, seg) -> str:
         values, tags = self._row_values(seg)
@@ -1668,6 +1798,7 @@ class AssignWindow(tk.Toplevel):
         self.txt_body.delete("1.0", "end")
         self.txt_body.insert("1.0", seg.text)
         self._body_index = self.current   # この欄がどの区間のものか（§_commit_text）
+        self._refresh_inserted_row(seg)  # 重なって入っている発話(§10.3.7)
         self._rebuild_candidates()      # 話者の候補(suggest.py)
         self._show_voice_candidates()   # 声の候補(candidates.py・§10.3)
         self._draw_timeline()
@@ -2464,6 +2595,7 @@ class AssignWindow(tk.Toplevel):
 
     def _scroll_candidate_into_view(self, widget) -> None:
         """選ばれている候補が隠れていたら、見える位置まで送る。"""
+        self._cand_scroll_after = None
         try:
             self.cand_canvas.update_idletasks()
             top = widget.winfo_y()
@@ -2507,7 +2639,16 @@ class AssignWindow(tk.Toplevel):
             btn.grid(row=i, column=0, sticky="ew", pady=1)
             self._cand_widgets.append(btn)
             if seg.speaker_id == cand.speaker.id:
-                self.after_idle(self._scroll_candidate_into_view, btn)
+                # **予約は 1 つだけ持ち、窓を閉じるときに取り消す。**
+                # 置きっぱなしにすると、閉じたあとに発火して Tk が
+                # 「invalid command name」を投げる(検査が不安定になった)。
+                if self._cand_scroll_after is not None:
+                    try:
+                        self.after_cancel(self._cand_scroll_after)
+                    except Exception:
+                        pass
+                self._cand_scroll_after = self.after_idle(
+                    self._scroll_candidate_into_view, btn)
 
         # **特別な選択肢は別枠に横一列。**名簿に混ぜると出席者が多いときに
         # 下から切れる(実機の指摘 2026-08-19)。
@@ -3289,6 +3430,22 @@ class AssignWindow(tk.Toplevel):
         # 上書きすると、点検を 2 回挟んだだけで却下の記録が消える。
         save_proposals(path, [*proposals, *history])
         self.update_status()
+
+    def destroy(self) -> None:
+        """**閉じる前に、予約した処理を取り消す。**
+
+        置きっぱなしにすると、窓が消えたあとに発火して Tk が
+        「invalid command name」を投げる。検査が不安定になり、実機でも
+        閉じるたびに背景でエラーが出る(2026-08-24)。
+        """
+        after_id = getattr(self, "_cand_scroll_after", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+            self._cand_scroll_after = None
+        super().destroy()
 
     def _on_close(self) -> None:
         self._inspect_cancel.set()

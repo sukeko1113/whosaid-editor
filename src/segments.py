@@ -1526,6 +1526,49 @@ def has_inserted_utterances(proj: Project) -> bool:
                for lst in _insert_cuts(proj).values() for _cut, sig in lst)
 
 
+def inserted_marks(proj: Project) -> tuple[dict, set]:
+    """「どの区間の何文字目に、どの追加発話が入るか」を割り当てる。
+
+    返すのは (親の鍵 → [(何文字目, 足した区間)], 割り当て済みの id 集合)。
+
+    **Word の出力と、割当画面の一覧で同じものを使う。**別々に実装すると、
+    片方だけ直したときに「画面ではここ、出力では別のところ」という食い違いが
+    起きる。この製品でいちばん避けたい種類の欠陥
+    （書いてあることと実物が違う）。
+    """
+    cuts = _insert_cuts(proj)
+
+    # **身元ごとに「並び」で持つ。**辞書に 1 つずつ入れていたため、同じ
+    # 身元の 2 件目が 1 件目を上書きし、上書きされたほうが差し込み先を
+    # 失って**出力から丸ごと落ちていた**(実データで発生・2026-08-20)。
+    pool: dict[tuple[float, float, str], list[Segment]] = {}
+    for s in proj.segments:
+        if proj.is_added_utterance(s):
+            pool.setdefault(added_signature(s), []).append(s)
+
+    # 差し込み記録に区間を 1 つずつ割り当てる。**記録より区間が多いときは
+    # 余りを単独で出す**(消し損ねて残った区間を黙って落とさないため)。
+    marks_by_parent: dict[tuple, list[tuple[int, Segment]]] = {}
+    placed: set[int] = set()
+    for pkey, lst in cuts.items():
+        for cut, sig in lst:
+            queue = pool.get(sig)
+            if not queue:
+                continue
+            seg_add = queue.pop(0)
+            placed.add(id(seg_add))
+            marks_by_parent.setdefault(pkey, []).append((cut, seg_add))
+    return marks_by_parent, placed
+
+
+def marks_for_segment(marks_by_parent: dict, seg: "Segment") -> list:
+    """その区間に入る割り込みを、位置の順に返す。"""
+    k = segment_key(seg)
+    return sorted(marks_by_parent.get(k, [])
+                  + marks_by_parent.get((k[0], None), []),
+                  key=lambda c: c[0])
+
+
 def _merge_runs(
     proj: Project,
     merge_consecutive: bool = True,
@@ -1549,34 +1592,12 @@ def _merge_runs(
     # これをやらないと Word が「長い発言 → 相づち」の順になり、しかも
     # 同じ話者の相づちが 1 段落にまとまる(実機で判明・2026-08-18)。
     cuts = _insert_cuts(proj)
-    # **身元ごとに「並び」で持つ。**辞書に 1 つずつ入れていたため、同じ
-    # 身元の 2 件目が 1 件目を上書きし、上書きされたほうが差し込み先を
-    # 失って**出力から丸ごと落ちていた**(実データで発生・2026-08-20)。
-    pool: dict[tuple[float, float, str], list[Segment]] = {}
-    for s in proj.segments:
-        if proj.is_added_utterance(s):
-            pool.setdefault(added_signature(s), []).append(s)
-
-    # 差し込み記録に区間を 1 つずつ割り当てる。**記録より区間が多いときは
-    # 余りを単独で出す**(消し損ねて残った区間を黙って落とさないため)。
-    marks_by_parent: dict[tuple, list[tuple[int, Segment]]] = {}
-    placed: set[int] = set()
-    for pkey, lst in cuts.items():
-        for cut, sig in lst:
-            queue = pool.get(sig)
-            if not queue:
-                continue
-            seg_add = queue.pop(0)
-            placed.add(id(seg_add))
-            marks_by_parent.setdefault(pkey, []).append((cut, seg_add))
+    marks_by_parent, placed = inserted_marks(proj)
 
     inline = insert_style == INSERT_STYLE_INLINE
 
     def marks_for(seg: Segment) -> list[tuple[int, Segment]]:
-        k = segment_key(seg)
-        return sorted(marks_by_parent.get(k, [])
-                      + marks_by_parent.get((k[0], None), []),
-                      key=lambda c: c[0])
+        return marks_for_segment(marks_by_parent, seg)
 
     shorts = short_labels(proj.speakers) if inline else {}
 

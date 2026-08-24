@@ -2064,6 +2064,97 @@ def run() -> int:
 # 利用者の config.json を書き換えないようにする。
 # ======================================================================
 
+def run_inline_inserts() -> int:
+    """**足した発言は、一覧に行を増やさず親の本文へ埋め込む。**
+
+    Word の出力は前から「割り込んだ位置に差し込む」形だったのに、一覧だけ
+    独立した行として並べていた。同じものが 2 か所に見えて分かりにくい、と
+    指摘を受けた（実機・2026-08-24）。
+
+    **画面と出力で同じ計算を使うこと**が要点。別々に実装すると「画面では
+    ここ、出力では別のところ」という食い違いが起きる。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[足した発言を本文に埋め込む]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            proj = make_project(tmp)
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            rows_before = len(win.tree.get_children())
+
+            parent = proj.segments[1]
+            add = proj.add_utterance(
+                parent.start + 0.1, parent.start + 0.4, "はい",
+                cluster=parent.cluster, cut=3,
+                parent_orig=parent.orig_start, parent_start=parent.start)
+            add.speaker_id = proj.speakers[0].id
+            win.reload_tree()
+            win.update()
+
+            check("一覧の行が増えない",
+                  len(win.tree.get_children()) == rows_before)
+            vals, tags = win._row_values(parent)
+            check("親の本文の、割り込んだ位置に入る",
+                  vals[3].startswith("これは（") and "：はい）" in vals[3])
+            check("親の行にも印が付く", "bg_added" in tags)
+
+            # **画面と出力が同じ位置を指すこと**
+            from src.segments import inserted_marks, marks_for_segment
+            marks, _ = inserted_marks(proj)
+            out_cut = marks_for_segment(marks, parent)[0][0]
+            gui_cut = win.inserted_in(parent)[0][0]
+            check("画面と出力が同じ位置を使う", out_cut == gui_cut == 3)
+
+            # 右ペインが唯一の入口になる
+            win.goto(parent.index)
+            win.update()
+            check("右ペインに「重なって入っている発言」が出る",
+                  win.row_inserted.winfo_ismapped())
+
+            # 行で出す設定に戻せる
+            win.var_added_rows.set(True)
+            win._on_added_rows_toggled()
+            win.update()
+            check("行で出す設定にすると行が増える",
+                  len(win.tree.get_children()) == rows_before + 1)
+            check("行で出すときは埋め込まない",
+                  "：はい）" not in win._row_values(parent)[0][3])
+            win.var_added_rows.set(False)
+            win._on_added_rows_toggled()
+            win.update()
+
+            # 消す入口が効く
+            real_yes = assign_gui.messagebox.askyesno
+            assign_gui.messagebox.askyesno = lambda *a2, **k2: True
+            try:
+                win._remove_inserted(add.index)
+            finally:
+                assign_gui.messagebox.askyesno = real_yes
+            check("右ペインから消せる",
+                  not any(s.text == "はい" for s in proj.segments))
+            check("消したら埋め込みも消える",
+                  "：はい）" not in win._row_values(proj.segments[1])[0][3])
+
+            win.destroy()
+    finally:
+        root.destroy()
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 def run_candidate_scroll() -> int:
     """**出席者が多くても、全員を選べるか。**
 
@@ -2786,8 +2877,9 @@ def run_main_window() -> int:
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
+    rc_inline = run_inline_inserts()
     rc_cand = run_candidate_scroll()
     rc_multi = run_multi_select()
     rc_main = run_main_window()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
-    sys.exit(rc_assign or rc_cand or rc_multi or rc_main or rc_cfg)
+    sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main or rc_cfg)
