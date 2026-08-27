@@ -219,6 +219,16 @@ FRAGMENTED = """[00:00] 【A】 吉沢と申しますけども
 """
 
 
+FRAGMENTED_EN = """[00:00] 【A】 Thank you Mr Chairperson
+[00:01] 【A】 um, my first contention is
+[00:24] 【A】 that the current system
+[00:26] 【A】 uh, fails to protect
+[00:29] 【A】 the most vulnerable members of our society.
+[00:47] 【B】 Point of information.
+[00:49] 【A】 No thank you, I will take one at the end.
+"""
+
+
 def test_merge_collapses_same_speaker_run():
     merged = parse_segments(FRAGMENTED, 0, 0, 600)
     clusters = [s["cluster"] for s in merged]
@@ -235,14 +245,39 @@ def test_merge_can_be_disabled():
     assert len(raw) == 10
 
 
-def test_merge_inserts_reading_comma():
-    """断片をそのまま繋ぐと「けどもえー」になる。間には読点を補う。"""
-    merged = parse_segments(FRAGMENTED, 0, 0, 600)
+def test_merge_inserts_comma_and_space():
+    """断片をそのまま繋ぐと "Chairpersonum" になる。空白とコンマを補う。
+
+    【英語テスト用ブランチ】日本語版は読点「、」を挿入し空白を挟まなかった
+    (test_merge_inserts_reading_comma)。
+    """
+    merged = parse_segments(FRAGMENTED_EN, 0, 0, 600)
     text = merged[0]["text"]
-    assert "けども、えー" in text
-    assert "けどもえー" not in text
-    # 既に句読点で終わっていれば二重にしない
-    assert "。、" not in text
+    # 語がくっつかない
+    assert "Chairpersonum" not in text
+    # 句読点で終わっていない断片の間にはコンマ + 空白を補う
+    assert "Thank you Mr Chairperson, um," in text
+    # 既に句読点で終わっていれば二重にしない(空白だけ挟む)
+    assert ",," not in text
+    assert " ," not in text
+    assert "system, uh, fails" in text   # "...system" は句点なしなのでコンマ
+    # 句点で終わる断片の後ろはコンマを足さない
+    assert "society." in text
+
+
+def test_join_fragments_rules():
+    """連結の 3 分岐を直接押さえる(主経路なので単体でも見ておく)。"""
+    from src.transcribe import _join_fragments
+
+    # 句読点なし → コンマ + 空白
+    assert _join_fragments("we stand", "and we say") == "we stand, and we say"
+    # 句点あり → 空白だけ
+    assert _join_fragments("That is our case.", "Thank you") == "That is our case. Thank you"
+    # 右が句読点始まり → 直付け(前の語に付く)
+    assert _join_fragments("the evidence", ", however, is weak") == "the evidence, however, is weak"
+    # 片側が空
+    assert _join_fragments("", "Yes") == "Yes"
+    assert _join_fragments("Yes", "") == "Yes"
 
 
 def test_merge_skips_pseudo_clusters():
@@ -657,9 +692,10 @@ def test_write_docx_merges_consecutive():
         doc = Document(str(out))
         paras = [p.text for p in doc.paragraphs if p.text.strip()]
     body = [p for p in paras if p.startswith("[")]
-    # 連続する 3 区間が 1 段落にまとまる(日本語なので空白を挟まない)
+    # 連続する 3 区間が 1 段落にまとまる
+    # 【英語テスト用ブランチ】日本語版は "あいう"(空白を挟まない)
     assert body[0].startswith("[00:00:00] 【佐藤】")
-    assert "あいう" in body[0]
+    assert "あ い う" in body[0]
     # 表題・出席者一覧が入る
     assert paras[0] == "第1回理事会"
     assert any(p.startswith("出席者: 佐藤、田中、鈴木") for p in paras)
@@ -901,7 +937,9 @@ def test_merge_segments_basics():
     assert len(proj.segments) == 2
     assert [s.index for s in proj.segments] == [0, 1]
     assert (merged.start, merged.end) == (100.0, 120.0)
-    assert merged.text == "そうですねいいと思います次の発言"   # 空白を挟まない
+    # 【英語テスト用ブランチ】日本語版は "そうですねいいと思います次の発言"
+    # (空白を挟まない)。連結が空白を挟むようになったぶんだけずれる。
+    assert merged.text == "そうですねいいと思います 次の発言"
     assert merged.cluster == "0:B"                            # 前側を採用
     assert merged.speaker_id == "sp01"                        # 同じ話者なら維持
     assert merged.reviewed is False
@@ -928,18 +966,48 @@ def test_merge_segments_rejects_last():
     raise AssertionError("次の区間が無いのに結合できてしまった")
 
 
+def _splittable_en() -> Project:
+    """英語の分割・結合用。語の境界で切れることを前提にする。
+
+    【英語テスト用ブランチ】連結が空白を挟むようになったので、可逆性は
+    「語の境界で切ったとき」に限って成り立つ(語の途中で切って戻すと
+    そこに空白が入る)。日本語では常に成り立っていた性質が弱まっている。
+    """
+    proj = Project(audio_path="a.m4a", duration=300.0)
+    proj.speakers = parse_roster("佐藤\n田中")
+    proj.segments = [
+        Segment(index=0, start=90.0, end=100.0, text="Before this", cluster="0:A"),
+        Segment(index=1, start=100.0, end=110.0, text="Yes I agree with that point",
+                cluster="0:B", chunk=0, speaker_id="sp01", reviewed=True, note="めも"),
+        Segment(index=2, start=110.0, end=120.0, text="After this", cluster="0:C"),
+    ]
+    return proj
+
+
 def test_split_then_merge_restores_shape():
-    """分割の取り消しは結合で行う(Ctrl+Z の対象外)。"""
-    proj = _splittable()
+    """分割の取り消しは結合で行う(Ctrl+Z の対象外)。
+
+    語の境界(空白の位置)で切れば、結合で元の本文に戻る。
+    """
+    proj = _splittable_en()
     before = proj.segments[1]
     span, text = (before.start, before.end), before.text
-    proj.split_segment(1, 105.0, 5)
+    proj.split_segment(1, 105.0, 3)          # "Yes" / " I agree with that point"
+    assert proj.segments[1].text == "Yes"
     proj.merge_segments(1)
     after = proj.segments[1]
     assert len(proj.segments) == 3
     assert (after.start, after.end) == span
     assert after.text == text
     assert (after.orig_start, after.orig_end) == span
+
+
+def test_split_inside_a_word_is_not_reversible():
+    """語の途中で切ると結合で空白が入る。英語での既知の非可逆。"""
+    proj = _splittable_en()
+    proj.split_segment(1, 105.0, 2)          # "Ye" / "s I agree..."
+    proj.merge_segments(1)
+    assert proj.segments[1].text == "Ye s I agree with that point"
 
 
 # ======================================================================

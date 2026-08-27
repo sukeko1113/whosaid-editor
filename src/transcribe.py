@@ -577,17 +577,25 @@ def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
 
     return raw
 
-# 連結時、直前がこれらで終わっていれば読点を足さない
-_SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
+# 連結時、直前がこれらで終わっていればコンマを足さない。
+# 【英語テスト用ブランチ】日本語版は "。、．，!?！？」』）)…・ー~〜-" だった。
+_SENTENCE_ENDS = ".!?,;:…—-\"')]"
+
+# 右側がこれらで始まるときは、前の語に直付けする(空白を挟まない)。
+# 日本語では句読点が必ず前の語に付くのでこの区別が要らなかった。
+_CLINGING = ".!?,;:%)]}"
 
 
 def _join_fragments(left: str, right: str) -> str:
-    """断片を連結する。日本語なので空白は挟まない。
+    """断片を連結する。英語なので語の間に空白が要る。
 
     Gemini が行を分けた位置は、話者が息を継いだ位置に対応している。
-    そのまま連結すると「吉沢と申しますけどもえー、まず…」と読みにくいので、
-    直前が句読点で終わっていなければ読点を補う。
+    そのまま連結すると "Thank you Mr Chairpersonwe stand..." になるので、
+    必ず空白を挟み、直前が句読点で終わっていなければコンマを補う。
     (逐語での「間」の表現であり、発話内容そのものは変えない)
+
+    【英語テスト用ブランチ】日本語版は空白を挟まず読点「、」を補っていた。
+    ここは merge_consecutive から毎回の転写で呼ばれる主経路。
     """
     left = left.rstrip()
     right = right.lstrip()
@@ -595,9 +603,11 @@ def _join_fragments(left: str, right: str) -> str:
         return right
     if not right:
         return left
-    if left[-1] in _SENTENCE_ENDS or right[0] in _SENTENCE_ENDS:
-        return left + right
-    return left + "、" + right
+    if right[0] in _CLINGING:
+        return left + right          # ", and" のような句読点始まりは直付け
+    if left[-1] in _SENTENCE_ENDS:
+        return left + " " + right
+    return left + ", " + right
 
 
 def merge_consecutive(

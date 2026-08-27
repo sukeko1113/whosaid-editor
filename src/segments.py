@@ -42,6 +42,25 @@ PSEUDO_MULTI = "*"
 MIN_SEGMENT_SECONDS = 0.1
 
 
+def _join_texts(left: str, right: str) -> str:
+    """2 つの区間の本文を連結する。英語なので語の間に空白が要る。
+
+    【英語テスト用ブランチ】日本語版は単純な `a.text + b.text` だった。
+    transcribe._join_fragments と違い、ここは人が明示的にまとめた別々の
+    発言なので、コンマは補わない(元の句読点をそのまま残す)。
+
+    transcribe から import しないのは、あちらが google.genai を
+    トップレベル import しており、素の Python で落ちるため。
+    """
+    left = left.rstrip()
+    right = right.lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return left + " " + right
+
+
 def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
     """その区間が実音声のどこで鳴っているか(開始, 終了)。
 
@@ -432,7 +451,7 @@ class Project:
             index=index,
             start=min(a.start, b.start),
             end=max(a.end, b.end),
-            text=a.text + b.text,           # 日本語なので空白を挟まない
+            text=_join_texts(a.text, b.text),   # 英語なので空白を挟む
             cluster=a.cluster,              # 前側の声のまとまりを採用する
             chunk=a.chunk,
             speaker_id=a.speaker_id if a.speaker_id == b.speaker_id else None,
@@ -575,8 +594,8 @@ def _merge_runs(
             runs[-1][2].append(text)
         else:
             runs.append((seg.start, seg.speaker_id, [text]))
-    # 日本語なので連結時に空白を挟まない
-    return [(start, sid, "".join(parts)) for start, sid, parts in runs]
+    # 【英語テスト用ブランチ】日本語版は "".join(parts) だった(空白を挟まない)
+    return [(start, sid, " ".join(parts)) for start, sid, parts in runs]
 
 
 def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
