@@ -547,6 +547,26 @@ def run() -> int:
                   not any("文字起こし失敗" in s.text for s in proj_h.segments))
 
         pipeline.transcribe_audio = fake_transcribe
+
+        # --- キャッシュキーに言語が入っているか -----------------------------
+        # 【英語テスト用ブランチ】これが無いと、同じ音声を main(日本語)と
+        # このブランチ(英語)で流したとき、指紋もチャンク長も逐語フラグも
+        # 一致するので、黙ってもう一方の言語の転写が返る。
+        args = dict(with_timestamps=True, with_diarization=True,
+                    verbatim=True, roster="", chunk_seconds=600,
+                    fingerprint="abc123")
+        en = pipeline._cache_suffix(**args)
+        check("キャッシュキーに言語が入る", ".en." in en)
+
+        real_lang = pipeline.PROMPT_LANG
+        try:
+            pipeline.PROMPT_LANG = "ja"
+            ja = pipeline._cache_suffix(**args)
+        finally:
+            pipeline.PROMPT_LANG = real_lang
+        check("日本語と英語で別のキャッシュになる", en != ja)
+        check("日本語のキーは元のまま", ".en." not in ja and ja.startswith(".abc123.c600."))
+
     finally:
         pipeline.transcribe_audio = real_transcribe
         pipeline.genai = real_genai

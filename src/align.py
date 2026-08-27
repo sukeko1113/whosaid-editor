@@ -27,7 +27,12 @@ from .audio import audio_fingerprint
 
 
 # 実装のバージョン。上げると words キャッシュを作り直す。
-ALIGN_VER = 1
+#
+# 【英語テスト用ブランチ】1 → 2。words キャッシュのキーは
+# 指紋 + モデル + このバージョンで、LANGUAGE を含んでいない。上げておかないと、
+# 同じ音声を main(ja)で点検したあとにこのブランチ(en)で点検したとき、
+# 日本語として起こした単語列がそのまま使い回される。
+ALIGN_VER = 2
 
 # 既定は small。base は速いが精度が落ち、medium は CPU では重い(§9)。
 DEFAULT_MODEL = "small"
@@ -37,7 +42,9 @@ AVAILABLE_MODELS = ("base", "small", "medium")
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 
-LANGUAGE = "ja"
+# 【英語テスト用ブランチ】日本語版は "ja"。
+# 変えたら ALIGN_VER も上げること(キャッシュキーに言語が入っていないため)。
+LANGUAGE = "en"
 
 
 class AlignUnavailable(RuntimeError):

@@ -18,6 +18,7 @@ from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
 from .config import APP_VERSION
 from .segments import Project, Segment, Speaker, fmt_hms, parse_roster
 from .transcribe import (
+    PROMPT_LANG,
     DIARIZATION_NOTE,
     ROSTER_NOTE,
     CancelledError,
@@ -82,10 +83,19 @@ def _cache_suffix(
     v2.0.0: チャンク長と音声の指紋も含める。チャンクのファイル名は長さに
     よらず chunk_0000.m4a なので、含めないと別の長さ・別の中身の転写を
     使い回してしまう(音声を編集してもファイル名が同じなら再利用される)。
+
+    【英語テスト用ブランチ】プロンプトの言語も含める。これが無いと、同じ音声を
+    main(日本語プロンプト)と feature/en-test(英語プロンプト)で流したとき、
+    指紋もチャンク長も逐語フラグも一致するので、黙ってもう一方の言語の転写が
+    返ってくる。転写の中身がキーに現れていない、という点で他のキー欠落と
+    同じ事故になる。transcribe.PROMPT_LANG を見るので、あちらを "ja" に
+    戻せばキーも一緒に戻る。
     """
     parts: list[str] = []
     if fingerprint:
         parts.append(fingerprint)
+    if PROMPT_LANG != "ja":
+        parts.append(PROMPT_LANG)
     if chunk_seconds:
         parts.append(f"c{chunk_seconds}")
     if with_diarization:
