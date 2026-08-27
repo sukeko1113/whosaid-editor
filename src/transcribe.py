@@ -96,6 +96,175 @@ _EXAMPLE_TS = """出力例:
 [03:15] 続いて人事についての検討に移ります。"""
 
 
+# ======================================================================
+# 【英語テスト用ブランチ】英語版のプロンプト部品
+#
+# 日本語版は上に元の名前のまま残してある。戻すときは PROMPT_LANG を "ja"
+# にするだけでよい(呼び出し側は _P() 越しに読む)。
+#
+# ルールを英語で書いたのは、few-shot の出力例がどのみち英語になるため。
+# 日本語のルールに英語の例を添えると、モデルに翻訳を促す形になる。
+# ======================================================================
+
+PROMPT_LANG = "en"          # "ja" に戻すと日本語版のプロンプトに戻る
+
+
+_OPENING = "この音声を日本語で書き起こしてください。"
+_OPENING_EN = "Transcribe this audio in English."
+
+
+_RULES_CLEANUP_EN = """- Transcribe the content accurately, word for word, with nothing omitted or altered
+- Remove fillers (um, uh, er, you know, like, I mean) where appropriate
+- Tidy false starts and unnecessary repetition into readable English
+- Keep the speaker's intent, proper nouns and numbers exact
+- Write [unclear] where you could not make out the audio"""
+
+
+_RULES_VERBATIM_EN = """【VERBATIM RULES - HIGHEST PRIORITY】
+- Transcribe exactly what is said. Never summarise, paraphrase, correct or tidy the speech.
+- Keep every filler and hesitation exactly as spoken: um, uh, er, ah, like, you know,
+  I mean, sort of, kind of, well, so, right, okay.
+- Keep false starts, self-corrections, repetitions and stutters. Write "the- the government",
+  not "the government".
+- **Keep every short response in full, and give it its own line.** Yes / Yeah / No / Nope /
+  Right / Correct / I don't know / I'm not sure / It does not say that / That is not what
+  it says / Could you repeat the question / Point of information - these are answers.
+  Never drop them, never shorten them, never merge them into a neighbouring turn, and
+  never treat them as backchannel noise to be cleaned away.
+- **If a speaker is asked a question and does not answer, write (no response).**
+  If there is a noticeable silence, write (silence). If a speaker is cut off, write
+  (interrupted). Never omit these and never fill in what you think was meant.
+- If you cannot hear something, write (inaudible). Do not guess and do not finish the
+  speaker's sentence for them.
+- Do not add any word that is not in the audio. Do not fix grammar, and do not correct
+  mistakes of fact, even when the speaker is plainly wrong.
+- If a proper noun is unclear, write it as it sounded. Do not substitute the "correct" spelling.
+- Write only what was actually said. Do not repeat a phrase in the output unless it is
+  repeated in the audio."""
+
+
+_RULES_TS_EN = """- **Begin every paragraph with a timestamp in [MM:SS] form**
+  (the time that paragraph starts in the audio, zero-padded to 2 digits, e.g. [00:00], [03:45])
+- Break paragraphs at topic boundaries, clear pauses, or every 30 seconds to 2 minutes"""
+
+
+_RULES_DIAR_EN = """- **Start a new line every time the speaker changes**
+- **Begin every line in exactly this form**:
+  [MM:SS] 【speaker label】 text...
+  (minutes:seconds, zero-padded to 2 digits. No milliseconds or hundredths)
+- A short response from a different voice always gets its own line, never appended to
+  the previous speaker's line"""
+
+
+_LABEL_ABC_EN = """- Identify speaker labels (Speaker A, Speaker B, Speaker C...) by voice, and always use
+  the same label for the same person
+- Use 【unknown】 when you cannot tell who is speaking"""
+
+
+_RULES_CLUSTER_EN = """- **Start a new line only when the person speaking changes**
+- **Begin every line in exactly this form**:
+  [MM:SS] 【A】 text...
+  (minutes:seconds from the start of this audio, zero-padded to 2 digits. No milliseconds)
+- Speaker labels are a single letter A, B, C, ... only. **Never write a name or a role.**
+- Always use the same label for the same voice. If the voice changes, the label must change.
+- **While the same person keeps speaking, never split the line.** Do not break at a breath,
+  a pause, a comma, or a hesitation. However many sentences follow, keep them on one line
+  until the next person starts speaking.
+  (Bad: splitting "our first contention" / "um, the funding plan" / "and the timetable"
+   into 3 lines -> correct is one line: "our first contention, um, the funding plan,
+   and the timetable...")
+- Only when the same person has spoken for more than 3 minutes may you split at a topic break
+- **A short response from a different voice always gets its own line** - Yes, No, Right,
+  I don't know, and any other brief answer. These are the answers in a question-and-answer
+  exchange, so they must appear as their own turn and must never be folded into the
+  previous speaker's line.
+- Use 【?】 when you cannot tell whose voice it is, and 【*】 when several people speak at once"""
+
+
+_EXAMPLE_CLUSTER_EN = """Example output:
+[00:00] 【A】 Thank you Mr Chairperson. We stand in firm affirmation of today's motion. Our first contention is that, um, the current system fails to protect the most vulnerable members of our society.
+[00:25] 【B】 Point of information.
+[00:27] 【A】 No thank you, I'll take one at the end.
+[00:32] 【B】 You said the study supports you. Where does it say that?
+[00:38] 【A】 (silence)
+[00:41] 【A】 I don't know.
+[00:43] 【C】 It does not say that."""
+
+
+_EXAMPLE_DIAR_EN = """Example output:
+[00:00] 【Speaker A】 Thank you Mr Chairperson. We stand in firm affirmation of today's motion.
+[00:25] 【Speaker B】 Point of information. Where does the study say that?
+[00:32] 【Speaker A】 I don't know."""
+
+
+_EXAMPLE_TS_EN = """Example output:
+[00:00] Thank you Mr Chairperson. We stand in firm affirmation of today's motion.
+[00:42] Our first contention concerns the cost of implementation.
+[03:15] I will now move on to the second contention."""
+
+
+_TAIL_EN = ("- Do not add any explanation, preamble or Markdown formatting. "
+            "Output the transcript body only.")
+
+
+_VERBATIM_PUNCT = "- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)"
+_VERBATIM_PUNCT_EN = ("- You may punctuate at the breaks you actually hear "
+                      "(but never change the content)")
+
+
+def _roster_block_en(roster: str) -> str:
+    return f"""The participants in this audio are known in advance. Identify the speaker from the
+voice, and also from what is said (self-introductions, being addressed by name, remarks
+that fit a particular role).
+
+【Participants】
+{roster.strip()}
+
+- Use the name from the list, wrapped in 【】 (e.g. 【Chair (President)】【Ms Sato】)
+- Use 【unknown】 only when you truly cannot tell, and 【multiple speakers】 when voices
+  overlap. Saying "unknown" is better than forcing a guess onto someone from the list"""
+
+
+# 使う部品をここで束ねる。差し替えは PROMPT_LANG の 1 行だけ。
+_PROMPT_SETS: dict[str, dict[str, object]] = {
+    "ja": {
+        "opening": _OPENING,
+        "cleanup": _RULES_CLEANUP,
+        "verbatim": _RULES_VERBATIM,
+        "ts": _RULES_TS,
+        "diar": _RULES_DIAR,
+        "cluster": _RULES_CLUSTER,
+        "label_abc": _LABEL_ABC,
+        "example_cluster": _EXAMPLE_CLUSTER,
+        "example_diar": _EXAMPLE_DIAR,
+        "example_ts": _EXAMPLE_TS,
+        "tail": _TAIL,
+        "verbatim_punct": _VERBATIM_PUNCT,
+        "roster_block": _roster_block,
+    },
+    "en": {
+        "opening": _OPENING_EN,
+        "cleanup": _RULES_CLEANUP_EN,
+        "verbatim": _RULES_VERBATIM_EN,
+        "ts": _RULES_TS_EN,
+        "diar": _RULES_DIAR_EN,
+        "cluster": _RULES_CLUSTER_EN,
+        "label_abc": _LABEL_ABC_EN,
+        "example_cluster": _EXAMPLE_CLUSTER_EN,
+        "example_diar": _EXAMPLE_DIAR_EN,
+        "example_ts": _EXAMPLE_TS_EN,
+        "tail": _TAIL_EN,
+        "verbatim_punct": _VERBATIM_PUNCT_EN,
+        "roster_block": _roster_block_en,
+    },
+}
+
+
+def _P(key: str) -> str:
+    """いま使う言語のプロンプト部品を取り出す。"""
+    return _PROMPT_SETS[PROMPT_LANG][key]      # type: ignore[return-value]
+
+
 def build_prompt(
     with_timestamps: bool,
     with_diarization: bool,
@@ -108,39 +277,40 @@ def build_prompt(
     cluster_only=True のときは v2.0.0 の手動割当モード用。
     名簿を渡さず、声質だけで A/B/C… に切り分けた区間リストを作らせる。
     """
-    parts: list[str] = ["この音声を日本語で書き起こしてください。", ""]
+    heading = "Rules:" if PROMPT_LANG == "en" else "ルール:"
+    parts: list[str] = [_P("opening"), ""]
 
     if cluster_only:
-        parts.append("ルール:")
-        parts.append(_RULES_CLUSTER)
-        parts.append(_RULES_VERBATIM if verbatim else _RULES_CLEANUP)
+        parts.append(heading)
+        parts.append(_P("cluster"))
+        parts.append(_P("verbatim") if verbatim else _P("cleanup"))
         if verbatim:
-            parts.append("- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)")
-        parts.append(_TAIL)
-        parts += ["", _EXAMPLE_CLUSTER]
+            parts.append(_P("verbatim_punct"))
+        parts.append(_P("tail"))
+        parts += ["", _P("example_cluster")]
         return "\n".join(parts)
 
     if with_diarization and roster.strip():
-        parts += [_roster_block(roster), ""]
+        parts += [_PROMPT_SETS[PROMPT_LANG]["roster_block"](roster), ""]   # type: ignore[operator]
 
-    parts.append("ルール:")
+    parts.append(heading)
     if with_diarization:
-        parts.append(_RULES_DIAR)
+        parts.append(_P("diar"))
         if not roster.strip():
-            parts.append(_LABEL_ABC)
+            parts.append(_P("label_abc"))
     elif with_timestamps:
-        parts.append(_RULES_TS)
+        parts.append(_P("ts"))
 
-    parts.append(_RULES_VERBATIM if verbatim else _RULES_CLEANUP)
+    parts.append(_P("verbatim") if verbatim else _P("cleanup"))
     if verbatim:
         # 逐語モードでも段落・句読点の最低限の整形は許可する
-        parts.append("- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)")
-    parts.append(_TAIL)
+        parts.append(_P("verbatim_punct"))
+    parts.append(_P("tail"))
 
     if with_diarization and not roster.strip():
-        parts += ["", _EXAMPLE_DIAR]
+        parts += ["", _P("example_diar")]
     elif with_timestamps and not with_diarization:
-        parts += ["", _EXAMPLE_TS]
+        parts += ["", _P("example_ts")]
 
     return "\n".join(parts)
 

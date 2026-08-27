@@ -455,9 +455,58 @@ def test_time_is_shared_in_proportion_to_text():
 
 
 def test_cluster_prompt_forbids_fragmenting():
+    """【英語テスト用ブランチ】日本語版は「同じ人が話し続けている間は…」を見ていた。"""
     p = build_prompt(True, True, cluster_only=True)
-    assert "同じ人が話し続けている間は、絶対に行を分けない" in p
-    assert "息継ぎ" in p
+    assert "While the same person keeps speaking, never split the line." in p
+    assert "Do not break at a breath" in p
+
+
+def test_verbatim_prompt_protects_short_responses():
+    """短い応答と沈黙を残す指示が逐語ルールに入っていること。
+
+    ディベートでは「答えなかった」「沈黙した」「聞き返した」こと自体が
+    判定材料になる。ここが落ちるとテストの目的が達成できない。
+    """
+    p = build_prompt(True, True, verbatim=True, cluster_only=True)
+    # 短い応答は落とさない・まとめない
+    assert "Keep every short response in full" in p
+    for token in ("Yes", "No", "I don't know", "It does not say that",
+                  "Could you repeat the question"):
+        assert token in p, token
+    assert "never merge them into a neighbouring turn" in p
+    assert "never treat them as backchannel noise" in p
+    # 無回答・沈黙・遮りは明示して残す
+    assert "(no response)" in p
+    assert "(silence)" in p
+    assert "(interrupted)" in p
+    assert "(inaudible)" in p
+    # 別の声の短い応答は独立した行にする(区間が潰れない)
+    assert "A short response from a different voice always gets its own line" in p
+    # 出力例にも沈黙と短い応答が現れている(few-shot で効かせる)
+    assert "【A】 (silence)" in p
+    assert "【A】 I don't know." in p
+
+
+def test_verbatim_prompt_keeps_english_fillers():
+    p = build_prompt(True, True, verbatim=True, cluster_only=True)
+    for filler in ("um", "uh", "you know", "I mean", "like"):
+        assert filler in p, filler
+    assert "Never summarise, paraphrase, correct or tidy" in p
+
+
+def test_prompt_language_can_be_switched_back():
+    """PROMPT_LANG を "ja" に戻せば日本語版の文字列に戻る(1 行で撤退できる)。"""
+    import src.transcribe as tr
+
+    before = tr.PROMPT_LANG
+    try:
+        tr.PROMPT_LANG = "ja"
+        p = build_prompt(True, True, verbatim=True, cluster_only=True)
+        assert "この音声を日本語で書き起こしてください。" in p
+        assert "同じ人が話し続けている間は、絶対に行を分けない" in p
+        assert "Transcribe this audio in English." not in p
+    finally:
+        tr.PROMPT_LANG = before
 
 
 def test_classify_api_error():
@@ -505,7 +554,8 @@ def test_build_prompt_cluster_only_has_no_names():
     p = build_prompt(True, True, roster="佐藤(理事長)", verbatim=False, cluster_only=True)
     assert "佐藤" not in p              # 名簿は渡さない
     assert "【A】" in p
-    assert "名前や役職は絶対に書かない" in p
+    # 【英語テスト用ブランチ】日本語版は「名前や役職は絶対に書かない」
+    assert "Never write a name or a role." in p
 
 
 # ======================================================================
