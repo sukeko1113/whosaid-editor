@@ -138,6 +138,26 @@ def test_normalize_cluster_label():
     assert normalize_cluster_label("") == "?"
 
 
+def test_normalize_cluster_label_english_pseudo_labels():
+    """【英語テスト用ブランチ】英語の擬似ラベルが記号に落ちること。
+
+    足さないと 【Multiple】 が「先頭の英字 1 文字」に落ちて クラスタ "M" と
+    いう実在しない話者が立ち、merge_consecutive がその連続を 1 人の発言として
+    連結してしまう。気づきにくい壊れ方なのでここで固定する。
+    """
+    for label in ("Multiple", "multiple speakers", "Several voices",
+                  "Overlapping", "overlap", "Crosstalk", "cross talk",
+                  "Simultaneous"):
+        assert normalize_cluster_label(label) == "*", label
+    for label in ("Unknown", "unclear", "Unidentified", "inaudible",
+                  "not sure", "cannot tell"):
+        assert normalize_cluster_label(label) == "?", label
+    # 本物の 1 文字ラベルは巻き添えにしない
+    for label, want in (("A", "A"), ("Speaker M", "M"), ("C (male)", "C"),
+                        ("Speaker O", "O"), ("u", "U")):
+        assert normalize_cluster_label(label) == want, label
+
+
 # ======================================================================
 # セグメント分解
 # ======================================================================

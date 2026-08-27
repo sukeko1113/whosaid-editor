@@ -627,6 +627,18 @@ CLUSTER_UNKNOWN = "?"
 CLUSTER_MULTI = "*"
 
 
+# 【英語テスト用ブランチ】英語の擬似ラベル。
+#
+# これを足さないと 【Multiple】【Overlapping】【Crosstalk】 が下の
+# 「先頭の英字 1 文字を採用」に落ち、クラスタ "M" / "O" / "C" という
+# 実在しない話者が立つ。しかも merge_consecutive がその連続を「同じ人が
+# 話し続けている」とみなして 1 発言に連結してしまう。
+_MULTI_WORDS_EN = ("multiple", "several", "overlap", "crosstalk",
+                   "cross talk", "simultaneous", "both speak", "everyone")
+_UNKNOWN_WORDS_EN = ("unknown", "unclear", "unidentified", "inaudible",
+                     "not sure", "cannot tell", "can't tell", "unsure")
+
+
 def normalize_cluster_label(label: str | None) -> str:
     """Gemini が返した話者ラベルを 1〜3 文字のクラスタ記号に正規化する。"""
     if not label:
@@ -634,9 +646,14 @@ def normalize_cluster_label(label: str | None) -> str:
     s = _LABEL_STRIP.sub("", label.strip())
     if not s:
         return CLUSTER_UNKNOWN
-    if any(k in s for k in ("複数", "重複", "同時")) or s in ("*", "＊"):
+    low = s.lower()
+    if (any(k in s for k in ("複数", "重複", "同時"))
+            or any(k in low for k in _MULTI_WORDS_EN)
+            or s in ("*", "＊")):
         return CLUSTER_MULTI
-    if any(k in s for k in ("不明", "不詳", "unknown")) or s in ("?", "？"):
+    if (any(k in s for k in ("不明", "不詳"))
+            or any(k in low for k in _UNKNOWN_WORDS_EN)
+            or s in ("?", "？")):
         return CLUSTER_UNKNOWN
     # 先頭の英字 1 文字を採用(「A」「A(男性)」「A さん」など)
     m = re.match(r"[A-Za-z]", s)
