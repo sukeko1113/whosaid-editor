@@ -489,8 +489,14 @@ def run_segment_pipeline(
     # キャッシュ名には「音声の指紋」と「チャンク長」を含める。
     #   - 指紋が無いと、音声を編集してもファイル名が同じなら古い転写を再利用する
     #   - チャンク長が無いと、分割サイズを変えたとき音声とテキストがずれる
+    #
+    # 【英語テスト用ブランチ】プロンプトの言語も含める。ここは _cache_suffix()
+    # とは別に自前で組み立てているので、あちらだけ直しても効かない
+    # (実際にこの取りこぼしを踏んだ。転写 3 チャンクぶんが言語を含まない鍵で
+    #  保存され、main で同じ音声を流せば英語の転写が返るところだった)。
     cache_suffix = (
         f".cluster{'.' + fingerprint if fingerprint else ''}"
+        f"{'.' + PROMPT_LANG if PROMPT_LANG != 'ja' else ''}"
         f".c{chunk_seconds}{'.vb' if verbatim else ''}.txt"
     )
 

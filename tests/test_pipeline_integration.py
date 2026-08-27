@@ -159,6 +159,21 @@ def run() -> int:
                   Path(proj.json_path or "").exists()
                   and Path(proj.json_path or "").name == "meeting.speakers.json")
 
+            # --- キャッシュ名に言語が入っているか(実際に書かれたファイルで見る) ---
+            # 【英語テスト用ブランチ】run_segment_pipeline は _cache_suffix() を
+            # 使わず自前でサフィックスを組み立てている。関数だけ直しても実際の
+            # 経路には効かず、一度この取りこぼしを踏んだ(英語の転写が言語を
+            # 含まない鍵で保存され、main で同じ音声を流せば再利用される状態)。
+            # 関数ではなく、書き出されたファイル名を見る。
+            cached = sorted((tmp / ".work_meeting" / "transcripts").glob("*.txt"))
+            check("キャッシュが書き出されている", len(cached) == 3)
+            # cached が空だと all() が空真になり、下 2 つが素通りする。
+            # 検査しているつもりで何も見ていない状態を作らないよう明示的に弾く。
+            check("キャッシュ名に言語が入る",
+                  bool(cached) and all(".en." in f.name for f in cached))
+            check("キャッシュ名に指紋とチャンク長も入る",
+                  bool(cached) and all(".c60." in f.name for f in cached))
+
             # --- 割当してから再実行 → 引き継がれること -------------------
             sid = proj.speakers[0].id
             for seg in proj.segments[:5]:
