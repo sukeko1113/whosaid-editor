@@ -583,29 +583,35 @@ def run() -> int:
         def fake_words(indexes, shift=0.0):
             """その区間を実際に喋った、という単語列を作る。
 
-            発話速度は実測に寄せて約 6.7 字/秒にする。区間の長さで按分すると
-            0.9 字/秒という不自然な遅さになり、密度フィルタに正しく弾かれて
-            しまう(それはそれで正しい挙動)。
+            発話速度は実測に寄せる。区間の長さで按分すると不自然な遅さに
+            なり、密度フィルタに正しく弾かれてしまう(それはそれで正しい挙動)。
+
+            【英語テスト用ブランチ】0.15 秒/字(約 6.7 字/秒)は日本語の速さ。
+            英語は空白込みで約 11 字/秒なので 0.09 秒/字にする。これを直さないと
+            MIN_DENSITY = 4.0 の手前で全部弾かれ、提案が 1 件も出なくなる。
             """
             out = []
             for i in indexes:
                 seg = proj.segments[i]
                 text = seg.text.replace("。", "")
                 for n, ch in enumerate(text):
-                    at = seg.start + shift + n * 0.15
-                    out.append(AlignWord(text=ch, start=at, end=at + 0.15))
+                    at = seg.start + shift + n * 0.09
+                    out.append(AlignWord(text=ch, start=at, end=at + 0.09))
             return out
 
         # この見本は全区間が「これは N 番目の発言です。」でほぼ同じ本文なので、
         # どの区間の単語列にも当たってしまう(実際の会議録では起きない形)。
         # 点検を試す区間だけ、それらしく別々の本文にする。
+        # 【英語テスト用ブランチ】日本語の見本では 1 発言 17〜26 字だったが、
+        # 英語では MIN_MATCHED = 22(正規化後の文字数)に届かず短すぎる。
+        # 実際のディベート音声に近い長さの英語に置き換える。
         spoken = [
-            "本日はお忙しい中お集まりいただきありがとうございます",
-            "それでは第一号議案について事務局から説明をお願いします",
-            "お手元の資料の三ページをご覧ください",
-            "前回の会議で出された意見を踏まえて修正しております",
-            "この点について何かご質問はございますでしょうか",
-            "特にないようですので次の議題に進みます",
+            "thank you mister chairperson and good afternoon to everyone",
+            "our first contention is that the current system fails",
+            "please look at the third page of the handout in front of you",
+            "we have revised it in light of the comments from last time",
+            "does the opposition have any questions about this point",
+            "there being none we will move on to the second contention",
         ]
         kept_text = [proj.segments[i].text for i in range(10, 16)]
         for i, text in zip(range(10, 16), spoken):

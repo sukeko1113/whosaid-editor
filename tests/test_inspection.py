@@ -36,10 +36,21 @@ from src.inspection import (                              # noqa: E402
 from src.segments import MIN_SEGMENT_SECONDS, Project, Segment    # noqa: E402
 
 
-SPOKEN = ["おはようございます", "きょうはさむいですね", "そうですねまったく"]
+# 【英語テスト用ブランチ】共有フィクスチャを英語にしてある。
+#
+# 日本語版は 9〜10 文字の発言を 0.5 秒/文字(2 文字/秒)で喋らせていた。
+# 英語の既定値では、この組み合わせは 2 重に通らない:
+#   - MIN_BLOCK = 10 / MIN_MATCHED = 22 に対して発言が短すぎる
+#   - MIN_DENSITY = 4.0 に対して 2 文字/秒は遅すぎる(散らばり扱いになる)
+# 閾値を緩めて通すのではなく、英語として現実的な発言長と話速に置き換える。
+# 1 発言 37 文字・0.125 秒/文字(8 文字/秒)で、日本語版と同じ 4.6 秒前後に
+# なるよう合わせてあるので、区間の配置(0 / 6 / 12 秒)は変えていない。
+SPOKEN = ["thank you mister chairperson for that",
+          "our first contention is about funding",
+          "yes that is exactly what we argued so"]
 
 
-def evenly(text: str, start: float, per_char: float = 0.5) -> list[Word]:
+def evenly(text: str, start: float, per_char: float = 0.125) -> list[Word]:
     return [Word(text=ch, start=start + i * per_char,
                  end=start + (i + 1) * per_char)
             for i, ch in enumerate(text)]
@@ -145,10 +156,14 @@ def test_full_match_on_short_text_is_not_trusted():
     実会議の聴き取りで完全に外れた 2 件は、どちらも一致 3 文字だった。
     3 文字の本文が 3 文字一致すれば被覆率は 100% になる。被覆率では防げない。
     """
+    # 【英語テスト用ブランチ】日本語版は「はいそうです」(6 字)を使い
+    # MIN_MATCHED = 8 に対して短すぎることを見ていた。英語では
+    # MIN_BLOCK = 10 を超えつつ MIN_MATCHED = 22 を下回る長さで同じ性質を見る。
+    text = "yes it does say so"        # 正規化 14 字(10 <= 14 < 22)
     proj = Project(audio_path="a.m4a", duration=60.0)
     proj.segments = [Segment(index=0, start=6.8, end=9.8,
-                             text="はいそうです", cluster="0:A")]
-    got = inspect_times(proj, evenly("はいそうです", 0.0))
+                             text=text, cluster="0:A")]
+    got = inspect_times(proj, evenly(text, 0.0))
     assert got.proposals == []
     assert got.short_match == 1
 
@@ -173,10 +188,13 @@ def test_unheard_tail_keeps_current_duration():
     終了は「最後に一致した文字」から取るので、末尾が欠けると手前に出て
     発言の途中で切れる(聴き取りで確認: 欠け 3 字以上は終了が外れる)。
     """
-    heard = "あきのてんきはとてもすごしやすい"       # 16 字は実測にある
+    # 【英語テスト用ブランチ】尻欠けを TAIL_GAP_LIMIT = 8 以上にしてある
+    # (日本語版は 4 字欠けで上限 3 を超えていた)
+    heard = "the autumn weather is really very pleasant"    # 正規化 36 字
     proj = Project(audio_path="a.m4a", duration=60.0)
     proj.segments = [Segment(index=0, start=6.8, end=16.8,
-                             text=heard + "ですよね", cluster="0:A")]
+                             text=heard + " do you not think",   # 尻欠け 13 字
+                             cluster="0:A")]
     got = inspect_times(proj, evenly(heard, 0.0))
     assert len(got.proposals) == 1
     p = got.proposals[0]
@@ -221,14 +239,15 @@ def test_conflict_drop_is_counted():
     同じ場所まで戻れてしまい、同じ音声を 2 区間が取り合う。早口の挨拶
     (1 秒未満)が該当する。実測でも 3 区間が全く同じ時刻に当たった。
     """
-    heard = "よろしくおねがいいたします"
+    heard = "we look forward to working with you"       # 正規化 29 字
     proj = Project(audio_path="a.m4a", duration=60.0)
     proj.segments = [
         Segment(index=0, start=27.0, end=28.0, text=heard, cluster="0:A"),
         Segment(index=1, start=45.0, end=46.0, text=heard, cluster="0:B"),
     ]
-    # 実測には 30.0 秒に 1 回だけ、0.8 秒で早口に言った挨拶がある
-    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.06))
+    # 実測には 30.0 秒に 1 回だけ、0.875 秒で早口に言った挨拶がある
+    # (一致した範囲が掃引の戻り幅 1 秒より短い、という条件はそのまま)
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.025))
     assert got.proposals == []
     assert got.conflicted == 2
 
@@ -239,17 +258,17 @@ def test_unheard_head_is_compensated():
     開始は「最初に一致した文字」から取るので、頭が聞き取られていないと
     その分だけ遅く出る(聴き取り 2 回目: 換算 5.3 秒 ≒ 人の判定「約 5 秒」)。
     """
-    heard = "きょうのてんきはとてもすごしやすいですね"     # 20 字が実測にある
+    heard = "the weather today is really very pleasant"   # 正規化 35 字
     proj = Project(audio_path="a.m4a", duration=120.0)
-    # 頭の 6 字(えーとあのー相当)は聞き取られていない
+    # 頭のフィラー "um well er "(正規化 8 字)は聞き取られていない
     proj.segments = [Segment(index=0, start=40.0, end=50.0,
-                             text="えーとあのー" + heard, cluster="0:A")]
-    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.2))    # 5 字/秒
+                             text="um well er " + heard, cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.1))    # 約 8.8 字/秒
     assert len(got.proposals) == 1
     p = got.proposals[0]
-    # 30.0 − 換算 1.2 秒 − 余白 0.3 秒 = 28.5
-    assert abs(p.payload["start"] - 28.5) < 0.05
-    assert "頭の欠け 6 字を 1.2 秒手前に補正" in p.evidence
+    # 30.0 − 換算 0.9 秒 − 余白 0.3 秒 = 28.76
+    assert abs(p.payload["start"] - 28.76) < 0.05
+    assert "頭の欠け 8 字を 0.9 秒手前に補正" in p.evidence
 
 
 def test_hopeless_head_is_not_proposed():
@@ -257,12 +276,17 @@ def test_hopeless_head_is_not_proposed():
 
     補正が実測より大きくなったら、それはもう推定であって実測ではない。
     """
-    heard = "きょうのてんきはとてもすごしやすいですねこのごろは"
-    proj = Project(audio_path="a.m4a", duration=120.0)
-    # 頭の 13 字が聞き取られていない(換算 6.5 秒 > 上限 6 秒)
-    proj.segments = [Segment(index=0, start=40.0, end=55.0,
-                             text="あ" * 13 + heard, cluster="0:A")]
-    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.5))    # 2 字/秒
+    # 【英語テスト用ブランチ】密度の検査(MIN_DENSITY = 4.0)が先に来るので、
+    # 実測は英語として現実的な速さに保ちつつ欠けを大きくする必要がある。
+    # 正規化 69 字を 12 秒(5.75 字/秒)で喋らせ、頭を 38 字欠けさせる。
+    #   換算 38 / 5.75 = 6.6 秒 > 上限 6 秒
+    #   被覆 69 / 107 = 0.65 >= MIN_COVERAGE 0.60(被覆では弾かれない)
+    heard = ("the weather today is really very pleasant and quite mild "
+             "for this time of the season")
+    proj = Project(audio_path="a.m4a", duration=200.0)
+    proj.segments = [Segment(index=0, start=40.0, end=70.0,
+                             text="a" * 38 + heard, cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=12.0 / len(heard)))
     assert got.proposals == []
     assert got.head_lost == 1
 
@@ -273,14 +297,12 @@ def test_scattered_match_is_not_proposed():
     本文が発話と食い違っていると、あちこちの数文字がまばらに当たって
     「一致」に見える(聴き取り 2 回目: 内容違いの区間は 0.8 字/秒だった)。
     """
-    text = "はいそれではじかいのかいごう"
-    proj = Project(audio_path="a.m4a", duration=120.0)
+    text = "yes and then the next meeting will be held"     # 正規化 34 字
+    proj = Project(audio_path="a.m4a", duration=200.0)
     proj.segments = [Segment(index=0, start=20.0, end=36.0,
                              text=text, cluster="0:A")]
-    # 本文の文字が 2 秒おきにまばらに現れる(密度 0.5 字/秒)
-    ws = [Word(text=ch, start=30.0 + i * 2.0, end=30.2 + i * 2.0)
-          for i, ch in enumerate(text)]
-    got = inspect_times(proj, ws)
+    # 本文の文字が 20 秒に引き伸ばして現れる(密度 1.7 字/秒 < MIN_DENSITY 4.0)
+    got = inspect_times(proj, evenly(text, 30.0, per_char=20.0 / len(text)))
     assert got.proposals == []
     assert got.scattered == 1
 
@@ -291,16 +313,17 @@ def test_stretched_match_is_not_proposed():
     照合が遠くまで届きすぎている印で、区間の外の沈黙や別の発言まで
     抱き込んでいる(実測: 保存 4.7 秒の区間が 25.7 秒に伸びた例)。
     """
-    heard = "きょうのてんきはとてもすごしやすいですね"
+    heard = "the weather today is really very pleasant"      # 正規化 35 字
     proj = Project(audio_path="a.m4a", duration=200.0)
-    # 区間は 5 秒ぶんのつもりだが、実測は 20 秒に散らばっている
-    proj.segments = [Segment(index=0, start=40.0, end=45.0,
+    # 区間は 4 秒ぶんのつもりだが、実測は 8 秒に広がっている
+    #   4.0 * STRETCH_RATIO 1.5 + 1.0 = 7.0 < 8.0
+    # 密度は 35 / 8 = 4.4 字/秒 で MIN_DENSITY を超えるので、散らばりでは
+    # なく伸びすぎとして弾かれることを見ている
+    proj.segments = [Segment(index=0, start=40.0, end=44.0,
                              text=heard, cluster="0:A")]
-    ws = [Word(text=ch, start=30.0 + i, end=30.5 + i)
-          for i, ch in enumerate(heard)]        # 1 字 1 秒 = 20 秒ぶん
-    got = inspect_times(proj, ws)
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=8.0 / len(heard)))
     assert got.proposals == []
-    assert got.stretched + got.scattered == 1
+    assert got.stretched == 1
 
 
 def test_long_segment_may_stretch_a_little():
@@ -334,16 +357,16 @@ def test_small_tail_gap_extends_the_end():
     実測の終了は「最後に一致した文字」までしか届かないので、欠けた分を
     発話速度で換算して足す。
     """
-    heard = "きょうのてんきはとてもすごしやすい"     # 17 字は実測にある
+    heard = "the weather today is very pleasant"       # 正規化 29 字
     proj = Project(audio_path="a.m4a", duration=120.0)
-    # 末尾の「よね」2 字は聞き取られていない(尻欠け 2 < 上限 3)
+    # 末尾の " okay"(正規化 4 字)は聞き取られていない(尻欠け 4 < 上限 8)
     proj.segments = [Segment(index=0, start=40.0, end=44.0,
-                             text=heard + "よね", cluster="0:A")]
-    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.2))    # 5 字/秒
+                             text=heard + " okay", cluster="0:A")]
+    got = inspect_times(proj, evenly(heard, 30.0, per_char=0.1))   # 約 8.5 字/秒
     assert len(got.proposals) == 1
     p = got.proposals[0]
-    # 実測終了 33.4 + 換算 0.4 秒 + 余白 0.2 秒 = 34.0
-    assert abs(p.payload["end"] - 34.0) < 0.05
+    # 実測終了 33.4 + 換算 0.47 秒 + 余白 0.2 秒 = 34.07
+    assert abs(p.payload["end"] - 34.07) < 0.05
     assert "終わりは測れず" not in p.evidence
 
 

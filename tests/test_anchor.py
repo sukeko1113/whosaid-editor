@@ -30,6 +30,12 @@ from src.anchor import (                                        # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "words_sapi_sample.json"
 
+# 【英語テスト用ブランチ】anchor.MIN_BLOCK の既定は英語向けに 10 へ上げた。
+# 以下の日本語フィクスチャは「照合アルゴリズムそのもの」を見るためのもので、
+# 閾値の値とは無関係。当時の値を呼び出し側に明示して意味を保つ
+# (閾値を緩めて通しているのではなく、日本語の検査には日本語の閾値を渡している)。
+JA_MIN_BLOCK = 3
+
 
 def words(*specs: tuple[str, float, float]) -> list[Word]:
     return [Word(text=t, start=s, end=e) for t, s, e in specs]
@@ -128,15 +134,17 @@ def test_measure_exact_match():
 def test_measure_ignores_punctuation_difference():
     """本文の句読点の打ち方は両者で揃わない。落としてから比べる。"""
     track = prepare(words(("はい、そうですね。", 5.0, 8.0)))
-    got = measure("はいそうですね", track, 0.0, 100.0)
+    got = measure("はいそうですね", track, 0.0, 100.0, min_block=JA_MIN_BLOCK)
     assert got is not None and got.coverage == 1.0
 
 
 def test_measure_short_coincidence_is_not_an_anchor():
     """日本語は 1〜2 文字の一致が偶然でも起きる。3 文字未満は拾わない。"""
     track = prepare(evenly("かきくけこさしすせそ", 0.0, 0.5))
-    assert measure("かき", track, 0.0, 100.0) is None       # 2 文字だけ一致
-    assert measure("かきく", track, 0.0, 100.0) is not None  # 3 文字なら拾う
+    assert measure("かき", track, 0.0, 100.0,
+                   min_block=JA_MIN_BLOCK) is None          # 2 文字だけ一致
+    assert measure("かきく", track, 0.0, 100.0,
+                   min_block=JA_MIN_BLOCK) is not None       # 3 文字なら拾う
 
 
 def test_measure_reports_partial_coverage():
@@ -185,7 +193,7 @@ def _three_segments() -> tuple[list[tuple[str, float, float]], list[Word]]:
 
 def test_measure_segments_matches_each_span():
     spans, ws = _three_segments()
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert all(g is not None for g in got)
     assert got[0].start == 0.0
     assert abs(got[1].start - 6.0) < 1e-9
@@ -197,7 +205,7 @@ def test_measure_segments_finds_drifted_times():
     """本文の時刻が数秒ずれていても、窓の中なら見つかる(これが目的)。"""
     spans, ws = _three_segments()
     drifted = [(t, s + 6.8, e + 6.8) for t, s, e in spans]
-    got = measure_segments(drifted, ws)
+    got = measure_segments(drifted, ws, min_block=JA_MIN_BLOCK)
     assert all(g is not None for g in got)
     assert abs(got[1].start - 6.0) < 1e-9      # 実測の位置に戻る
 
@@ -222,7 +230,7 @@ def test_measure_segments_does_not_go_backwards():
     spans = [(phrase, 0.0, 4.5),
              ("べつのはなしです", 10.0, 14.0),
              (phrase, 20.0, 24.5)]
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert got[0] is not None and got[2] is not None
     assert got[0].start < got[2].start
     assert abs(got[2].start - 20.0) < 1e-9     # 後ろの方に当たる
@@ -239,7 +247,7 @@ def test_measure_segments_prefers_the_near_occurrence():
     ws = evenly(phrase, 0.0, 0.5) + evenly("あいだのはつげんです", 8.0, 0.5) \
         + evenly(phrase, 20.0, 0.5)
     # 20 秒側の発言。窓を広く取ると 0 秒側にも届く
-    got = measure_segments([(phrase, 20.0, 24.5)], ws)
+    got = measure_segments([(phrase, 20.0, 24.5)], ws, min_block=JA_MIN_BLOCK)
     assert got[0] is not None
     assert abs(got[0].start - 20.0) < 1e-9
 
@@ -274,7 +282,7 @@ def test_measure_segments_flags_a_lucky_short_match():
     """
     spans, ws = _three_segments()       # 3 つ目に「まったく」が含まれる
     spans.insert(1, ("まったくちがうはつげんです", 4.6, 5.9))
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert got[1] is not None and got[1].matched == 4
     assert got[1].coverage < 0.4        # 13 文字中 4 文字しか乗っていない
 
@@ -288,7 +296,7 @@ def test_a_lucky_short_match_does_not_block_the_rest():
     spans, ws = _three_segments()
     # この区間は 3 つ目の「まったく」に当たる(実測ではずっと後ろ)
     spans.insert(1, ("まったくちがうはつげんです", 4.6, 5.9))
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert got[2] is not None and got[3] is not None, "後ろの区間が巻き添えになった"
     assert abs(got[2].start - 6.0) < 1e-9
     assert abs(got[3].start - 12.0) < 1e-9
@@ -314,7 +322,7 @@ def test_real_words_from_whisper():
         ("それでは第一号議案について事務局から説明をお願いします。", 4.5, 9.5),
         ("はい。お手元の資料の三ページをご覧ください。", 10.0, 14.0),
     ]
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert all(g is not None for g in got), "実物で照合できない区間がある"
     # 表記ゆれがあっても 6 割は乗る(MIN_COVERAGE の初期値が 0.60)
     assert all(g.coverage >= 0.6 for g in got), [g.coverage for g in got]
@@ -334,9 +342,90 @@ def test_real_words_survive_drifted_input():
         ("本日はお忙しい中お集まりいただきありがとうございます。", 6.8, 10.3),
         ("それでは第一号議案について事務局から説明をお願いします。", 11.3, 16.3),
     ]
-    got = measure_segments(spans, ws)
+    got = measure_segments(spans, ws, min_block=JA_MIN_BLOCK)
     assert all(g is not None for g in got)
     assert got[0].start < 0.3           # ずれた入力でも実測の位置に戻る
+
+
+# ======================================================================
+# 【英語テスト用ブランチ】英語の既定値(MIN_BLOCK = 10)を押さえる
+#
+# 照合器が見るのは normalize() 後の**空白を落とした**文字列で、これは
+# 両側に掛かる(anchor 側も align 側も w.word.strip() で空白を捨てている)。
+# つまり英語も 1 本の文字列として衝突するので、日本語より偶然一致が長い。
+# ======================================================================
+
+def en_words(text: str, start: float, per_char: float = 0.09) -> list[Word]:
+    """英語を 1 文字ずつ喋った単語列にする(約 11 字/秒 = 実際の話速)。"""
+    return [Word(text=ch, start=start + i * per_char,
+                 end=start + (i + 1) * per_char)
+            for i, ch in enumerate(text)]
+
+
+def test_en_short_coincidence_is_not_an_anchor():
+    """英語は 3 文字の一致が偶然でも頻発する。既定の 10 文字未満は拾わない。"""
+    track = prepare(en_words("the government should adopt this policy", 0.0))
+    # "the" は 3 文字。無関係な区間でも当たってしまうので拾わない
+    assert measure("the", track, 0.0, 100.0) is None
+    assert measure("and", track, 0.0, 100.0) is None
+    # 9 文字でもまだ拾わない(実測の偶然一致の中央値〜p95 の帯)
+    assert measure("governmen", track, 0.0, 100.0) is None
+    # 10 文字で初めてアンカーになる
+    assert measure("government", track, 0.0, 100.0) is not None
+
+
+def test_en_unrelated_text_does_not_anchor():
+    """無関係な英語どうしは、既定値なら当たらない。
+
+    MIN_BLOCK = 3 のままだと the / and / for が当たり、measure() が
+    blocks[0] と blocks[-1] から時刻を取るため区間の境界がそこへ動く。
+    """
+    spoken = ("ladies and gentlemen the negative team believes "
+              "the proposal is unworkable")
+    track = prepare(en_words(spoken, 0.0))
+    unrelated = "we would ask the affirmative to explain how they finance this"
+    assert measure(unrelated, track, 0.0, 100.0) is None
+    # 当時の日本語向けの値では、偶然の一致を拾ってしまう
+    assert measure(unrelated, track, 0.0, 100.0, min_block=JA_MIN_BLOCK) is not None
+
+
+def test_en_genuine_match_still_lands():
+    """本物の一致は既定値でもちゃんと乗る(閾値を上げすぎていない)。"""
+    spoken = "our first contention is that the current system fails to protect"
+    track = prepare(en_words(spoken, 5.0))
+    got = measure(spoken, track, 0.0, 100.0)
+    assert got is not None
+    assert got.coverage == 1.0
+    assert abs(got.start - 5.0) < 1e-9
+
+
+def test_en_short_response_is_unmatched_not_deleted():
+    """短い応答は「照合不能」になる。これは意図した挙動。
+
+    "Yes" は正規化して 3 文字で閾値を下回り、measure() は None を返す。
+    本文には一切触れない(呼び出し側は unmatched として数えるだけ)。
+    日本語の「はい」= 2 文字も MIN_BLOCK = 3 の下で同じだった。
+
+    短い区間だけ閾値を下げる仕掛けは入れていない。入れると "Yes" が
+    30 秒の窓の中のどの yes にも当たり、自信を持って間違った時刻を出す。
+    """
+    spoken = ("does the study say that yes it does and we have shown "
+              "you the page reference already")
+    track = prepare(en_words(spoken, 0.0))
+    for short in ("Yes", "No", "Yes.", "No."):
+        assert measure(short, track, 0.0, 100.0) is None, short
+
+
+def test_en_measure_segments_finds_drifted_times():
+    """英語でも、時刻がずれた区間が実測の位置に戻る(点検の目的そのもの)。"""
+    a = "thank you mister chairperson we stand in firm affirmation"
+    b = "point of information about the implementation cost"
+    ws = en_words(a, 0.0) + en_words(b, 10.0)
+    spans = [(a, 6.8, 12.0), (b, 16.8, 22.0)]       # 6.8 秒ドリフト
+    got = measure_segments(spans, ws)
+    assert all(g is not None for g in got)
+    assert abs(got[0].start - 0.0) < 1e-6
+    assert abs(got[1].start - 10.0) < 1e-6
 
 
 # ======================================================================
