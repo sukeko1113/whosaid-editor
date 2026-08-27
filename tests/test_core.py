@@ -328,14 +328,31 @@ def test_merge_keeps_absolute_times_with_offset():
 # ======================================================================
 
 def test_estimate_speech_seconds():
-    from src.transcribe import MIN_SEGMENT_SECONDS, estimate_speech_seconds
+    """【英語テスト用ブランチ】絶対値は英語で押さえ、性質は定数への相対で見る。
+
+    日本語版は 34 字の行に 6.0〜12.0 秒(4.5 字/秒)を期待していた。
+    """
+    from src.transcribe import (
+        MIN_SEGMENT_SECONDS,
+        SPEECH_CHARS_PER_SECOND,
+        estimate_speech_seconds,
+    )
 
     assert estimate_speech_seconds("") == MIN_SEGMENT_SECONDS
-    assert estimate_speech_seconds("うん。") == MIN_SEGMENT_SECONDS   # 短い相づちは下限
-    long_line = "彼が要するに院外理事で、あの、理事で、あとはみんな学園の教授の方とか。"
-    assert 6.0 < estimate_speech_seconds(long_line) < 12.0
-    # 長さに比例する
-    assert estimate_speech_seconds("あ" * 100) > estimate_speech_seconds("あ" * 50)
+    # 短い応答は下限に張り付く。ここが消えないことがテストの目的そのもの
+    assert estimate_speech_seconds("Yes.") == MIN_SEGMENT_SECONDS
+    assert estimate_speech_seconds("No.") == MIN_SEGMENT_SECONDS
+    # 13 字なので下限をわずかに超える(1.18 秒)。切られない長さであればよい
+    assert MIN_SEGMENT_SECONDS <= estimate_speech_seconds("I don't know.") < 1.5
+
+    # 英語 1 文の実寸。約 132 wpm を想定している
+    line = "The opposition has not addressed the central question of implementation cost."
+    assert len(line) == 77
+    assert 6.5 < estimate_speech_seconds(line) < 7.5        # 77 / 11.0 = 7.0
+
+    # 定数を動かしても意味が変わらない性質
+    assert estimate_speech_seconds("a" * 110) == 110 / SPEECH_CHARS_PER_SECOND
+    assert estimate_speech_seconds("a" * 100) > estimate_speech_seconds("a" * 50)
 
 
 def test_overlapping_backchannel_does_not_truncate():
@@ -343,14 +360,17 @@ def test_overlapping_backchannel_does_not_truncate():
 
     実機で確認された事例: 37文字の発言の再生窓が 1 秒になり、
     再生すると「彼」だけ聞こえて切れた。
+
+    【英語テスト用ブランチ】fixture を同じ構造の英語に置き換えてある
+    (79 文字 / 11.0 = 7.2 秒。次の開始 07:04 で 1 秒に潰されないこと)。
     """
-    text = """[07:02] 【C】 卒業生。
-[07:03] 【A】 彼が要するに院外理事で、あの、理事で、あとはみんな学園の教授の方とか。
-[07:04] 【C】 うん。
-[07:30] 【A】 次の発言。
+    text = """[07:02] 【C】 A graduate.
+[07:03] 【A】 He was an external director, and the rest were all professors from the college.
+[07:04] 【C】 Mm hm.
+[07:30] 【A】 My next point.
 """
     segs = parse_segments(text, chunk_index=5, offset_seconds=2700, chunk_seconds=540)
-    long_seg = next(s for s in segs if "院外理事" in s["text"])
+    long_seg = next(s for s in segs if "external director" in s["text"])
     # 次の開始(07:04)で切られず、本文に見合う長さが確保されている
     assert long_seg["end"] - long_seg["start"] > 6.0, long_seg
     # 後ろに余裕があるので開始は動かない
@@ -365,22 +385,22 @@ def test_no_overlapping_playback_windows():
     実機報告: 51:47 と 51:48、51:50 と 51:51、52:03 と 52:04 で
     同じ音声が流れた。
     """
-    text = """[06:47] 【B】 それができればいいんだけど。
-[06:48] 【A】 理事がもう。
-[06:49] 【B】 はい。
-[06:50] 【A】 ま、梅田さんとあともう1人の県議以外は全部内部理事。
-[06:51] 【C】 うん。
-[06:56] 【B】 県議で。
-[06:57] 【A】 はい。
+    text = """[06:47] 【B】 I think that would be fine.
+[06:48] 【A】 The evidence already says so.
+[06:49] 【B】 Yes.
+[06:50] 【A】 Well, apart from the first study and one other survey, they all support us.
+[06:51] 【C】 Mm hm.
+[06:56] 【B】 In the second contention.
+[06:57] 【A】 Yes.
 """
     segs = parse_segments(text, chunk_index=5, offset_seconds=2700, chunk_seconds=540)
     for a, b in zip(segs, segs[1:]):
         assert b["start"] >= a["end"] - 0.01, (a["text"], b["text"], a["end"], b["start"])
-    # 詰まった範囲でも、長い発言には短い相づちより多くの時間が割り当てられる
+    # 詰まった範囲でも、長い発言には短い応答より多くの時間が割り当てられる
     # (最後の区間はチャンク末尾まで伸びるので比較から外す)
-    long_seg = next(s for s in segs if "梅田" in s["text"])
-    short = [s for s in segs[:-1] if s["text"].strip() in ("はい。", "うん。")]
-    assert short, "比較対象の相づちが無い"
+    long_seg = next(s for s in segs if "apart from" in s["text"])
+    short = [s for s in segs[:-1] if s["text"].strip() in ("Yes.", "Mm hm.")]
+    assert short, "比較対象の短い応答が無い"
     assert all(long_seg["end"] - long_seg["start"] > s["end"] - s["start"] for s in short)
     assert long_seg["end"] - long_seg["start"] > 3.0
 
