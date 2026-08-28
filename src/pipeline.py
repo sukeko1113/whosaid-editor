@@ -185,6 +185,35 @@ def _unique_path(base: Path) -> Path:
 VERBATIM_PROMPT_VER = 2
 
 
+# ======================================================================
+# クラウド転写のキャッシュキー
+#
+# **組み立てはこの 1 箇所だけ。**同じ事故を 4 回起こしている:
+#   v2.0.1  ファイル名しか見ておらず、中身を変えた音声で古い転写を使った
+#   8-14    モデルフォルダを差し替えても同じ鍵だった
+#   8-27    言語を変えても同じ鍵だった(関数は直したが実経路が別実装だった)
+#   8-28    モデル名と逐語プロンプトの版が、実経路の鍵に入っていなかった
+#
+# 4 回とも「鍵に入れるべき要素を入れ忘れた」形。**規約では止まらない**ので、
+# tests/test_cache_key.py で機械的に縛る:
+#   - EngineSpec に項目を足したら、鍵に入れるか除外するかを分類するまで落ちる
+#   - 鍵の要素を変えたら、**実際に書き出されるファイル名**が変わる
+#   - パイプラインが書いた名前が、この関数の出力と一致する
+#
+# **EngineSpec の項目のうち鍵に入れるもの。**足したときは KEYED か
+# NOT_KEYED のどちらかに入れること(入れないと検査が落ちる)。
+CACHE_KEY_ENGINE_FIELDS = ("mode", "model", "model_dir")
+
+# 鍵に入れない項目と、その理由。
+CACHE_KEY_ENGINE_EXCLUDED = {
+    "api_key": "同じキーでも別のキーでも転写は変わらない。鍵に入れると"
+               "キーを入れ直しただけで全部取り直しになる",
+    "diarize": "話者分離はローカル経路だけの設定で、転写の本文は変えない"
+               "(クラウドは Gemini が A/B/C を出す)",
+    "num_speakers": "同上。話者分離の上限であって、本文には効かない",
+}
+
+
 def _cache_suffix(
     with_timestamps: bool,
     with_diarization: bool,
@@ -192,6 +221,9 @@ def _cache_suffix(
     roster: str,
     chunk_seconds: int = 0,
     fingerprint: str = "",
+    *,
+    engine: "Optional[EngineSpec]" = None,
+    cluster_only: bool = False,
 ) -> str:
     """設定の組み合わせごとに別キャッシュにする(混在を防ぐ)。
 
@@ -202,10 +234,33 @@ def _cache_suffix(
     v2.0.0: チャンク長と音声の指紋も含める。チャンクのファイル名は長さに
     よらず chunk_0000.m4a なので、含めないと別の長さ・別の中身の転写を
     使い回してしまう(音声を編集してもファイル名が同じなら再利用される)。
+
+    2026-08-28: **モデルを鍵に入れた。**入っていなかったので
+    gemini-2.5-flash と gemini-2.5-pro が同じ鍵になり、モデルを切り替えても
+    前のモデルの転写が返っていた。**同じ音声を複数のエンジンで測る**という
+    測定の前提が成立しない状態だった(ローカル経路は最初から入れていた)。
+
+    2026-08-28: **run_segment_pipeline の自前組み立てをここへ寄せた。**
+    あちらは逐語の版を `.vb`(版なし)で書いており、VERBATIM_PROMPT_VER を
+    上げてもキャッシュが無効化されなかった。
     """
     parts: list[str] = []
+    if cluster_only:
+        parts.append("cluster")
     if fingerprint:
         parts.append(fingerprint)
+    if engine is not None:
+        # **経路とモデルは転写そのものを変える。**入れないと、エンジンを
+        # 切り替えても前のエンジンの転写が返る。
+        parts.append(engine.mode)
+        model = engine.resolved_model()
+        if model:
+            parts.append(re.sub(r"[^A-Za-z0-9_.-]+", "-", model))
+        if engine.model_dir:
+            digest = hashlib.blake2b(
+                str(Path(engine.model_dir).resolve()).encode("utf-8"),
+                digest_size=4).hexdigest()
+            parts.append(f"d{digest}")
     if chunk_seconds:
         parts.append(f"c{chunk_seconds}")
     if with_diarization:
@@ -735,13 +790,13 @@ def run_segment_pipeline(
     on_progress(0, len(chunks))
 
     chunk_seconds = chunk_minutes * 60
-    # キャッシュ名には「音声の指紋」と「チャンク長」を含める。
-    #   - 指紋が無いと、音声を編集してもファイル名が同じなら古い転写を再利用する
-    #   - チャンク長が無いと、分割サイズを変えたとき音声とテキストがずれる
-    cache_suffix = (
-        f".cluster{'.' + fingerprint if fingerprint else ''}"
-        f".c{chunk_seconds}{'.vb' if verbatim else ''}.txt"
-    )
+    # **鍵の組み立ては _cache_suffix() だけ。**ここで自前に組み立てていたため、
+    # モデル名と逐語プロンプトの版が抜けていた(2026-08-28)。
+    # 名簿は渡さない——手動割当モードでは Gemini に渡さないので、
+    # 名簿を変えても転写は変わらない。
+    cache_suffix = _cache_suffix(
+        True, True, verbatim, "", chunk_seconds, fingerprint,
+        engine=engine, cluster_only=True)
 
     all_segments: list[Segment] = []
     failed_chunks = 0
