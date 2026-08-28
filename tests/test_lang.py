@@ -182,6 +182,111 @@ def test_english_style_prompt_is_english():
 
 
 # ======================================================================
+# 切り替えが**実際の処理**に効くこと
+#
+# **値を読んで比べるだけでは足りない。**その値が使われていない経路があると
+# 見逃す(2026-08-27 にキャッシュキーで実際に見逃した)。処理を通して確かめる。
+#
+# 既定引数は import 時に束縛されるので、`min_block: int = MIN_BLOCK` と
+# 書いてあると lang.use() が効かない。その罠が塞がっていることも、ここで見る。
+# ======================================================================
+
+def _en_words(text, per_char=0.09, start=0.0):
+    from src.align import Word
+    return [Word(text=ch, start=start + i * per_char,
+                 end=start + (i + 1) * per_char)
+            for i, ch in enumerate(text)]
+
+
+def test_switch_changes_anchor_matching():
+    """anchor.measure() が、切り替えたあとの min_block で動くこと。"""
+    from src import anchor
+
+    before = lang.current().code
+    try:
+        track = anchor.prepare(_en_words(
+            "the government should adopt this policy"))
+        lang.use("ja")
+        assert anchor.measure("the", track, 0.0, 100.0) is not None, \
+            "日本語(3)なら 3 文字で当たるはず"
+        lang.use("en")
+        assert anchor.measure("the", track, 0.0, 100.0) is None, \
+            "英語(10)に切り替えたのに 3 文字で当たっている。" \
+            "**既定引数が import 時に束縛されていないか。**"
+        assert anchor.measure("government", track, 0.0, 100.0) is not None, \
+            "10 文字なら英語でも当たるはず"
+    finally:
+        lang.use(before)
+
+
+def test_switch_changes_inspection_thresholds():
+    """inspect_times() が、切り替えたあとの min_matched で動くこと。
+
+    正規化後 14 文字の本文は、日本語(8)なら提案が出て、英語(22)なら
+    「一致が短い」として出ない。
+    """
+    from src.inspection import inspect_times
+    from src.segments import Project, Segment
+
+    text = "yes it does say so"          # 正規化 14 字
+    proj = Project(audio_path="a.m4a", duration=60.0)
+    proj.segments = [Segment(index=0, start=6.8, end=9.8, text=text,
+                             cluster="0:A")]
+    words = _en_words(text, per_char=0.125)
+
+    before = lang.current().code
+    try:
+        lang.use("ja")
+        ja = inspect_times(proj, words)
+        lang.use("en")
+        en = inspect_times(proj, words)
+    finally:
+        lang.use(before)
+
+    assert ja.short_match == 0, "日本語(8)では一致 14 字は十分なはず"
+    assert en.short_match == 1, (
+        "英語(22)に切り替えたのに「一致が短い」で弾かれていない。"
+        "**既定引数が import 時に束縛されていないか。**")
+
+
+def test_explicit_argument_still_wins():
+    """呼び出し側が明示的に渡したら、そちらが勝つこと(検査が使う)。"""
+    from src import anchor
+
+    before = lang.current().code
+    try:
+        track = anchor.prepare(_en_words("the government should adopt"))
+        lang.use("en")
+        assert anchor.measure("the", track, 0.0, 100.0) is None
+        assert anchor.measure("the", track, 0.0, 100.0, min_block=3) is not None
+    finally:
+        lang.use(before)
+
+
+def test_no_module_constant_is_used_as_a_default_argument():
+    """**言語で変わる定数を既定引数に書かないこと。**
+
+    書くと import 時に値が固定され、切り替えが静かに効かなくなる。
+    grep で見つけて落とす(次に触る人が同じ書き方に戻すのを防ぐ)。
+    """
+    root = Path(__file__).resolve().parent.parent / "src"
+    banned = ("= MIN_BLOCK", "= MIN_MATCHED", "= MIN_DENSITY",
+              "= TAIL_GAP_LIMIT", "= SPEECH_CHARS_PER_SECOND")
+    found = []
+    for path in sorted(root.glob("*.py")):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#")[0]
+            if any(b in code for b in banned) and ":" in code and "def " not in code:
+                # 定義そのもの(MIN_BLOCK = ...)は除く
+                if code.strip().startswith(tuple(b.strip("= ") for b in banned)):
+                    continue
+                found.append(f"{path.name}:{n} {line.strip()}")
+    assert not found, (
+        "言語で変わる定数が既定引数に使われています。import 時に束縛され、"
+        "lang.use() の切り替えが効きません:\n  " + "\n  ".join(found))
+
+
+# ======================================================================
 # ここに置かないと決めたもの
 # ======================================================================
 
