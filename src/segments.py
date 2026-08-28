@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from . import lang
+
 
 SCHEMA_VERSION = 5
 
@@ -108,6 +110,25 @@ def added_signature(seg: "Segment") -> tuple[float, float, str]:
     orig = seg.orig_start if seg.orig_start is not None else seg.start
     return (round(float(orig), 3), round(float(seg.end), 3),
             str(seg.cluster or ""))
+
+
+def _join_texts(left: str, right: str) -> str:
+    """2 つの区間の本文を連結する。**語の区切りは言語で変わる。**
+
+    transcribe._join_fragments と違い、ここは人が明示的にまとめた別々の
+    発言なので、区切りの記号(読点・コンマ)は補わない。元の句読点をそのまま残す。
+
+    transcribe から import しないのは、あちらが google.genai を
+    トップレベル import しており、素の Python で落ちるため。
+    """
+    sep = lang.current().text.word_separator
+    left = left.rstrip()
+    right = right.lstrip()
+    if not left:
+        return right
+    if not right:
+        return left
+    return left + sep + right
 
 
 def audio_span(seg: "Segment", time_offset: float) -> tuple[float, float]:
@@ -1309,7 +1330,7 @@ class Project:
             index=index,
             start=min(a.start, b.start),
             end=max(a.end, b.end),
-            text=a.text + b.text,           # 日本語なので空白を挟まない
+            text=_join_texts(a.text, b.text),
             cluster=a.cluster,              # 前側の声のまとまりを採用する
             chunk=a.chunk,
             speaker_id=a.speaker_id if a.speaker_id == b.speaker_id else None,
@@ -1679,8 +1700,9 @@ def _merge_runs(
         else:
             runs.append((seg.start, seg.speaker_id, [text], cont))
         closed = shut
-    # 日本語なので連結時に空白を挟まない
-    return [(start, sid, "".join(parts), cont) for start, sid, parts, cont in runs]
+    # 連結の仕方は言語で変わる(日本語は空白なし・英語は空白あり)
+    sep = lang.current().text.word_separator
+    return [(start, sid, sep.join(parts), cont) for start, sid, parts, cont in runs]
 
 
 # 編集履歴の op → 検証要約に出す日本語（編集履歴設計書 §3）。

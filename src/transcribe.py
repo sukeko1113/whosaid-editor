@@ -11,6 +11,8 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 
+from . import lang
+
 from .segments import Utterance, utterances_to_segments
 
 
@@ -503,9 +505,20 @@ def normalize_cluster_label(label: str | None) -> str:
     s = _LABEL_STRIP.sub("", label.strip())
     if not s:
         return CLUSTER_UNKNOWN
-    if any(k in s for k in ("複数", "重複", "同時")) or s in ("*", "＊"):
+    # **擬似ラベルの語彙は言語で変わる。**足りないと 【Multiple】 が下の
+    # 「先頭の英字 1 文字」に落ち、クラスタ "M" という実在しない話者が立つ。
+    # しかも merge_consecutive がその連続を 1 人の発言として連結する。
+    #
+    # 日本語の語彙も常に見る。名簿や設定が日本語のまま英語音声を流すことが
+    # あり、どちらが来ても取りこぼさないほうが安全(誤判定の危険は無い——
+    # 「複数」が英語の話者ラベルとして現れることはない)。
+    labels = lang.current().labels
+    low = s.lower()
+    multi = tuple(labels.multi_words) + lang.JA.labels.multi_words
+    unknown = tuple(labels.unknown_words) + lang.JA.labels.unknown_words
+    if (any(k in s or k in low for k in multi)) or s in ("*", "＊"):
         return CLUSTER_MULTI
-    if any(k in s for k in ("不明", "不詳", "unknown")) or s in ("?", "？"):
+    if (any(k in s or k in low for k in unknown)) or s in ("?", "？"):
         return CLUSTER_UNKNOWN
     # 先頭の英字 1 文字を採用(「A」「A(男性)」「A さん」など)
     m = re.match(r"[A-Za-z]", s)
@@ -540,9 +553,14 @@ VERBATIM_MERGE_MAX_SECONDS = 20.0
 # 文字数から必要な秒数を見積もり、足りなければ終わりを延ばす。
 # ----------------------------------------------------------------------
 
-# 日本語の話速の目安。逐語では言いよどみが多く実測 4〜6 文字/秒。
-# 短く見積もると発言が途中で切れるので、遅めに見ておく。
-SPEECH_CHARS_PER_SECOND = 4.5
+# 話速の目安。**言語で変わる**ので lang.py が持つ。
+#   日本語 4.5 … 逐語では言いよどみが多く実測 4〜6 文字/秒。短く見積もると
+#                 発言が途中で切れるので、範囲の下端を採る
+#   英語  11.0 … 約 132 wpm。同じ理由で 12.5(150 wpm)より低く採る
+#
+# 下の定数は互換のために残してある(日本語の値に固定)。
+# 切り替えを効かせるのは estimate_speech_seconds() の側。
+SPEECH_CHARS_PER_SECOND = lang.JA.speech.chars_per_second
 MIN_SEGMENT_SECONDS = 1.0
 MAX_ESTIMATED_SECONDS = 120.0
 
@@ -553,7 +571,8 @@ def estimate_speech_seconds(text: str) -> float:
     if not n:
         return MIN_SEGMENT_SECONDS
     return min(MAX_ESTIMATED_SECONDS,
-               max(MIN_SEGMENT_SECONDS, n / SPEECH_CHARS_PER_SECOND))
+               max(MIN_SEGMENT_SECONDS,
+                   n / lang.current().speech.chars_per_second))
 
 
 def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
@@ -625,26 +644,39 @@ def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
     return raw
 
 # 連結時、直前がこれらで終わっていれば読点を足さない
-_SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
+# 互換のために残してある(日本語の値)。切り替えは _join_fragments() の側。
+_SENTENCE_ENDS = lang.JA.text.sentence_ends
 
 
 def _join_fragments(left: str, right: str) -> str:
-    """断片を連結する。日本語なので空白は挟まない。
+    """断片を連結する。**連結の仕方は言語で変わる**ので lang.py が持つ。
 
     Gemini が行を分けた位置は、話者が息を継いだ位置に対応している。
-    そのまま連結すると「吉沢と申しますけどもえー、まず…」と読みにくいので、
-    直前が句読点で終わっていなければ読点を補う。
+    そのまま連結すると読みにくいので、直前が句読点で終わっていなければ
+    区切りの記号を補う。
     (逐語での「間」の表現であり、発話内容そのものは変えない)
+
+        日本語: 語の間に何も入れず、読点「、」を補う
+                「けども」+「えー」→「けども、えー」
+        英語:   語の間に空白が要る。コンマ + 空白を補う
+                "Chairperson" + "we stand" → "Chairperson, we stand"
+
+    英語には「右が句読点で始まるときは前の語に直付けする」分岐が要る
+    (", however," のような断片)。日本語では句読点が必ず前の語に付くので、
+    この区別が要らなかった。
     """
+    t = lang.current().text
     left = left.rstrip()
     right = right.lstrip()
     if not left:
         return right
     if not right:
         return left
-    if left[-1] in _SENTENCE_ENDS or right[0] in _SENTENCE_ENDS:
-        return left + right
-    return left + "、" + right
+    if t.clinging and right[0] in t.clinging:
+        return left + right          # ", and" のような句読点始まりは直付け
+    if left[-1] in t.sentence_ends or right[0] in t.sentence_ends:
+        return left + t.word_separator + right
+    return left + t.fragment_comma + right
 
 
 def merge_consecutive(
