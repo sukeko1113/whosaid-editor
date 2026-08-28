@@ -2156,6 +2156,78 @@ def test_carry_over_does_not_swallow_the_next_segment():
         s.text for s in result]
 
 
+def test_carry_over_keeps_the_next_chunk_head_at_a_split_boundary():
+    """**開始が一致するだけの別区間を消さないこと。**
+
+    2026-08-28 に test_pipeline_integration で発覚。再実行で発言が 1 件、
+    黙って消えていた(12 区間 → 11 区間)。
+
+    `lo <= start < hi` で二重化を直した副作用(§10.3.5・3 回目)。
+    分割した子は**親の系譜(orig)を継ぐ**ので範囲が狭い。その範囲の lo が
+    チャンク境界と重なると、次のチャンクの先頭区間は開始だけが一致し、
+    範囲はまったく違うのに取り込まれて消える。
+
+    実データの形: チャンク 0 の最終区間 orig(60.03, 60.33) を分割 →
+    子 2 つが同じ系譜を持つ。チャンク 1 の先頭は orig(60.03, 80.03)。
+    """
+    old = [
+        # 分割した前半・後半。どちらも親の系譜 (60.03, 60.33) を継ぐ
+        Segment(index=0, start=60.03, end=60.20, text="一点よ", cluster="0:C",
+                time_edited=True, orig_start=60.03, orig_end=60.33),
+        Segment(index=1, start=60.20, end=60.33, text="落ちていた発言",
+                cluster="0:?", time_edited=True, text_edited=True,
+                orig_start=60.03, orig_end=60.33),
+    ]
+    new = [
+        Segment(index=0, start=60.03, end=60.33, text="一点よろしいですか。",
+                cluster="0:C"),
+        # チャンク 1 の先頭。開始は同じだが 20 秒の別発言
+        Segment(index=1, start=60.03, end=80.03, text="議事を始めます。",
+                cluster="1:A"),
+    ]
+    result, _ = _carry(old, new)
+    texts = [x.text for x in result]
+    assert "議事を始めます。" in texts, f"**次のチャンクの発言が消えている**: {texts}"
+
+
+def test_carry_over_absorbs_pieces_inside_a_merged_segment():
+    """結合した区間の内側は取り込む(再実行で 2 つに戻らない)。
+
+    中点判定でも、結合区間の中にすっぽり入る断片は取り込まれること。
+    """
+    old = [
+        Segment(index=0, start=80.03, end=120.00, text="まとめた本文",
+                cluster="0:B", speaker_id="sp01", reviewed=True,
+                time_edited=True, orig_start=80.03, orig_end=120.00),
+    ]
+    new = [
+        Segment(index=0, start=80.03, end=105.03, text="前半", cluster="0:B"),
+        Segment(index=1, start=105.03, end=120.00, text="後半", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [x.text for x in result] == ["まとめた本文"], [x.text for x in result]
+
+
+def test_carry_over_absorbs_a_tail_piece_that_overruns_the_merged_end():
+    """**結合区間の末尾を数十ミリ秒はみ出す断片も取り込む。**
+
+    単純な包含(seg.end <= hi)にすると、ここが取り込まれずに残り、
+    §10.3.5 で直したはずの二重化が戻る。中点判定を選んだのはこのため。
+    """
+    old = [
+        Segment(index=0, start=80.03, end=120.00, text="まとめた本文",
+                cluster="0:B", speaker_id="sp01", reviewed=True,
+                time_edited=True, orig_start=80.03, orig_end=120.00),
+    ]
+    new = [
+        Segment(index=0, start=80.03, end=105.03, text="前半", cluster="0:B"),
+        # 終わりが 0.06 秒だけ範囲を超える(チャンク末尾の丸めで実際に起きる)
+        Segment(index=1, start=105.03, end=120.06, text="後半", cluster="0:B"),
+    ]
+    result, _ = _carry(old, new)
+    assert [x.text for x in result] == ["まとめた本文"], [x.text for x in result]
+
+
 def test_carry_over_warns_about_leftover_duplicates():
     """**重複が残ったら知らせる。ただし勝手に消さない。**
 
