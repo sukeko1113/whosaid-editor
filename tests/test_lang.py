@@ -403,6 +403,79 @@ def test_prompt_parts_are_not_duplicated_in_transcribe():
 
 
 # ======================================================================
+# ローカル転写 — **2 経路が同時に切り替わること**
+#
+# LANGUAGE の参照は align.py(単語時刻の取得)と local_asr.py(本文の転写)の
+# 2 箇所にある。**片方だけ切り替えると、本文と物差しの言語が食い違う。**
+# ======================================================================
+
+def test_both_asr_paths_switch_together():
+    from src import align, local_asr
+
+    before = lang.current().code
+    try:
+        for code in ("ja", "en"):
+            lang.use(code)
+            want = lang.current().asr.whisper_language
+            assert align.whisper_language() == want, f"align が {code} で切り替わらない"
+            assert local_asr.whisper_language() == want,                 f"local_asr が {code} で切り替わらない(本文と物差しが食い違う)"
+    finally:
+        lang.use(before)
+
+
+def test_style_prompt_switches_with_the_language():
+    """英語音声に日本語の例文を与えないこと。"""
+    from src import local_asr
+
+    before = lang.current().code
+    try:
+        lang.use("en")
+        t = local_asr.LocalTranscriber(model="small")
+        assert t.style_prompt
+        assert not any("぀" <= c <= "ヿ" or "一" <= c <= "鿿"
+                       for c in t.style_prompt),             "英語なのに日本語の例文が渡っている"
+        lang.use("ja")
+        t = local_asr.LocalTranscriber(model="small")
+        assert "本日は" in t.style_prompt
+    finally:
+        lang.use(before)
+
+
+def test_style_prompt_can_still_be_turned_off():
+    """明示的に None を渡せば「例文を使わない」になること。
+
+    「指定なし(プロファイルを使う)」と区別が要る。
+    """
+    from src import local_asr
+
+    t = local_asr.LocalTranscriber(model="small", style_prompt=None)
+    assert t.style_prompt is None
+    assert t.prompt_ver == 0, "例文を使わないのに版が付いている"
+
+
+def test_language_constant_is_not_referenced_directly():
+    """**LANGUAGE を直接参照しないこと。**
+
+    import 時に束縛されるので、切り替えが静かに効かなくなる。
+    whisper_language() を通すこと。
+    """
+    root = Path(__file__).resolve().parent.parent / "src"
+    found = []
+    for path in sorted(root.glob("*.py")):
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#")[0]
+            if "LANGUAGE" not in code:
+                continue
+            if code.strip().startswith("LANGUAGE = "):
+                continue            # 定義そのもの(互換のため残している)
+            found.append(f"{path.name}:{n} {line.strip()}")
+    assert not found, (
+        "LANGUAGE を直接参照しています。import 時に束縛され、切り替えが"
+        "効きません。whisper_language() を使ってください:\n  "
+        + "\n  ".join(found))
+
+
+# ======================================================================
 # ここに置かないと決めたもの
 # ======================================================================
 

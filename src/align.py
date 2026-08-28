@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from . import lang
 from .audio import audio_fingerprint
 
 
@@ -55,7 +56,19 @@ COMPUTE_TYPE = "int8"
 GPU_DEVICE = "cuda"
 GPU_COMPUTE_TYPE = "int8_float16"
 
-LANGUAGE = "ja"
+# faster-whisper に渡す言語。**言語で変わる**ので lang.py が持つ。
+#
+# **参照が 2 経路ある。**ここ(単語時刻の取得)と local_asr.py(本文の転写)。
+# 片方だけ切り替えると、本文と物差しの言語が食い違う。どちらも
+# lang.current().asr.whisper_language を見るようにしてある。
+#
+# 下の定数は互換のために残してある(日本語に固定)。**参照しないこと。**
+LANGUAGE = lang.JA.asr.whisper_language
+
+
+def whisper_language() -> str:
+    """いま使う言語コード。**import 時ではなく呼ばれた時に決める。**"""
+    return lang.current().asr.whisper_language
 
 
 class AlignUnavailable(RuntimeError):
@@ -419,7 +432,7 @@ def transcribe_words(
 
     segments, info = whisper.transcribe(
         str(audio_path),
-        language=LANGUAGE,
+        language=whisper_language(),
         word_timestamps=True,       # これが目的。単語ごとの start/end が付く
         # VAD は使わない。無音を飛ばすと速くなるが、短い相づちを落とす
         # 恐れがある。落ちた区間は「照合不能」になって提案が出せなくなる。

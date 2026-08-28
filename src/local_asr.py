@@ -25,13 +25,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
 
+from . import lang
 from .align import (
     AlignUnavailable,
     add_cuda_dll_path,
     COMPUTE_TYPE,
     DEFAULT_MODEL,
     DEVICE,
-    LANGUAGE,
+    whisper_language,
     Word,
     default_model,
     model_tag,
@@ -62,11 +63,29 @@ PROMPT_VER = 1
 # 代償: 掛け合いの帯では読点が過剰になる(正解 142 に対し 1274)。意味は
 # 壊れないので許容した。「建て替え」が 1 回落ちるのも確認済みで、
 # これは［語句をまとめて直す...］で直せる範囲。
-STYLE_PROMPT = (
-    "本日は、お忙しい中お集まりいただき、ありがとうございます。"
-    "それでは、お手元の資料に沿って、順にご説明いたします。"
-    "この点につきまして、何かご質問がございましたら、お願いいたします。"
-)
+# **例文は言語で変わる**ので lang.py が持つ。英語音声に日本語の例文を
+# 与えると害になる(用語も句読点も別物のため)。
+#
+# **英語版は未検証。**日本語版は実測で効果を確認してある(句読点 0 → 971)が、
+# 英語版は置いただけで、効果は 1 本目の測定で初めて分かる。
+# runs.csv の params_note に「STYLE_PROMPT: en-v1(未検証)」と記録すること。
+#
+# 下の定数は互換のために残してある(日本語に固定)。**参照しないこと。**
+# 「指定なし(プロファイルを使う)」と「明示的に None(例文を使わない)」を
+# 区別するための番兵。
+_USE_PROFILE = object()
+
+STYLE_PROMPT = lang.JA.asr.style_prompt
+
+
+def style_prompt_() -> str:
+    """いま使う例文。**import 時ではなく呼ばれた時に決める。**"""
+    return lang.current().asr.style_prompt
+
+
+def style_prompt_ver_() -> int:
+    """例文の版。キャッシュ鍵に入る。"""
+    return lang.current().asr.style_prompt_ver
 
 
 # **同じ本文が続くだけでは「暴走」と決めない。**
@@ -310,7 +329,7 @@ class LocalTranscriber:
                  model_dir: Optional[Path | str] = None,
                  condition_on_previous_text: bool = True,
                  prefer_gpu: bool = True,
-                 style_prompt: Optional[str] = STYLE_PROMPT) -> None:
+                 style_prompt: Optional[str] = _USE_PROFILE) -> None:
         """model を省くと、装置に合った既定を選ぶ(GPU なら large-v3)。
 
         condition_on_previous_text: 直前までの本文を次の 30 秒に引き継ぐか。
@@ -331,8 +350,13 @@ class LocalTranscriber:
         self.model = model or default_model(self.device)
         self.model_dir = model_dir
         self.condition_on_previous_text = condition_on_previous_text
+        # **既定は import 時ではなく作られた時に決める。**既定引数に
+        # STYLE_PROMPT と書くと値が固定され、lang.use() が効かない。
+        # 明示的に None を渡せば「例文を使わない」になる(区別が要る)。
+        if style_prompt is _USE_PROFILE:
+            style_prompt = style_prompt_()
         self.style_prompt = style_prompt or None
-        self.prompt_ver = PROMPT_VER if self.style_prompt else 0
+        self.prompt_ver = style_prompt_ver_() if self.style_prompt else 0
         # 置き場の間違い(フォルダが無い・model.bin が無い)はここで分かる。
         # 音声を分割し終わってから気づくのでは遅い。
         self.target = resolve_model(self.model, model_dir)
@@ -425,7 +449,7 @@ class LocalTranscriber:
             if device == "cuda":
                 import numpy as np
                 list(m.transcribe(np.zeros(16000, dtype=np.float32),
-                                  language=LANGUAGE,
+                                  language=whisper_language(),
                                   without_timestamps=True)[0])
             return m
 
@@ -565,7 +589,7 @@ class LocalTranscriber:
 
         segments, info = whisper.transcribe(
             str(audio_path),
-            language=LANGUAGE,
+            language=whisper_language(),
             # 本文と一緒に単語時刻も取る。自動点検が使う実測値がただで手に入る。
             word_timestamps=word_timestamps,
             # VAD は使わない。無音を飛ばすと速くなるが、短い相づちを落とす
