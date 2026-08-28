@@ -132,8 +132,47 @@ def make_project(tmp: Path) -> Project:
     return proj
 
 
+def install_dialog_guard() -> list:
+    """**差し替え忘れたモーダルで止まらないようにする。**
+
+    tkinter の messagebox / filedialog は人が押すまで返らない。検査の中で
+    出ると、そこで止まって**以降が一度も走らない**。しかも出力はバッファ
+    されるので、止まった位置すら分からない。
+
+    実際に 2 回起きた(2026-08-28):
+      - 一括適用で全区間が埋まり showinfo(完了) が出た
+      - 出力の最後に askyesno(出力完了 / ファイルを開きますか?) が出た
+
+    そこで既定を「記録して、いちばん害のない値を返す」に置き換える。
+    - 問い合わせ(askyesno 等) → False。**「いいえ」が最も害がない**
+      (True を返すと、出力の後に Word が本当に起動する)
+    - 選択(asksaveasfilename 等) → 空文字。取り消しと同じ
+    - 通知(showinfo 等) → None
+
+    個別に差し替えている箇所はこれまでどおりそちらが勝つ(あとから代入し、
+    finally で戻すときも同じ関数に戻る)。差し替え忘れは止まらずに進み、
+    末尾に一覧が出るので、そこで気づける。
+    """
+    leaked: list = []
+
+    def record(name, ret):
+        def f(*a, **k):
+            leaked.append((name, a[0] if a else ""))
+            return ret
+        return f
+
+    for name, ret in (("showinfo", None), ("showwarning", None),
+                      ("showerror", None), ("askyesno", False),
+                      ("askokcancel", False), ("askretrycancel", False)):
+        setattr(assign_gui.messagebox, name, record(name, ret))
+    for name in ("asksaveasfilename", "askopenfilename", "askdirectory"):
+        setattr(assign_gui.filedialog, name, record(name, ""))
+    return leaked
+
+
 def run() -> int:
     failures = []
+    leaked = install_dialog_guard()
 
     def check(label: str, cond: bool) -> None:
         print(f"  {'ok  ' if cond else 'FAIL'} {label}")
@@ -1470,8 +1509,27 @@ def run() -> int:
         check("押せば雑音として確定できる",
               callable(mwin.special_buttons[_SN].cget("command"))
               or bool(mwin.special_buttons[_SN].cget("command")))
-        mwin.special_buttons[_SN].invoke()
+        # **完了の知らせはモーダル。**この見本は 6 区間とも同じまとまり(g:A)で、
+        # 一括適用が既定(var_apply_cluster=True)なので、1 回押すと全区間が
+        # 埋まる。すると _after_change() が messagebox.showinfo("完了", ...) を
+        # 出し、誰も押さないので**ここで検査が止まって返ってこない**
+        # (2026-08-28 に実際に止まり、以降の検査が一度も走っていなかった)。
+        # アプリの動作は正しい。止まるのは検査の側の落ち度なので、この
+        # ファイルの他の箇所と同じやり方で差し替える。
+        done_msgs: list = []
+        real_done = assign_gui.messagebox.showinfo
+        assign_gui.messagebox.showinfo = lambda *a, **k: done_msgs.append(a)
+        try:
+            mwin.special_buttons[_SN].invoke()
+        finally:
+            assign_gui.messagebox.showinfo = real_done
         check("雑音に確定できる", many.segments[0].speaker_id == _SN)
+        # 止まっていた間、ここから先は一度も検査されていなかった。
+        # 通りがかりに 2 つ足しておく。
+        check("一括適用で同じまとまりが全部埋まる",
+              all(s.speaker_id == _SN for s in many.segments))
+        check("全部確定したら完了を知らせる",
+              any("完了" in str(a) for a in done_msgs))
         mwin.player.close()
         mwin.destroy()
 
@@ -1922,9 +1980,15 @@ def run() -> int:
             real_wait = awin.wait_window
             real_save = assign_gui.filedialog.asksaveasfilename
             real_err = assign_gui.messagebox.showerror
+            real_ask = assign_gui.messagebox.askyesno
             # 出力で落ちるとエラーの小窓で止まる。記録して先へ進める
             assign_gui.messagebox.showerror = (
                 lambda *a, **k: seen.setdefault('error', a))
+            # **出力の最後に askyesno(出力完了) が出る。**差し替えないと
+            # ここで止まる(2026-08-28 に実際に止まった)。
+            # **必ず False を返す。**True にすると Word が本当に起動する。
+            assign_gui.messagebox.askyesno = (
+                lambda *a, **k: (seen.setdefault('done', a), False)[1])
             awin.wait_window = fake_wait
             assign_gui.filedialog.asksaveasfilename = (
                 lambda *a, **k: str(out_path))
@@ -1934,6 +1998,7 @@ def run() -> int:
                 awin.wait_window = real_wait
                 assign_gui.filedialog.asksaveasfilename = real_save
                 assign_gui.messagebox.showerror = real_err
+                assign_gui.messagebox.askyesno = real_ask
             return seen
 
         def _docx_text(path):
@@ -2053,6 +2118,11 @@ def run() -> int:
         awin.destroy()
         root.destroy()
 
+    if leaked:
+        print(f"\n※ 差し替えていないモーダルが {len(leaked)} 件出ました"
+              f"(止血して先へ進めています。検査の側で差し替えてください):")
+        for name, title in leaked:
+            print(f"    {name}({title!r})")
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
     return 1 if failures else 0
 
