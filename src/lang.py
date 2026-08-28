@@ -334,6 +334,148 @@ JA = LanguageProfile(
 # ここではまず器と、測って決めた値だけを置く。
 # ======================================================================
 
+_EN_OPENING = "Transcribe this audio in English."
+
+_EN_RULES_CLEANUP = """- Transcribe the content accurately, word for word, with nothing omitted or altered
+- Remove fillers (um, uh, er, you know, like, I mean) where appropriate
+- Tidy false starts and unnecessary repetition into readable English
+- Keep the speaker's intent, proper nouns and numbers exact
+- Write [unclear] where you could not make out the audio"""
+
+
+# **短い応答の保護は、この一連の作業の主目的そのもの。**
+# 2026-08-27 の実測(英語ディベート決勝 45:12)で、この指示が効いていることを
+# 確認している:
+#   Yes 28 / No 30 / Right 16 / Yeah 5 回、25 文字以下の独立区間 48 件。
+#   遮られて切れた語("How")も、言い淀んだまま終わった応答("No, uh")も、
+#   相づち扱いで前の発言に併合されずに独立した区間として残っていた。
+# **書き換えるときに、この指示を薄めないこと。**
+_EN_RULES_VERBATIM = """【VERBATIM RULES - HIGHEST PRIORITY】
+- Transcribe exactly what is said. Never summarise, paraphrase, correct or tidy the speech.
+- Keep every filler and hesitation exactly as spoken: um, uh, er, ah, like, you know,
+  I mean, sort of, kind of, well, so, right, okay.
+- Keep false starts, self-corrections, repetitions and stutters. Write "the- the government",
+  not "the government".
+- **Keep every short response in full, and give it its own line.** Yes / Yeah / No / Nope /
+  Right / Correct / I don't know / I'm not sure / It does not say that / That is not what
+  it says / Could you repeat the question / Point of information - these are answers.
+  Never drop them, never shorten them, never merge them into a neighbouring turn, and
+  never treat them as backchannel noise to be cleaned away.
+- **If a speaker is asked a question and does not answer, write (no response).**
+  If there is a noticeable silence, write (silence). If a speaker is cut off, write
+  (interrupted). Never omit these and never fill in what you think was meant.
+- If you cannot hear something, write (inaudible). Do not guess and do not finish the
+  speaker's sentence for them.
+- Do not add any word that is not in the audio. Do not fix grammar, and do not correct
+  mistakes of fact, even when the speaker is plainly wrong.
+- If a proper noun is unclear, write it as it sounded. Do not substitute the "correct" spelling.
+- Write only what was actually said. Do not repeat a phrase in the output unless it is
+  repeated in the audio."""
+
+
+_EN_RULES_TS = """- **Begin every paragraph with a timestamp in [MM:SS] form**
+  (the time that paragraph starts in the audio, zero-padded to 2 digits, e.g. [00:00], [03:45])
+- Break paragraphs at topic boundaries, clear pauses, or every 30 seconds to 2 minutes"""
+
+
+_EN_RULES_DIAR = """- **Start a new line every time the speaker changes**
+- **Begin every line in exactly this form**:
+  [MM:SS] 【speaker label】 text...
+  (minutes:seconds, zero-padded to 2 digits. No milliseconds or hundredths)
+- A short backchannel (just "yes" or "mm") may stay on the previous speaker's line"""
+
+
+# 日本語版と同じ理由で、逐語では相づちを吸収させない。
+# **吸収は「一切要約・整文しない」と正面から矛盾する。**しかも消えるのではなく
+# 別の人の "Yes" が前の話者の行に混ざるので、「誰が言ったか」の記録としては
+# 消えるより悪い(誤って別人の発言として残る)。
+# 併せて 1 行が長くなりすぎないようにする——同じ人が話し続けると 1 区間が
+# 長大になり、**その区間には話者を割り当てられない**(間に何人も話している)。
+_EN_RULES_DIAR_VERBATIM = """- **Start a new line every time the speaker changes**
+- **Begin every line in exactly this form**:
+  [MM:SS] 【speaker label】 text...
+  (minutes:seconds, zero-padded to 2 digits. No milliseconds or hundredths)
+- **Every short response gets its own line, always.** Yes / Yeah / No / Right /
+  I don't know / I'm not sure / It does not say that / Could you repeat the question.
+  Never put them on the previous speaker's line. The record has to show who agreed,
+  who refused, and when.
+- **Even when the same speaker continues, break the line at sentence ends and pauses.
+  Keep each line under 20 seconds.**"""
+
+
+_EN_RULES_CLUSTER = """- **Start a new line only when the person speaking changes**
+- **Begin every line in exactly this form**:
+  [MM:SS] 【A】 text...
+  (minutes:seconds from the start of this audio, zero-padded to 2 digits. No milliseconds)
+- Speaker labels are a single letter A, B, C, ... only. **Never write a name or a role.**
+- Always use the same label for the same voice. If the voice changes, the label must change.
+- **While the same person keeps speaking, never split the line.** Do not break at a breath,
+  a pause, a comma, or a hesitation. However many sentences follow, keep them on one line
+  until the next person starts speaking.
+  (Bad: splitting "our first contention" / "um, the funding plan" / "and the timetable"
+   into 3 lines -> correct is one line: "our first contention, um, the funding plan,
+   and the timetable...")
+- Only when the same person has spoken for more than 3 minutes may you split at a topic break
+- **A short response from a different voice always gets its own line** - Yes, No, Right,
+  I don't know, and any other brief answer. These are the answers in a question-and-answer
+  exchange, so they must appear as their own turn and must never be folded into the
+  previous speaker's line.
+- Use 【?】 when you cannot tell whose voice it is, and 【*】 when several people speak at once"""
+
+
+# **例は指示より強く効く。**短い応答が独立した行になっている様子と、
+# 沈黙・無回答の書き方を実演する。
+_EN_EXAMPLE_CLUSTER = """Example output:
+[00:00] 【A】 Thank you Mr Chairperson. We stand in firm affirmation of today's motion. Our first contention is that, um, the current system fails to protect the most vulnerable members of our society.
+[00:25] 【B】 Point of information.
+[00:27] 【A】 No thank you, I'll take one at the end.
+[00:32] 【B】 You said the study supports you. Where does it say that?
+[00:38] 【A】 (silence)
+[00:41] 【A】 I don't know.
+[00:43] 【C】 It does not say that."""
+
+
+_EN_LABEL_ABC = """- Identify speaker labels (Speaker A, Speaker B, Speaker C...) by voice, and always use
+  the same label for the same person
+- Use 【unknown】 when you cannot tell who is speaking"""
+
+
+_EN_EXAMPLE_DIAR = """Example output:
+[00:00] 【Speaker A】 Thank you Mr Chairperson. We stand in firm affirmation of today's motion.
+[00:25] 【Speaker B】 Point of information. Where does the study say that?
+[00:32] 【Speaker A】 I don't know."""
+
+
+_EN_EXAMPLE_DIAR_VERBATIM = """Example output:
+[00:00] 【Speaker A】 Um, thank you Mr Chairperson, and, uh, thank you to the previous speaker.
+[00:08] 【Speaker B】 Yes.
+[00:09] 【Speaker A】 So, our first contention is about the funding plan.
+[00:14] 【Speaker C】 Right.
+[00:15] 【Speaker B】 Where exactly does the study say that? Could you repeat the page?
+[00:20] 【Speaker A】 I don't know.
+[00:22] 【Speaker B】 (no response)
+[00:25] 【Speaker A】 It does not say that anywhere in the text."""
+
+
+_EN_EXAMPLE_TS = """Example output:
+[00:00] Thank you Mr Chairperson. We stand in firm affirmation of today's motion.
+[00:42] Our first contention concerns the cost of implementation.
+[03:15] I will now move on to the second contention."""
+
+
+def _en_roster_block(roster: str) -> str:
+    return f"""The participants in this audio are known in advance. Identify the speaker from the
+voice, and also from what is said (self-introductions, being addressed by name, remarks
+that fit a particular role).
+
+【Participants】
+{roster.strip()}
+
+- Use the name from the list, wrapped in 【】 (e.g. 【Chair (President)】【Ms Sato】)
+- Use 【unknown】 only when you truly cannot tell, and 【multiple speakers】 when voices
+  overlap. Saying "unknown" is better than forcing a guess onto someone from the list"""
+
+
 EN = LanguageProfile(
     code="en",
     label="English",
@@ -393,9 +535,26 @@ EN = LanguageProfile(
         ),
         style_prompt_ver=1,
     ),
-    # 単位 6 で入れる。それまでは日本語のプロンプトを指しておく
-    # (英語で走らせると日本語の指示が出るので、単位 6 の前に使わないこと)。
-    prompt=JA.prompt,
+    prompt=Prompt(
+        opening=_EN_OPENING,
+        rules_heading="Rules:",
+        rules_cleanup=_EN_RULES_CLEANUP,
+        rules_verbatim=_EN_RULES_VERBATIM,
+        rules_ts=_EN_RULES_TS,
+        rules_diar=_EN_RULES_DIAR,
+        rules_diar_verbatim=_EN_RULES_DIAR_VERBATIM,
+        rules_cluster=_EN_RULES_CLUSTER,
+        label_abc=_EN_LABEL_ABC,
+        verbatim_punct=("- You may punctuate at the breaks you actually hear "
+                        "(but never change the content)"),
+        tail=("- Do not add any explanation, preamble or Markdown formatting. "
+              "Output the transcript body only."),
+        example_cluster=_EN_EXAMPLE_CLUSTER,
+        example_diar=_EN_EXAMPLE_DIAR,
+        example_diar_verbatim=_EN_EXAMPLE_DIAR_VERBATIM,
+        example_ts=_EN_EXAMPLE_TS,
+        roster_block=_en_roster_block,
+    ),
 )
 
 

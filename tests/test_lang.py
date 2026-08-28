@@ -287,6 +287,122 @@ def test_no_module_constant_is_used_as_a_default_argument():
 
 
 # ======================================================================
+# プロンプト — 短い応答の保護
+#
+# **これがこの一連の作業の主目的そのもの。**ディベートでは「答えなかった」
+# 「沈黙した」「聞き返した」こと自体が判定材料になる。
+#
+# 2026-08-27 の実測(英語ディベート決勝 45:12)で効いていることを確認した:
+#   Yes 28 / No 30 / Right 16 / Yeah 5 回、25 文字以下の独立区間 48 件。
+#   遮られて切れた語("How")も、言い淀んだまま終わった応答("No, uh")も、
+#   相づち扱いで前の発言に併合されずに独立した区間として残っていた。
+#
+# **書き換えるときに薄まらないよう、ここで固定する。**
+# ======================================================================
+
+def _en_prompt(**kw):
+    from src.transcribe import build_prompt
+
+    before = lang.current().code
+    try:
+        lang.use("en")
+        return build_prompt(True, True, **kw)
+    finally:
+        lang.use(before)
+
+
+def test_en_verbatim_protects_short_responses():
+    p = _en_prompt(verbatim=True, cluster_only=True)
+    assert "Keep every short response in full" in p
+    for token in ("Yes", "No", "I don't know", "It does not say that",
+                  "Could you repeat the question"):
+        assert token in p, token
+    assert "never merge them into a neighbouring turn" in p
+    assert "never treat them as backchannel noise" in p
+
+
+def test_en_verbatim_marks_silence_and_no_answer():
+    """無回答・沈黙・遮り・聞き取り不能を、省略せず書かせること。"""
+    p = _en_prompt(verbatim=True, cluster_only=True)
+    for token in ("(no response)", "(silence)", "(interrupted)", "(inaudible)"):
+        assert token in p, token
+
+
+def test_en_cluster_gives_short_responses_their_own_line():
+    p = _en_prompt(verbatim=True, cluster_only=True)
+    assert "A short response from a different voice always gets its own line" in p
+
+
+def test_en_diar_verbatim_also_protects_short_responses():
+    """**この部品は本線に後から入ったもので、英語版は新規に書き起こした。**
+
+    en-test の時点では存在しなかったので、実測で確認されていない。
+    保護の指示が薄まっていないことだけは、ここで固定しておく。
+    """
+    p = _en_prompt(verbatim=True)
+    assert "Every short response gets its own line, always." in p
+    assert "Never put them on the previous speaker's line." in p
+    for token in ("Yes", "No", "I don't know", "Could you repeat the question"):
+        assert token in p, token
+    # 1 行が長くなりすぎない指示(区間に話者を割り当てられなくなるため)
+    assert "Keep each line under 20 seconds." in p
+
+
+def test_en_examples_demonstrate_short_responses():
+    """**例は指示より強く効く。**沈黙と短い応答が例に出ていること。"""
+    cluster = _en_prompt(verbatim=True, cluster_only=True)
+    assert "【A】 (silence)" in cluster
+    assert "【A】 I don't know." in cluster
+    diar = _en_prompt(verbatim=True)
+    assert "(no response)" in diar
+    assert "【Speaker B】 Yes." in diar
+
+
+def test_en_verbatim_keeps_english_fillers():
+    p = _en_prompt(verbatim=True, cluster_only=True)
+    for filler in ("um", "uh", "you know", "I mean", "like"):
+        assert filler in p, filler
+    assert "Never summarise, paraphrase, correct or tidy" in p
+
+
+def test_en_prompt_has_no_japanese_left():
+    """**英語の指示に日本語が混じっていないこと。**
+
+    単位 6 の前は EN.prompt が JA.prompt を指す仮置きだった。その状態で
+    英語の転写を走らせると、日本語の指示が Gemini に飛ぶ。
+    仮置きに戻したらここで落ちる。
+    """
+    import dataclasses
+
+    for f in dataclasses.fields(lang.Prompt):
+        v = getattr(lang.EN.prompt, f.name)
+        if callable(v):
+            v = v("Sato")
+        bad = [c for c in v if "぀" <= c <= "ヿ" or "一" <= c <= "鿿"]
+        assert not bad, f"EN.prompt.{f.name} に日本語が混じっている: {set(bad)}"
+
+
+def test_en_and_ja_prompts_are_different_objects():
+    assert lang.EN.prompt is not lang.JA.prompt
+    assert lang.EN.prompt.opening != lang.JA.prompt.opening
+
+
+def test_prompt_parts_are_not_duplicated_in_transcribe():
+    """**プロンプトの部品を transcribe.py に書き戻さないこと。**
+
+    2 箇所に散ると、言語を足す人がどちらかを見落とす。この一連の作業で
+    4 回起こした形。
+    """
+    src = (Path(__file__).resolve().parent.parent / "src" / "transcribe.py"
+           ).read_text(encoding="utf-8")
+    for banned in ("_RULES_VERBATIM = ", "_RULES_CLUSTER = ",
+                   "_EXAMPLE_CLUSTER = ", "_RULES_DIAR_VERBATIM = "):
+        assert banned not in src, (
+            f"{banned.strip(' =')} が transcribe.py に戻っています。"
+            "プロンプトの部品は src/lang.py にまとめること。")
+
+
+# ======================================================================
 # ここに置かないと決めたもの
 # ======================================================================
 
