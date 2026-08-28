@@ -21,6 +21,7 @@ from . import diarize as diarize_mod
 from . import listen_order
 from . import local_asr
 from .align import DEFAULT_MODEL as DEFAULT_LOCAL_MODEL
+from . import lang
 from .audio import audio_fingerprint, audio_hashes, probe_duration, split_audio
 from .config import APP_VERSION
 from .segments import (
@@ -204,6 +205,18 @@ VERBATIM_PROMPT_VER = 2
 # NOT_KEYED のどちらかに入れること(入れないと検査が落ちる)。
 CACHE_KEY_ENGINE_FIELDS = ("mode", "model", "model_dir")
 
+# **EngineSpec 以外で鍵に入るもの。**言語もここ。
+# 5 回目の事故を防ぐために、EngineSpec と同じ形で宣言しておく——
+# 「鍵に入れたつもり」と「実際に入っている」を検査で突き合わせる。
+CACHE_KEY_OTHER_FIELDS = (
+    "fingerprint",      # 音声の中身
+    "chunk_seconds",    # 分割の長さ
+    "language",         # プロンプトと転写の言語
+    "verbatim",         # 逐語モード(+ そのプロンプトの版)
+    "roster",           # 名簿(話者推定モードのみ)
+    "cluster_only",     # 手動割当モードか
+)
+
 # 鍵に入れない項目と、その理由。
 CACHE_KEY_ENGINE_EXCLUDED = {
     "api_key": "同じキーでも別のキーでも転写は変わらない。鍵に入れると"
@@ -240,6 +253,10 @@ def _cache_suffix(
     前のモデルの転写が返っていた。**同じ音声を複数のエンジンで測る**という
     測定の前提が成立しない状態だった(ローカル経路は最初から入れていた)。
 
+    2026-08-28: **言語を鍵に入れた。**プロンプトも転写の言語も変わるので、
+    同じ音声・同じ設定でも別物の転写になる。日本語は無印のままにしてあり、
+    既存の日本語キャッシュは有効なまま。
+
     2026-08-28: **run_segment_pipeline の自前組み立てをここへ寄せた。**
     あちらは逐語の版を `.vb`(版なし)で書いており、VERBATIM_PROMPT_VER を
     上げてもキャッシュが無効化されなかった。
@@ -249,6 +266,13 @@ def _cache_suffix(
         parts.append("cluster")
     if fingerprint:
         parts.append(fingerprint)
+    # **言語を入れる。**プロンプトも転写の言語も変わるので、同じ音声・同じ
+    # 設定でも別物の転写になる。
+    # **日本語は無印のまま**にする(`!= DEFAULT` の形)。無条件に足すと既存の
+    # 日本語キャッシュが全てミスになり、実データの再転写が起きる。
+    code = lang.current().code
+    if code != lang.DEFAULT:
+        parts.append(code)
     if engine is not None:
         # **経路とモデルは転写そのものを変える。**入れないと、エンジンを
         # 切り替えても前のエンジンの転写が返る。

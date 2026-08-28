@@ -40,9 +40,11 @@ for _s in (sys.stdout, sys.stderr):
         _s.reconfigure(encoding="utf-8", errors="replace")
 
 from src import pipeline                                    # noqa: E402
+from src import lang                                        # noqa: E402
 from src.pipeline import (                                  # noqa: E402
     CACHE_KEY_ENGINE_EXCLUDED,
     CACHE_KEY_ENGINE_FIELDS,
+    CACHE_KEY_OTHER_FIELDS,
     EngineSpec,
     VERBATIM_PROMPT_VER,
     _cache_suffix,
@@ -149,6 +151,117 @@ def test_no_fingerprint_is_still_usable():
     """指紋が取れなくても鍵は作れる(ffmpeg が無い等)。"""
     got = key(fingerprint="")
     assert got.endswith(".txt") and FP not in got
+
+
+# ======================================================================
+# 言語(5 回目の事故を防ぐ)
+#
+# 8-27 に「関数は直したが実経路が別実装」で言語が鍵から落ちた。今回は
+# EngineSpec と同じ形で宣言し、宣言と実物を突き合わせる。
+# ======================================================================
+
+def test_language_is_declared_as_a_key_field():
+    assert "language" in CACHE_KEY_OTHER_FIELDS, (
+        "言語を鍵の要素として宣言していません。"
+        "**プロンプトも転写の言語も変わるので、同じ音声でも別物の転写になります。**")
+
+
+def test_every_declared_other_field_actually_changes_the_key():
+    """**鍵に入れると宣言した要素は、本当に鍵を変えること。**
+
+    宣言だけして実装を忘れたら、分類は通るのに事故は起きる。
+    """
+    base = key()
+    changed = {}
+    changed["fingerprint"] = key(fingerprint="ちがう指紋")
+    changed["chunk_seconds"] = key(chunk_seconds=420)
+    changed["verbatim"] = key(verbatim=False)
+    changed["cluster_only"] = _cache_suffix(
+        True, True, True, "", CS, FP, engine=CLOUD, cluster_only=False)
+    changed["roster"] = _cache_suffix(
+        True, True, True, "佐藤\n田中", CS, FP, engine=CLOUD, cluster_only=False)
+    before = lang.current().code
+    try:
+        lang.use("en")
+        changed["language"] = key()
+    finally:
+        lang.use(before)
+
+    for name in CACHE_KEY_OTHER_FIELDS:
+        assert name in changed, f"{name} を変えた場合の検査がありません"
+        if name == "roster":
+            # 名簿は cluster_only=False のときだけ効く(手動割当では渡さない)
+            assert changed[name] != changed["cluster_only"], name
+            continue
+        assert changed[name] != base, (
+            f"{name} を変えても鍵が同じです({base})。"
+            "**この要素を変えても古い転写が返ります。**")
+
+
+def test_japanese_key_is_unchanged_by_the_language_field():
+    """**日本語は無印のまま。**
+
+    無条件に言語を足すと、既存の日本語キャッシュが全てミスになり、
+    実データの再転写(＝課金)が起きる。
+    """
+    before = lang.current().code
+    try:
+        lang.use("ja")
+        ja = key()
+        assert ".ja." not in ja, f"日本語に言語が付いている: {ja}"
+        lang.use("en")
+        en = key()
+        assert ".en." in en, f"英語に言語が付いていない: {en}"
+        assert ja != en
+    finally:
+        lang.use(before)
+
+
+def test_local_chunk_key_also_carries_the_language():
+    """**ローカル経路の鍵にも言語が要る。**
+
+    本文を faster-whisper でも書く(両方のエンジンで測る)ので、
+    ここが抜けると言語を切り替えても前の言語の転写が返る。
+    """
+    from src import local_asr
+
+    before = lang.current().code
+    try:
+        def path(code):
+            lang.use(code)
+            return local_asr.chunk_cache_path(
+                ".w", "chunk_0000", fingerprint="abc123", chunk_seconds=960,
+                model="large-v3", compute_type="int8", prompt_ver=1).name
+
+        ja, en = path("ja"), path("en")
+        assert ja != en, f"言語で鍵が変わらない: {ja}"
+        assert ".ja." not in ja, f"日本語に言語が付いている: {ja}"
+        assert ".en." in en, f"英語に言語が付いていない: {en}"
+    finally:
+        lang.use(before)
+
+
+def test_written_file_names_change_with_the_language():
+    """**実際に書き出されるファイル名が、言語で変わること。**
+
+    8-27 はここを見ていなかったので、関数だけ直して実経路を見逃した。
+    """
+    if not shutil.which("ffmpeg"):
+        return
+    before = lang.current().code
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        try:
+            lang.use("ja")
+            ja = set(_run_and_list_cache(tmp, CLOUD))
+            lang.use("en")
+            after = set(_run_and_list_cache(tmp, CLOUD))
+        finally:
+            lang.use(before)
+        added = after - ja
+        assert added, f"言語を変えても新しい名前ができません: {sorted(ja)}"
+        assert all(".en." in n for n in added), sorted(added)
+        assert all(".en." not in n for n in ja), sorted(ja)
 
 
 # ======================================================================

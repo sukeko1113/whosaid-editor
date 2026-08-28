@@ -260,6 +260,11 @@ def chunk_cache_path(
     if not fingerprint:
         return None
     tag = model_tag(model, model_dir)
+    # **言語を鍵に入れる。**同じモデルでも言語が違えば別物の転写になる。
+    # 日本語は無印のまま(既存のキャッシュを無効にしない)。
+    code = lang.current().code
+    if code != lang.DEFAULT:
+        tag += "." + code
     if compute_type:
         tag += "." + re.sub(r"[^A-Za-z0-9_]+", "-", compute_type)
     if prompt_ver:

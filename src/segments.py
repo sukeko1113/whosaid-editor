@@ -122,12 +122,17 @@ def _join_texts(left: str, right: str) -> str:
     トップレベル import しており、素の Python で落ちるため。
     """
     sep = lang.current().text.word_separator
-    left = left.rstrip()
-    right = right.lstrip()
     if not left:
         return right
     if not right:
         return left
+    # **区切りが無い言語では、元の文字列に一切手を入れない。**
+    # rstrip/lstrip を掛けると、分割した本文を結合で戻したときに
+    # 元と一致しなくなる(日本語で実際に落ちた)。
+    if not sep:
+        return left + right
+    if left.endswith(sep) or right.startswith(sep):
+        return left + right
     return left + sep + right
 
 
