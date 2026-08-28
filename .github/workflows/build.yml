@@ -114,6 +114,13 @@ jobs:
           python tests/test_gui_smoke.py
           # 実データを使う 1 件は、音声が無い環境では自動で飛ぶ（CI がここ）
           python tests/test_listen_order.py
+          python tests/test_candidates.py
+          # 言語プロファイルと、鍵・集計 CSV のガード。**CI で走らせないと
+          # 「入れたつもり」で終わる**——ガードそのものが動いていない状態は、
+          # このリポジトリで何度も踏んだ形。
+          python tests/test_lang.py
+          python tests/test_cache_key.py
+          python tests/test_measure_header.py
 
       - name: Build with PyInstaller
         run: pyinstaller --clean -y build.spec
