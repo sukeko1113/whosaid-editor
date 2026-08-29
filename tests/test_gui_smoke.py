@@ -39,6 +39,56 @@ def real_config_path() -> Path | None:
     return Path(REAL_APPDATA) / "WhosaidEditor" / "config.json"
 
 
+# ======================================================================
+# **押し出されて消えた部品を、幅の検査から見逃さない。**
+#
+# 幅の検査は winfo_ismapped() の部品だけを数えていた。説明文と候補の
+# 選択肢は排他で同時には出ないので（設計書 §10.3）、隠れているものを
+# 数えないこと自体は正しい。
+#
+# **だが pack は、入りきらない部品も unmap する。**そうなると要求幅が
+# その部品のぶんだけ小さくなり、**押し出された結果として検査が通る**。
+# 実測（1024x768・125% 表示）で［取り消し (Ctrl+Z)］が消え、6 個中 5 個で
+# 「収まる」と出ていた。一番ひどい状態で OK が出ていたことになる。
+#
+# 見分けはつく。意図して隠した部品（pack_forget）は pack の管理下から
+# 外れるが、入りきらずに消えた部品は管理下に残ったまま unmap される。
+# 実測で確認した（pack_slaves に残り、ismapped は False）。
+# ======================================================================
+
+def squeezed_out(parent) -> list:
+    """入りきらずに消えた部品。意図して隠したものは含まない。"""
+    try:
+        managed = list(parent.pack_slaves())
+    except Exception:                       # pack 以外で並べている行
+        managed = []
+    return [c for c in managed if not c.winfo_ismapped()]
+
+
+def visible_need(parent, pad: int = 0) -> tuple[int, list]:
+    """その行に要る幅と、押し出されて消えた部品。
+
+    幅は**見えている部品**から出す（排他の部品を二重に数えないため）。
+    消えた部品は呼び出し側が別に落とす——ここで幅に足すと「閾値の緩和の
+    裏返し」になり、何が起きたのかが読めなくなる。
+    """
+    lost = squeezed_out(parent)
+    need = sum(c.winfo_reqwidth() for c in parent.winfo_children()
+               if c.winfo_ismapped()) + pad
+    return need, lost
+
+
+def lost_names(lost: list) -> str:
+    """消えた部品を人が読める形に。"""
+    out = []
+    for c in lost:
+        try:
+            out.append(str(c.cget("text")) or c.winfo_class())
+        except Exception:
+            out.append(c.winfo_class())
+    return " / ".join(out)
+
+
 _REAL_CONFIG_STAMP = (real_config_path().stat().st_mtime
                       if real_config_path() and real_config_path().exists()
                       else None)
@@ -1547,13 +1597,15 @@ def run() -> int:
         _rows = [r for r in _frm.winfo_children() if r.winfo_children()]
         # **見えている部品だけ数える。**説明文と候補の選択肢は排他で、
         # 同時には出ない(設計書 §10.3)。両方を足すと実際より広く見積もる。
-        def _row_need(r):
-            return sum(c.winfo_reqwidth() for c in r.winfo_children()
-                       if c.winfo_ismapped()) + 20
-        _need = max(_row_need(r) for r in _rows)
+        # **押し出されて消えたぶんは別に落とす**(visible_need の注記)。
+        _needs = [visible_need(r, 20) for r in _rows]
+        _need = max(n for n, _ in _needs)
+        _lost = [c for _, lost in _needs for c in lost]
         _have = _frm.master.winfo_width()
         check(f"既定の幅で右ペインのボタン列が収まる（要 {_need} / 幅 {_have}）",
               _have >= _need)
+        check(f"右ペインで押し出された部品が無い（{lost_names(_lost) or 'なし'}）",
+              not _lost)
         check("＋この声を足す が右端をはみ出さない",
               awin.btn_del_added.winfo_x() + awin.btn_del_added.winfo_width()
               <= _have)
@@ -1563,10 +1615,14 @@ def run() -> int:
         # なり、右端の[取り消し]を押し出した(要 734px / 幅 713px。実機の
         # 指摘・2026-08-21)。§10.3.6・GPU の注記と同じ種類の失敗で 3 度目。
         _opts = awin.chk_apply_cluster.master
+        _need, _lost = visible_need(_opts, 20)
         _kids = [c for c in _opts.winfo_children() if c.winfo_ismapped()]
-        _need = sum(c.winfo_reqwidth() for c in _kids) + 20
         check(f"確定の行が収まる（要 {_need} / 幅 {_opts.master.winfo_width()}）",
               _opts.master.winfo_width() >= _need)
+        # **この行に排他の部品は無い**(assign_gui.py:1045-1057 で 6 つとも
+        # 素直に pack している)。消えていたら押し出されたということ。
+        check(f"確定の行で押し出された部品が無い（{lost_names(_lost) or 'なし'}）",
+              not _lost)
         check("チェックの文字列に注記を埋めていない",
               len(str(awin.chk_apply_cluster.cget("text"))) <= 32)
         check("[取り消し]が窓の右端をはみ出さない",
@@ -1588,9 +1644,12 @@ def run() -> int:
             check("候補が出ている（この検査の前提）",
                   len(awin._current_voice_candidates) >= 1)
             _row = awin.btn_cand_add.master.master
+            _need_c, _lost_c = visible_need(_row, 20)
             check("候補を出しても収まる（要 "
-                  + str(_row_need(_row)) + " / 幅 " + str(_have) + "）",
-                  _have >= _row_need(_row))
+                  + str(_need_c) + " / 幅 " + str(_have) + "）",
+                  _have >= _need_c)
+            check("候補の行で押し出された部品が無い"
+                  f"（{lost_names(_lost_c) or 'なし'}）", not _lost_c)
             check("候補が出ている間は説明文を出さない（幅の取り合い）",
                   not awin.lbl_cand.winfo_ismapped())
         finally:
@@ -1619,6 +1678,9 @@ def run() -> int:
         check(f"下の帯のボタンが既定の幅に収まる（要 {_need_bar} / 幅 "
               f"{_bottom_bar.winfo_width()}）",
               _bottom_bar.winfo_width() >= _need_bar)
+        _lost_bar = squeezed_out(_bottom_bar)
+        check(f"下の帯で押し出された部品が無い（{lost_names(_lost_bar) or 'なし'}）",
+              not _lost_bar)
         _rep = next((c for c in _left
                      if "語句" in str(c.cget("text"))), None)
         check("［語句をまとめて直す...］がある", _rep is not None)
@@ -2071,12 +2133,15 @@ def run() -> int:
                 _je = _w
         check("［時刻へ飛ぶ］の入力欄が見えている",
               _je is not None and _je.winfo_ismapped() and _je.winfo_width() > 10)
-        check("絞り込みの行が左ペインに収まる",
-              all(sum(c.winfo_reqwidth() for c in r.winfo_children()
-                      if c.winfo_ismapped()) + 10 <= jwin.tree.master.winfo_width()
-                  for r in jwin.tree.master.winfo_children()
+        _frows = [r for r in jwin.tree.master.winfo_children()
                   if r is not jwin.tree and r.winfo_children()
-                  and r.winfo_class() == "TFrame"))
+                  and r.winfo_class() == "TFrame"]
+        check("絞り込みの行が左ペインに収まる",
+              all(visible_need(r, 10)[0] <= jwin.tree.master.winfo_width()
+                  for r in _frows))
+        _lost_f = [c for r in _frows for c in squeezed_out(r)]
+        check(f"絞り込みの行で押し出された部品が無い（{lost_names(_lost_f) or 'なし'}）",
+              not _lost_f)
         check("一覧が見えている", jwin.tree.winfo_ismapped())
 
         jwin.var_jump.set("25:02")          # 1502 秒 = 3 番目の区間の先頭
