@@ -106,21 +106,64 @@ jobs:
           # ランナーの標準出力は cp1252。テスト側でも出力を UTF-8 に
           # 固定しているが、subprocess 等からの出力も含めて念のため。
           $env:PYTHONIOENCODING = 'utf-8'
+          # **出力を溜めない。**溜まると、止まったときにどこで止まったかが
+          # ログから分からない（2026-08-19〜08-27 の 14 実行が 30 分で
+          # 打ち切られたとき、最後の出力は停止位置の 27 分前だった）。
+          $env:PYTHONUNBUFFERED = '1'
           $env:PATH = "$PWD\ffmpeg;$env:PATH"
-          python tests/test_core.py
-          python tests/test_anchor.py
-          python tests/test_inspection.py
-          python tests/test_pipeline_integration.py
-          python tests/test_gui_smoke.py
-          # 実データを使う 1 件は、音声が無い環境では自動で飛ぶ（CI がここ）
-          python tests/test_listen_order.py
-          python tests/test_candidates.py
-          # 言語プロファイルと、鍵・集計 CSV のガード。**CI で走らせないと
-          # 「入れたつもり」で終わる**——ガードそのものが動いていない状態は、
-          # このリポジトリで何度も踏んだ形。
-          python tests/test_lang.py
-          python tests/test_cache_key.py
-          python tests/test_measure_header.py
+
+          # **1 本ずつ走らせて、終了コードを全部集める。**
+          # pwsh のステップは末尾に exit $LASTEXITCODE が付くだけなので、
+          # コマンドを素直に並べると**最後の 1 本の結果しか見ない**。
+          # 実際、fabffe9(2026-08-28)は 3 件落ちたまま success になった。
+          # 最後の test_measure_header が 0 を返しただけで緑になっていた。
+          #
+          # 途中で止めないのは、1 本目の失敗で残りが見えなくなると
+          # 「他にも落ちているか」が分からず、直すたびに CI を回す羽目に
+          # なるため。全部走らせて、最後にまとめて落とす。
+          $scripts = @(
+            'tests/test_core.py',
+            'tests/test_anchor.py',
+            'tests/test_inspection.py',
+            'tests/test_pipeline_integration.py',
+            'tests/test_gui_smoke.py',
+            # 実データを使う 1 件は、音声が無い環境では自動で飛ぶ（CI がここ）
+            'tests/test_listen_order.py',
+            'tests/test_candidates.py',
+            # 言語プロファイルと、鍵・集計 CSV のガード。**CI で走らせないと
+            # 「入れたつもり」で終わる**——ガードそのものが動いていない状態は、
+            # このリポジトリで何度も踏んだ形。
+            'tests/test_lang.py',
+            'tests/test_cache_key.py',
+            'tests/test_measure_header.py'
+          )
+
+          $results = @()
+          foreach ($s in $scripts) {
+            Write-Host "::group::$s"
+            $global:LASTEXITCODE = 0
+            python $s
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0) {
+              # ::error:: で出すと、実行の一覧からも落ちた本数が見える
+              Write-Host "::error file=$s::$s が失敗しました (exit $code)"
+            }
+            $results += [pscustomobject]@{ Script = $s; Exit = $code }
+          }
+
+          Write-Host ''
+          Write-Host '===== テストの結果 ====='
+          foreach ($r in $results) {
+            $mark = if ($r.Exit -eq 0) { 'PASS' } else { 'FAIL' }
+            Write-Host ('{0}  {1,-40} exit {2}' -f $mark, $r.Script, $r.Exit)
+          }
+
+          $failed = @($results | Where-Object { $_.Exit -ne 0 })
+          Write-Host ('{0} 本中 {1} 本が失敗しました。' -f $results.Count, $failed.Count)
+          if ($failed.Count -gt 0) {
+            throw ('テストが失敗しました: ' + (($failed | ForEach-Object { $_.Script }) -join ', '))
+          }
 
       - name: Build with PyInstaller
         run: pyinstaller --clean -y build.spec
