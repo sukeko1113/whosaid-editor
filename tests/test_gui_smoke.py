@@ -1686,7 +1686,9 @@ def run() -> int:
         check("窓が画面からはみ出さない",
               awin.winfo_width() <= awin.winfo_screenwidth()
               and awin.winfo_height() <= awin.winfo_screenheight())
-        _bottom_bar = awin.winfo_children()[-1]
+        # **末尾の子で取らない。**帯を 2 行にしたとき、これは新しく足した
+        # 行を指してしまい、編集系と出力系の両方を出力系で測っていた。
+        _bottom_bar = awin.bottom_edit
         # **これは素通りしていた。**下の帯は grid で最下段に固定されるので、
         # 「下端 <= 窓の高さ」はどんな条件でも真になる(実測: どの画面・
         # どの拡大率でも余り 0)。高さが足りているかを測っていなかった。
@@ -1695,11 +1697,15 @@ def run() -> int:
         # 高さが固定で、入らなければ下から切れる(本文と候補は縮む側なので
         # 対象にしない)。行を足す変更を重ねているので、ここが効いていないと
         # 「幅は直したが下が見えない」に気づけない。
+        # **下の帯 2 行もここで見る。**「帯が窓の中にある」という検査を
+        # 別に置いていたが、帯は grid の最下段に固定されるので常に真だった。
+        # 素通りを残さないため消し、この検査に含める。
         _fixed_rows = (list(awin._time_rows)
                        + [awin.btn_confirm_time.master,
                           awin.btn_del_added.master,
                           awin.chk_apply_cluster.master,
-                          awin.btn_undo.master])
+                          awin.btn_undo.master,
+                          _bottom_bar, awin.bottom_out])
         _clipped = []
         for _r in _fixed_rows:
             if not _r.winfo_ismapped():
@@ -1711,23 +1717,32 @@ def run() -> int:
                 _clipped.append(_r)
         check(f"縮まない行が下まで見えている（切れ {len(_clipped)} 行）",
               not _clipped)
-        check("いちばん下の帯（保存など）が窓の中にある",
-              _bottom_bar.winfo_y() + _bottom_bar.winfo_height()
-              <= awin.winfo_height())
         # 下の帯は既に混んでいる。[語句をまとめて直す...]を足したので、
         # **横に押し出されていないか**を数える(§10.3.6 で特別な選択肢が
         # 窓の外に出ていた前例がある)。
+        # **帯は 2 行ある**(編集系 / 出力系)。両方測る。
+        for _name, _bar in (("編集系", _bottom_bar), ("出力系", awin.bottom_out)):
+            _need_bar, _lost_bar = visible_need(_bar, 24)
+            check(f"下の帯（{_name}）が既定の幅に収まる（要 {_need_bar} / 幅 "
+                  f"{_bar.winfo_width()}）",
+                  _bar.winfo_width() >= _need_bar)
+            check(f"下の帯（{_name}）で押し出された部品が無い"
+                  f"（{lost_names(_lost_bar) or 'なし'}）", not _lost_bar)
+        # **［保存］は空いている行に置く。**混んでいる編集系の行に戻すと、
+        # 狭い画面で押し出される(1024x768@125% で実際に消えていた)。
+        #
+        # 「見えているか」だけでは検査にならない。窓を 100px まで詰めても
+        # ［保存］は消えなかった——右寄せの並び順で［元音声と照合］が先に
+        # 落ちるため、押し出しのガードが必ず先に発火する(実測)。
+        # **置き場所を留めるほうが、実際に落ちうる検査になる。**
+        check("［保存］が空いているほうの行にある",
+              awin.btn_save.master is awin.bottom_out)
+        check("［保存］が見えている",
+              awin.btn_save.winfo_ismapped()
+              and awin.btn_save.winfo_rootx() + awin.btn_save.winfo_width()
+              <= awin.winfo_rootx() + awin.winfo_width())
         _left = [c for c in _bottom_bar.winfo_children()
                  if c.winfo_ismapped() and c.pack_info().get("side") == "left"]
-        _right = [c for c in _bottom_bar.winfo_children()
-                  if c.winfo_ismapped() and c.pack_info().get("side") == "right"]
-        _need_bar = (sum(c.winfo_reqwidth() for c in _left + _right) + 24)
-        check(f"下の帯のボタンが既定の幅に収まる（要 {_need_bar} / 幅 "
-              f"{_bottom_bar.winfo_width()}）",
-              _bottom_bar.winfo_width() >= _need_bar)
-        _lost_bar = squeezed_out(_bottom_bar)
-        check(f"下の帯で押し出された部品が無い（{lost_names(_lost_bar) or 'なし'}）",
-              not _lost_bar)
         _rep = next((c for c in _left
                      if "語句" in str(c.cget("text"))), None)
         check("［語句をまとめて直す...］がある", _rep is not None)
@@ -2167,8 +2182,11 @@ def run() -> int:
         # **［時刻へ飛ぶ］が画面から押し出されていないこと。**
         # 「候補のみ」を足したぶんで絞り込みの行が 840px になり、左ペイン
         # (775px)から入力欄が消えて押せなくなった(実機の指摘・2026-08-19)。
+        # **本体と同じ式にする**(assign_gui.py:653)。800 と書いていたので
+        # 本体より低い窓で測っていた。厳しい側なので害は無かったが、
+        # 別の式が 2 つあると、片方だけ直したときに食い違う。
         jwin.geometry(f"{min(1320, jwin.winfo_screenwidth() - 40)}"
-                      f"x{min(800, jwin.winfo_screenheight() - 90)}")
+                      f"x{min(900, jwin.winfo_screenheight() - 90)}")
         jwin.update()
         _je = None
         _stack = [jwin]

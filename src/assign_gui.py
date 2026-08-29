@@ -1102,7 +1102,19 @@ class AssignWindow(tk.Toplevel):
                                    padx=8, pady=(0, 4))
 
         # --- 下部: ボタン ----------------------------------------------
-        bottom = ttk.Frame(self, padding=(10, 4, 10, 10))
+        # **下の帯は 2 行に分ける。**10 個を 1 行に並べていたが、全部を
+        # 数えると 100% で 1015px・125% で 1233px・150% で 1486px 要る。
+        # 1024x768(帯の幅 984px)では 100% でも［元音声と照合］が、125% では
+        # **［保存］が消えていた**(CI が実測・2026-08-29)。幅の検査は通って
+        # いた——消えた部品は数に入らないので要求幅が小さく出るため。
+        #
+        # **3 行には分けない。**高さの余裕が 1280x720@150% で 0 行、
+        # 1024x768@150% と 1366x768@150% で 1 行しかなく、2 行足すと
+        # 上の「縮まない行」が切れる(実測)。
+        #
+        # 分ける線は編集系(左)と出力系(右)。出力は作業の終わりに押すもので、
+        # 種類が違う。
+        bottom = self.bottom_edit = ttk.Frame(self, padding=(10, 4, 10, 0))
         bottom.grid(row=3, column=0, sticky="ew")
         ttk.Button(bottom, text="出席者を編集...", command=self.edit_roster).pack(side="left")
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
@@ -1121,11 +1133,17 @@ class AssignWindow(tk.Toplevel):
                                         command=self.undo_bulk_times,
                                         state="disabled")
         self.btn_undo_bulk.pack(side="left")
-        ttk.Button(bottom, text="Word で出力...", command=self.export_docx).pack(side="right")
-        ttk.Button(bottom, text="保存", command=self.save).pack(side="right", padx=6)
+
+        # 出力系。**［保存］はここ。**画面の右下という定位置を変えない。
+        self.bottom_out = ttk.Frame(self, padding=(10, 0, 10, 10))
+        self.bottom_out.grid(row=4, column=0, sticky="ew")
+        ttk.Button(self.bottom_out, text="Word で出力...",
+                   command=self.export_docx).pack(side="right")
+        self.btn_save = ttk.Button(self.bottom_out, text="保存", command=self.save)
+        self.btn_save.pack(side="right", padx=6)
         # 「この書面はこの録音から作った」の検算(SHA-256 の再計算と突き合わせ)
-        ttk.Button(bottom, text="元音声と照合", command=self.verify_source_audio)\
-            .pack(side="right", padx=(0, 6))
+        ttk.Button(self.bottom_out, text="元音声と照合",
+                   command=self.verify_source_audio).pack(side="right", padx=(0, 6))
 
         self.var_backend.set({
             "ffplay": "再生: ffplay(同梱)",
