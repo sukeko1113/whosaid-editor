@@ -3234,10 +3234,15 @@ def test_device_choice_pairs_with_the_model():
     実測(2026-08-20・GTX 1660 SUPER)で、GPU + large-v3 + int8_float16 は
     誤字 11.9% → 7.0%、67 分の音声が 24 分 → 15.5 分。**速くなって正確**
     という珍しい形なので、利用者に選ばせる必要がない。
+
+    **GPU 側の既定は `test_default_model_only_picks_what_is_there` が見る。**
+    ここで `default_model(GPU_DEVICE)` を検査していたが、あれは large-v3 が
+    ディスクにあるかどうかで変わる(align.py:193)ので、手元では通り CI では
+    落ちる——機械の状態が漏れていただけだった。向こうは一時フォルダで
+    両方の分岐を作るので、どの機械でも同じ結果になる。
     """
     from src import align
     assert align.default_model("cpu") == align.DEFAULT_MODEL == "small"
-    assert align.default_model(align.GPU_DEVICE) == align.GPU_DEFAULT_MODEL
     assert "large-v3" in align.AVAILABLE_MODELS
     # GPU を使わない指定は、GPU のある機械でも CPU の組を返す
     assert align.pick_device(prefer_gpu=False) == (align.DEVICE,
