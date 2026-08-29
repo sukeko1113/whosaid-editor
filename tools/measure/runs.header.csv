@@ -1,0 +1,1 @@
+source_id,engine,model,run_date,params_note,elapsed_sec,api_calls,tokens_in,tokens_out,retry_count,runaway_count,segments,clusters,text_len_median,text_len_p90,seg_sec_median,seg_sec_p90,uncovered_gaps,align_model,coverage_median,coverage_p10,unmatched,below_threshold,min_block,min_coverage,notes

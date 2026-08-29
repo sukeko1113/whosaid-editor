@@ -55,7 +55,12 @@ gemini-transcriber/
 ffmpeg/ffplay.exe
 ffmpeg/ffplay
 
-# ����m�F�p�̉����ƍ�ƃt�@�C��
+# 話者分離のモデル(ffmpeg と同じ扱い。各環境/CI で配置し、ビルドで同梱する)
+#   models/diarize/sherpa-onnx-pyannote-segmentation-3-0/model.onnx  … MIT
+#   models/diarize/nemo_en_titanet_small.onnx                        … CC-BY-4.0
+models/
+
+# 動作確認用の音声と作業ファイル
 _tmp/
 *.m4a
 *.mp3

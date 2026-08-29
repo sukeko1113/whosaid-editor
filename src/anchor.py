@@ -28,12 +28,19 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Optional, Sequence
 
+from . import lang
 from .align import Word
 
 
-# 一致とみなす最短の長さ。日本語は 1〜2 文字の一致が偶然でも頻発するので、
-# それを拾うと誤ったアンカーだらけになる。
-MIN_BLOCK = 3
+# 一致とみなす最短の長さ。**言語で変わる**ので lang.py が持つ。
+#   日本語 3  … 1〜2 文字の一致が偶然でも頻発する
+#   英語  10  … 3 文字では the / and / for が当たり続ける
+# 値の根拠(実測)は lang.py の各プロファイルに書いてある。
+#
+# **この定数は互換のために残してある。**import した時点の値で固定されるので、
+# lang.use() の切り替えが効かない。新しい呼び出しは min_block=None のまま
+# 渡し、関数の中で現在のプロファイルから引くこと。
+MIN_BLOCK = lang.JA.matching.min_block
 
 # 区間の時刻の前後、何秒ぶんの単語を探すか。実測のドリフトは +6.8 秒程度
 # だったので、4 倍以上の余裕を取ってある(§12 のキャリブレーション対象)。
@@ -175,7 +182,7 @@ def measure(
     t0: float,
     t1: float,
     *,
-    min_block: int = MIN_BLOCK,
+    min_block: Optional[int] = None,
 ) -> Optional[Measured]:
     """1 区間ぶんを、[t0, t1] の範囲の実測と突き合わせる。
 
@@ -189,6 +196,12 @@ def measure(
     区間の頭が丸ごと聞き取れていない場合、始まりはその分だけ後ろに出る。
     head_gap と被覆率を一緒に返すので、呼び出し側で補正・棄却できる。
     """
+    # **既定は import 時ではなく呼ばれた時に決める。**既定引数に書くと
+    # 値が import 時に固定され、lang.use() の切り替えが効かない
+    # (feature/en-test では、この罠のせいで検査が min_block を明示的に
+    #  渡す必要があった)。
+    if min_block is None:
+        min_block = lang.current().matching.min_block
     norm, _ = normalize(text)
     if not norm:
         return None
@@ -226,7 +239,7 @@ def measure_segments(
     near_window: float = NEAR_WINDOW,
     wide_window: float = WIDE_WINDOW,
     good_enough: float = GOOD_ENOUGH,
-    min_block: int = MIN_BLOCK,
+    min_block: Optional[int] = None,
 ) -> list[Optional[Measured]]:
     """全区間ぶんまとめて実測と突き合わせる。
 
@@ -247,6 +260,8 @@ def measure_segments(
     1 度目で見つからなかった区間だけ、広い窓でもう一度探す。数が少ないので
     広げても安く、ドリフトが大きい帯を取りこぼさずに済む。
     """
+    if min_block is None:
+        min_block = lang.current().matching.min_block
     track = prepare(words)
     results: list[Optional[Measured]] = [None] * len(spans)
     if not track.text:

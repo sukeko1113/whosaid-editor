@@ -29,13 +29,15 @@ jobs:
       - name: Download ffmpeg + ffplay
         shell: pwsh
         run: |
-          # 配布元を 1 つに頼らない。gyan.dev は共有ホスト上にあり、
-          # 503 (resource limitation) でビルドが止まる事例が実際にあった。
-          # 失敗したら少し待って再試行し、それでも駄目なら
-          # GitHub 上でホストされている BtbN のビルドに切り替える。
-          # どちらも bin/ 配下に ffmpeg.exe / ffplay.exe を含む LGPL 版。
+          # **LGPL 版でなければならない。**本体は MIT で、GPL の FFmpeg を
+          # 同梱すると「同梱物全体を GPL にせよ」と衝突する。別プロセスで
+          # 起動する使い方なので、LGPL なら MIT のまま配れる。
+          #
+          # 以前ここには gyan.dev の release-essentials を先に書いていたが、
+          # **あれは --enable-gpl でビルドされた GPL 版**だった(2026-08-21 に
+          # 実測して発覚)。コメントには「どちらも LGPL 版」と書いてあり、
+          # 誰も確かめていなかった。**この下で構成を検査する。**
           $sources = @(
-            'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
             'https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl.zip'
           )
 
@@ -66,11 +68,37 @@ jobs:
           Get-ChildItem ffmpeg | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
           & ffmpeg/ffmpeg.exe -version
 
+          # **LGPL かをここで確かめる。**コメントに「LGPL 版」と書くだけでは
+          # 配布元が差し替わっても気づけない(実際に GPL 版が入っていた)。
+          # CREDITS.txt は LGPL と表示しており、食い違うと表示が嘘になる。
+          $cfg = (& ffmpeg/ffmpeg.exe -version 2>&1 | Out-String)
+          foreach ($bad in @('--enable-gpl', '--enable-nonfree')) {
+            if ($cfg -match [regex]::Escape($bad)) {
+              throw "取得した ffmpeg は $bad です。CREDITS.txt は LGPL と表示しており、MIT の本体に同梱できません。"
+            }
+          }
+          Write-Host 'ffmpeg は LGPL 構成です。'
+
+      - name: Download speaker diarization models
+        shell: pwsh
+        run: |
+          # models/ は .gitignore で除外してある(合計 44MB・ライセンスも別々)。
+          # 取得元と SHA-256 はスクリプト側に 1 つだけ書く。ここに URL を
+          # 書き写すと、片方だけ古くなる。
+          # 依存を入れる前に走る —— 標準ライブラリだけで動く。
+          python tools/fetch_diarize_models.py
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+
+      # **転写のモデルを同梱する。**入れないと利用者の端末が初回に通信を
+      # 要し、「ネットワークを遮断したままでも動きます」が嘘になる。
+      # huggingface_hub が要るので、依存を入れたあとに走らせる。
+      - name: Download ASR model (small)
+        run: python tools/fetch_asr_model.py small
 
       - name: Run tests
         shell: pwsh
@@ -78,12 +106,64 @@ jobs:
           # ランナーの標準出力は cp1252。テスト側でも出力を UTF-8 に
           # 固定しているが、subprocess 等からの出力も含めて念のため。
           $env:PYTHONIOENCODING = 'utf-8'
+          # **出力を溜めない。**溜まると、止まったときにどこで止まったかが
+          # ログから分からない（2026-08-19〜08-27 の 14 実行が 30 分で
+          # 打ち切られたとき、最後の出力は停止位置の 27 分前だった）。
+          $env:PYTHONUNBUFFERED = '1'
           $env:PATH = "$PWD\ffmpeg;$env:PATH"
-          python tests/test_core.py
-          python tests/test_anchor.py
-          python tests/test_inspection.py
-          python tests/test_pipeline_integration.py
-          python tests/test_gui_smoke.py
+
+          # **1 本ずつ走らせて、終了コードを全部集める。**
+          # pwsh のステップは末尾に exit $LASTEXITCODE が付くだけなので、
+          # コマンドを素直に並べると**最後の 1 本の結果しか見ない**。
+          # 実際、fabffe9(2026-08-28)は 3 件落ちたまま success になった。
+          # 最後の test_measure_header が 0 を返しただけで緑になっていた。
+          #
+          # 途中で止めないのは、1 本目の失敗で残りが見えなくなると
+          # 「他にも落ちているか」が分からず、直すたびに CI を回す羽目に
+          # なるため。全部走らせて、最後にまとめて落とす。
+          $scripts = @(
+            'tests/test_core.py',
+            'tests/test_anchor.py',
+            'tests/test_inspection.py',
+            'tests/test_pipeline_integration.py',
+            'tests/test_gui_smoke.py',
+            # 実データを使う 1 件は、音声が無い環境では自動で飛ぶ（CI がここ）
+            'tests/test_listen_order.py',
+            'tests/test_candidates.py',
+            # 言語プロファイルと、鍵・集計 CSV のガード。**CI で走らせないと
+            # 「入れたつもり」で終わる**——ガードそのものが動いていない状態は、
+            # このリポジトリで何度も踏んだ形。
+            'tests/test_lang.py',
+            'tests/test_cache_key.py',
+            'tests/test_measure_header.py'
+          )
+
+          $results = @()
+          foreach ($s in $scripts) {
+            Write-Host "::group::$s"
+            $global:LASTEXITCODE = 0
+            python $s
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0) {
+              # ::error:: で出すと、実行の一覧からも落ちた本数が見える
+              Write-Host "::error file=$s::$s が失敗しました (exit $code)"
+            }
+            $results += [pscustomobject]@{ Script = $s; Exit = $code }
+          }
+
+          Write-Host ''
+          Write-Host '===== テストの結果 ====='
+          foreach ($r in $results) {
+            $mark = if ($r.Exit -eq 0) { 'PASS' } else { 'FAIL' }
+            Write-Host ('{0}  {1,-40} exit {2}' -f $mark, $r.Script, $r.Exit)
+          }
+
+          $failed = @($results | Where-Object { $_.Exit -ne 0 })
+          Write-Host ('{0} 本中 {1} 本が失敗しました。' -f $results.Count, $failed.Count)
+          if ($failed.Count -gt 0) {
+            throw ('テストが失敗しました: ' + (($failed | ForEach-Object { $_.Script }) -join ', '))
+          }
 
       - name: Build with PyInstaller
         run: pyinstaller --clean -y build.spec
@@ -91,10 +171,10 @@ jobs:
       - name: Smoke test (exe should exist)
         shell: pwsh
         run: |
-          if (-not (Test-Path 'dist/GeminiTranscriber/GeminiTranscriber.exe')) {
+          if (-not (Test-Path 'dist/WhosaidEditor/WhosaidEditor.exe')) {
             throw 'Build artifact not found'
           }
-          Get-ChildItem dist/GeminiTranscriber | Select-Object Name, Length
+          Get-ChildItem dist/WhosaidEditor | Select-Object Name, Length
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -106,15 +186,15 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiTranscriber-Installer
+          name: WhosaidEditor-Installer
           path: Output/*.exe
           if-no-files-found: error
 
       - name: Upload portable build (zip)
         uses: actions/upload-artifact@v4
         with:
-          name: GeminiTranscriber-Portable
-          path: dist/GeminiTranscriber/**
+          name: WhosaidEditor-Portable
+          path: dist/WhosaidEditor/**
 
       - name: Create GitHub Release on tag
         if: startsWith(github.ref, 'refs/tags/v')

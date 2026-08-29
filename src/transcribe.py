@@ -11,6 +11,10 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml.ns import qn
 
+from . import lang
+
+from .segments import Utterance, utterances_to_segments
+
 
 # ======================================================================
 # プロンプト部品
@@ -20,80 +24,8 @@ from docx.oxml.ns import qn
 #   - 参加者名簿(roster)があれば話者ラベルを実名にする
 # ======================================================================
 
-_RULES_CLEANUP = """- 内容は正確に一言一句書き起こす(情報の欠落・改変なし)
-- フィラー(「えー」「あのー」「えっと」「まあ」「そのー」など)は適宜削除
-- 言い淀み・不要な繰り返しは整理し、読みやすい日本語に整える
-- 話者の意図・固有名詞・数字は正確に保つ
-- 聞き取れなかった箇所は [不明] と記す"""
-
-_RULES_VERBATIM = """【逐語(一言一句)ルール・最重要】
-- 発言は一切要約・整文しない。話されたとおりに書き起こす
-- 「えー」「あのー」「えっと」等の言いよどみ(フィラー)、言い直し、繰り返しも省略せずそのまま残す
-- 聞き取れない箇所は推測で補完せず、必ず「(聴取不能)」と表記する
-- 音声に存在しない語句を付け加えない。文法的に不自然でも直さない
-- 固有名詞が不明瞭な場合は、聞こえたとおりに表記する(勝手に「正しい」名前に直さない)
-- 実際に発話された内容だけを書く。音声上で繰り返されていない限り、出力で同じ言葉を繰り返さない"""
-
-_RULES_TS = """- **段落の先頭に必ず [MM:SS] 形式のタイムスタンプを入れる**
-  (音声内のその段落が始まる時刻、ゼロ埋め2桁、例: [00:00], [03:45])
-- 段落は話題のまとまり・明確な区切り・または30秒~2分ごとに分ける"""
-
-_RULES_DIAR = """- **話者が変わるごとに新しい行として書き出す**
-- **各行の冒頭に必ず以下の形式を入れる**:
-  [MM:SS] 【話者ラベル】 本文...
-  (時刻はゼロ埋め2桁の分:秒。ミリ秒や1/100秒は付けない)
-- 短い相づち(「はい」「うん」程度)は前の発言と同じ行に含めてよい"""
-
-_TAIL = "- 説明や前置き、Markdown 装飾は不要。書き起こし本文のみを出力する。"
-
-# v2.0.0: 手動割当モード用。名簿は渡さず、声質だけで区間に切り分けさせる。
-# 実名の推定をやめたので、プロンプトが短くなり応答も安定する。
-_RULES_CLUSTER = """- **行を分けるのは「話す人が変わったとき」だけ**
-- **各行は必ず次の形式で始める**:
-  [MM:SS] 【A】 本文...
-  (時刻はこの音声の先頭からの 分:秒。ゼロ埋め2桁。ミリ秒は付けない)
-- 話者ラベルは A, B, C, ... のアルファベット1文字のみ。**名前や役職は絶対に書かない**
-- 同じ声の人物には常に同じラベルを使う。声が変われば必ず別のラベルにする
-- **同じ人が話し続けている間は、絶対に行を分けない**。
-  息継ぎ・間・読点・言いよどみで区切ってはいけない。
-  文がいくつ続いても、次の人が話し始めるまでは 1 行に書く。
-  (悪い例: 「工程表」「えー、財源計画」「年度別資金繰り」と 3 行に分ける
-   → 正しくは 1 行に「工程表、えー、財源計画、年度別資金繰り…」と続ける)
-- 同じ人が 3 分以上話し続けた場合のみ、話題の切れ目で行を分けてよい
-- 短い相づち(「はい」「うん」程度)も、別の人物の声なら独立した行にする
-- 誰の声か判別できない場合は 【?】、複数人が同時に話している場合は 【*】 とする"""
-
-_EXAMPLE_CLUSTER = """出力例:
-[00:00] 【A】 本日はお忙しい中お集まりいただきありがとうございます。それでは議事を始めます。まず、お手元の資料をご覧ください。えー、本日の議題は、予算と、あの、人事の二点になります。
-[00:25] 【B】 すみません、確認ですが、前回の議事録は配布済みですか?
-[00:32] 【A】 はい、配布済みです。修正点も反映されています。
-[00:40] 【C】 その件、私からも補足させてください。"""
-
-
-def _roster_block(roster: str) -> str:
-    return f"""この音声の参加者は以下のとおり事前に判明しています。話者の判別には、声質に加えて、
-発言内容(名乗り・指名・役職に応じた発言内容)も手がかりにしてください。
-
-【参加者名簿】
-{roster.strip()}
-
-- 話者ラベルは名簿にある呼称を【】で囲んで用いる(例: 【議長(理事長)】【佐藤理事】)
-- どうしても特定できない場合のみ【発言者不明】、複数人の発話が重なる場合は【発言者複数・重複】とする。
-  無理に名簿の誰かに割り当てるより、不明と明示するほうが望ましい"""
-
-
-_LABEL_ABC = """- 話者ラベル(発言者A, 発言者B, 発言者C...)は声の特徴で識別し、同じ人物には常に同じラベルを使う
-- 話者を特定できない場合は【発言者不明】とする"""
-
-_EXAMPLE_DIAR = """出力例:
-[00:00] 【発言者A】 本日はお忙しい中お集まりいただきありがとうございます。それでは議事を始めます。
-[00:25] 【発言者B】 すみません、確認ですが、前回の議事録は配布済みですか?
-[00:32] 【発言者A】 はい、配布済みです。修正点も反映されています。"""
-
-_EXAMPLE_TS = """出力例:
-[00:00] 本日の会議を開始します。まず議題ですが、予算と人事の二点になります。
-[00:42] それでは一つ目、来期予算について議論を始めます。
-[03:15] 続いて人事についての検討に移ります。"""
+# プロンプトの部品は src/lang.py へ移した(言語で変わるため)。
+# ここに書き戻さないこと——言語を足す人が 2 箇所を見ることになる。
 
 
 def build_prompt(
@@ -108,39 +40,41 @@ def build_prompt(
     cluster_only=True のときは v2.0.0 の手動割当モード用。
     名簿を渡さず、声質だけで A/B/C… に切り分けた区間リストを作らせる。
     """
-    parts: list[str] = ["この音声を日本語で書き起こしてください。", ""]
+    # **プロンプト一式は言語で変わる**ので lang.py が持つ。
+    p = lang.current().prompt
+    parts: list[str] = [p.opening, ""]
 
     if cluster_only:
-        parts.append("ルール:")
-        parts.append(_RULES_CLUSTER)
-        parts.append(_RULES_VERBATIM if verbatim else _RULES_CLEANUP)
+        parts.append(p.rules_heading)
+        parts.append(p.rules_cluster)
+        parts.append(p.rules_verbatim if verbatim else p.rules_cleanup)
         if verbatim:
-            parts.append("- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)")
-        parts.append(_TAIL)
-        parts += ["", _EXAMPLE_CLUSTER]
+            parts.append(p.verbatim_punct)
+        parts.append(p.tail)
+        parts += ["", p.example_cluster]
         return "\n".join(parts)
 
     if with_diarization and roster.strip():
-        parts += [_roster_block(roster), ""]
+        parts += [p.roster_block(roster), ""]
 
-    parts.append("ルール:")
+    parts.append(p.rules_heading)
     if with_diarization:
-        parts.append(_RULES_DIAR)
+        parts.append(p.rules_diar_verbatim if verbatim else p.rules_diar)
         if not roster.strip():
-            parts.append(_LABEL_ABC)
+            parts.append(p.label_abc)
     elif with_timestamps:
-        parts.append(_RULES_TS)
+        parts.append(p.rules_ts)
 
-    parts.append(_RULES_VERBATIM if verbatim else _RULES_CLEANUP)
+    parts.append(p.rules_verbatim if verbatim else p.rules_cleanup)
     if verbatim:
         # 逐語モードでも段落・句読点の最低限の整形は許可する
-        parts.append("- 句読点は聞こえたとおりの区切りで付けてよい(内容の変更は不可)")
-    parts.append(_TAIL)
+        parts.append(p.verbatim_punct)
+    parts.append(p.tail)
 
     if with_diarization and not roster.strip():
-        parts += ["", _EXAMPLE_DIAR]
+        parts += ["", p.example_diar_verbatim if verbatim else p.example_diar]
     elif with_timestamps and not with_diarization:
-        parts += ["", _EXAMPLE_TS]
+        parts += ["", p.example_ts]
 
     return "\n".join(parts)
 
@@ -361,6 +295,7 @@ def transcribe_audio(
             time.sleep(rest)
 
     for attempt in range(max_retries):
+        uploaded = None
         try:
             check_cancel()
             # 再試行時はアップロードからやり直すので、何回目かを添えないと
@@ -402,11 +337,6 @@ def transcribe_audio(
                 log("  ※ 再生成でも暴走が解消しませんでした。このチャンクは要確認です。")
                 text = f"【警告: このチャンクの出力は不安定でした。原音声を確認してください】\n{text}"
 
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                pass
-
             return text
 
         except CancelledError:
@@ -430,6 +360,16 @@ def transcribe_audio(
                 log(f"  通信エラー: {type(e).__name__}: {str(e)[:200]}")
                 log(f"  {wait}秒後に再試行します ({attempt + 2}/{max_retries}回目)...")
                 sleep_cancellable(wait)
+
+        finally:
+            # **失敗しても、上げた音声を必ず消す。**正常終了のときだけ
+            # 消していたので、途中でエラーになると Gemini 側に残っていた
+            # (48 時間後に自動削除されるが、録音は機微情報なので待たない)。
+            if uploaded is not None:
+                try:
+                    client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
 
     assert last_error is not None
     raise last_error
@@ -464,9 +404,20 @@ def normalize_cluster_label(label: str | None) -> str:
     s = _LABEL_STRIP.sub("", label.strip())
     if not s:
         return CLUSTER_UNKNOWN
-    if any(k in s for k in ("複数", "重複", "同時")) or s in ("*", "＊"):
+    # **擬似ラベルの語彙は言語で変わる。**足りないと 【Multiple】 が下の
+    # 「先頭の英字 1 文字」に落ち、クラスタ "M" という実在しない話者が立つ。
+    # しかも merge_consecutive がその連続を 1 人の発言として連結する。
+    #
+    # 日本語の語彙も常に見る。名簿や設定が日本語のまま英語音声を流すことが
+    # あり、どちらが来ても取りこぼさないほうが安全(誤判定の危険は無い——
+    # 「複数」が英語の話者ラベルとして現れることはない)。
+    labels = lang.current().labels
+    low = s.lower()
+    multi = tuple(labels.multi_words) + lang.JA.labels.multi_words
+    unknown = tuple(labels.unknown_words) + lang.JA.labels.unknown_words
+    if (any(k in s or k in low for k in multi)) or s in ("*", "＊"):
         return CLUSTER_MULTI
-    if any(k in s for k in ("不明", "不詳", "unknown")) or s in ("?", "？"):
+    if (any(k in s or k in low for k in unknown)) or s in ("?", "？"):
         return CLUSTER_UNKNOWN
     # 先頭の英字 1 文字を採用(「A」「A(男性)」「A さん」など)
     m = re.match(r"[A-Za-z]", s)
@@ -478,6 +429,14 @@ def normalize_cluster_label(label: str | None) -> str:
 # 同じ話者の連続をまとめるときの上限
 MERGE_MAX_SECONDS = 180.0    # これを超えたら区切る(聴き直しが辛くなるため)
 MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
+
+# 逐語モードの連結の上限。**180 秒のままだと、同じ人が話し続ける限り連結が
+# 進み、1 区間が 112 秒に達する(実測)。その区間には話者を割り当てられない**
+# ——間に何人も話しているため。Gemini 自体は 5〜8 秒ごとに出しており、
+# 潰していたのはこちらの後処理だった。
+# 20 秒はプロンプトの指示(「1 行が 20 秒を超えないように」)と揃えた値。
+# **連結を止めるのではない。**文の途中で割れた断片は従来どおりまとまる。
+VERBATIM_MERGE_MAX_SECONDS = 20.0
 
 # ----------------------------------------------------------------------
 # 発言の長さの見積もり
@@ -493,9 +452,14 @@ MERGE_MAX_GAP = 20.0         # 無音が長い場合は別の発言とみなす
 # 文字数から必要な秒数を見積もり、足りなければ終わりを延ばす。
 # ----------------------------------------------------------------------
 
-# 日本語の話速の目安。逐語では言いよどみが多く実測 4〜6 文字/秒。
-# 短く見積もると発言が途中で切れるので、遅めに見ておく。
-SPEECH_CHARS_PER_SECOND = 4.5
+# 話速の目安。**言語で変わる**ので lang.py が持つ。
+#   日本語 4.5 … 逐語では言いよどみが多く実測 4〜6 文字/秒。短く見積もると
+#                 発言が途中で切れるので、範囲の下端を採る
+#   英語  11.0 … 約 132 wpm。同じ理由で 12.5(150 wpm)より低く採る
+#
+# 下の定数は互換のために残してある(日本語の値に固定)。
+# 切り替えを効かせるのは estimate_speech_seconds() の側。
+SPEECH_CHARS_PER_SECOND = lang.JA.speech.chars_per_second
 MIN_SEGMENT_SECONDS = 1.0
 MAX_ESTIMATED_SECONDS = 120.0
 
@@ -506,7 +470,8 @@ def estimate_speech_seconds(text: str) -> float:
     if not n:
         return MIN_SEGMENT_SECONDS
     return min(MAX_ESTIMATED_SECONDS,
-               max(MIN_SEGMENT_SECONDS, n / SPEECH_CHARS_PER_SECOND))
+               max(MIN_SEGMENT_SECONDS,
+                   n / lang.current().speech.chars_per_second))
 
 
 def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
@@ -578,26 +543,39 @@ def redistribute_times(raw: list[dict], chunk_len: float) -> list[dict]:
     return raw
 
 # 連結時、直前がこれらで終わっていれば読点を足さない
-_SENTENCE_ENDS = "。、．，!?！？」』）)…・ー~〜-"
+# 互換のために残してある(日本語の値)。切り替えは _join_fragments() の側。
+_SENTENCE_ENDS = lang.JA.text.sentence_ends
 
 
 def _join_fragments(left: str, right: str) -> str:
-    """断片を連結する。日本語なので空白は挟まない。
+    """断片を連結する。**連結の仕方は言語で変わる**ので lang.py が持つ。
 
     Gemini が行を分けた位置は、話者が息を継いだ位置に対応している。
-    そのまま連結すると「吉沢と申しますけどもえー、まず…」と読みにくいので、
-    直前が句読点で終わっていなければ読点を補う。
+    そのまま連結すると読みにくいので、直前が句読点で終わっていなければ
+    区切りの記号を補う。
     (逐語での「間」の表現であり、発話内容そのものは変えない)
+
+        日本語: 語の間に何も入れず、読点「、」を補う
+                「けども」+「えー」→「けども、えー」
+        英語:   語の間に空白が要る。コンマ + 空白を補う
+                "Chairperson" + "we stand" → "Chairperson, we stand"
+
+    英語には「右が句読点で始まるときは前の語に直付けする」分岐が要る
+    (", however," のような断片)。日本語では句読点が必ず前の語に付くので、
+    この区別が要らなかった。
     """
+    t = lang.current().text
     left = left.rstrip()
     right = right.lstrip()
     if not left:
         return right
     if not right:
         return left
-    if left[-1] in _SENTENCE_ENDS or right[0] in _SENTENCE_ENDS:
-        return left + right
-    return left + "、" + right
+    if t.clinging and right[0] in t.clinging:
+        return left + right          # ", and" のような句読点始まりは直付け
+    if left[-1] in t.sentence_ends or right[0] in t.sentence_ends:
+        return left + t.word_separator + right
+    return left + t.fragment_comma + right
 
 
 def merge_consecutive(
@@ -633,22 +611,21 @@ def merge_consecutive(
     return out
 
 
-def parse_segments(
+def parse_utterances(
     text: str,
-    chunk_index: int = 0,
-    offset_seconds: float = 0.0,
     chunk_seconds: float | None = None,
-    start_index: int = 0,
     merge_same_speaker: bool = True,
-) -> list[dict]:
-    """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
+    verbatim: bool = False,
+) -> list[Utterance]:
+    """1 チャンクの出力テキストを Utterance の並びに変換する。
 
-    - 時刻はチャンク内相対値として読み、offset_seconds を足して絶対秒にする
+    - 時刻はチャンク内の相対秒のまま返す(絶対秒にするのは共通の後段の仕事)
     - 時刻が巻き戻っている行は直前の時刻に合わせる(Gemini が稀に乱す)
     - 行頭が時刻でない行は、直前の区間の続きとして連結する
     - 区間の終了時刻は「次の区間の開始」、最後だけチャンク末尾
 
-    戻り値の各要素は Segment(...) にそのまま渡せるキーを持つ。
+    ここまでが「クラウド経路がやること」。ローカル経路(local_asr.py)は
+    同じ形の Utterance を faster-whisper から直接作る(設計書 §4.2)。
     """
     raw: list[dict] = []
     prev_rel = 0.0
@@ -707,7 +684,12 @@ def parse_segments(
             r["rel_end"] = r["rel"] + 1.0
 
     if merge_same_speaker:
-        raw = merge_consecutive(raw)
+        # **関数の中身は触らない**(CLAUDE.md の注意点)。既にある引数で
+        # 上限だけを変える。逐語では 20 秒、整文では従来どおり 180 秒。
+        raw = merge_consecutive(
+            raw,
+            max_seconds=(VERBATIM_MERGE_MAX_SECONDS if verbatim
+                         else MERGE_MAX_SECONDS))
 
     # 連結が済んでから、時刻を割り振り直す。
     # (詰まっている箇所を本文の長さで按分。区間どうしは重ならない)
@@ -717,21 +699,42 @@ def parse_segments(
     if raw and chunk_len > raw[-1]["rel_end"]:
         raw[-1]["rel_end"] = chunk_len
 
-    out: list[dict] = []
-    for i, r in enumerate(raw):
-        start = offset_seconds + r["rel"]
-        end = offset_seconds + r["rel_end"]
-        if end <= start:
-            end = start + 1.0
-        out.append({
-            "index": start_index + i,
-            "start": round(start, 2),
-            "end": round(end, 2),
-            "text": r["text"],
-            "cluster": f"{chunk_index}:{r['cluster']}",
-            "chunk": chunk_index,
-        })
-    return out
+    return [
+        Utterance(rel_start=r["rel"], rel_end=r["rel_end"],
+                  text=r["text"], cluster=r["cluster"])
+        for r in raw
+    ]
+
+
+def parse_segments(
+    text: str,
+    chunk_index: int = 0,
+    offset_seconds: float = 0.0,
+    chunk_seconds: float | None = None,
+    start_index: int = 0,
+    merge_same_speaker: bool = True,
+    verbatim: bool = False,
+) -> list[dict]:
+    """1 チャンクの出力テキストを発言区間の辞書リストに変換する。
+
+    parse_utterances(経路ごと)＋ utterances_to_segments(共通の後段)の
+    組み合わせに委ねている。戻り値の各要素は Segment(...) にそのまま渡せる
+    キーを持つ(従来どおり)。
+    """
+    segments = utterances_to_segments(
+        parse_utterances(text, chunk_seconds, merge_same_speaker, verbatim),
+        chunk_index=chunk_index,
+        offset_seconds=offset_seconds,
+        start_index=start_index,
+    )
+    return [{
+        "index": s.index,
+        "start": s.start,
+        "end": s.end,
+        "text": s.text,
+        "cluster": s.cluster,
+        "chunk": s.chunk,
+    } for s in segments]
 
 
 # ======================================================================

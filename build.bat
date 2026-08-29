@@ -89,7 +89,7 @@ if "%ISCC%"=="" (
     echo [WARN] Inno Setup ^(ISCC^) が見つかりません。
     echo  https://jrsoftware.org/isdl.php からインストール後に再実行してください。
     echo.
-    echo  ※ 実行可能ファイルだけは dist\GeminiTranscriber\GeminiTranscriber.exe に出力済みです。
+    echo  ※ 実行可能ファイルだけは dist\WhosaidEditor\WhosaidEditor.exe に出力済みです。
     pause
     exit /b 0
 )
@@ -104,7 +104,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  完了!
-echo  インストーラ: Output\GeminiTranscriberSetup-2.0.6.exe
+echo  インストーラ: Output\WhosaidEditorSetup-2.0.6.exe
 echo ============================================================
 pause
 endlocal

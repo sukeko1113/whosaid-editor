@@ -1,17 +1,17 @@
 ; ============================================================
-; Gemini 文字起こし - Inno Setup インストーラスクリプト
+; Whosaid 反訳エディタ - Inno Setup インストーラスクリプト
 ; ============================================================
 ; 使い方:
-;   1. PyInstaller で dist\GeminiTranscriber\ を生成しておく
+;   1. PyInstaller で dist\WhosaidEditor\ を生成しておく
 ;   2. Inno Setup Compiler でこのファイルをコンパイル
 ;      または: iscc installer.iss
 ; ============================================================
 
-#define MyAppName        "Gemini 文字起こし"
-#define MyAppNameAscii   "GeminiTranscriber"
+#define MyAppName        "Whosaid 反訳エディタ"
+#define MyAppNameAscii   "WhosaidEditor"
 #define MyAppVersion     "2.1.0"
-#define MyAppPublisher   "Your Name"
-#define MyAppExeName     "GeminiTranscriber.exe"
+#define MyAppPublisher   "西村香介"
+#define MyAppExeName     "WhosaidEditor.exe"
 
 [Setup]
 AppId={{B7E2F4A3-9F1A-4D2C-9A8E-1F2D3E4B5C6A}
@@ -41,7 +41,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; PyInstaller が出力した onedir をまるごと取り込む
-Source: "dist\GeminiTranscriber\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\WhosaidEditor\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}";       Filename: "{app}\{#MyAppExeName}"

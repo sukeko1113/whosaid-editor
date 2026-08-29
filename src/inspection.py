@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from . import lang
 from .align import ALIGN_VER, Word
 from .anchor import Measured, measure_segments
 from .segments import (
@@ -37,10 +38,11 @@ from .segments import (
 # 被覆率がこれ未満なら提案しない。偶然の数文字一致から時刻を作らないための壁。
 MIN_COVERAGE = 0.60
 
-# 一致した文字がこれより少ない提案は出さない。3〜4 文字の偶然一致は被覆率が
+# 一致した文字がこれより少ない提案は出さない。短い偶然一致は被覆率が
 # 100% になり得るので、被覆率では防げない。
-# 実会議の聴き取り(2026-08-13・15 件): 完全に外れた 2 件はどちらも一致 3 文字。
-MIN_MATCHED = 8
+# **言語で変わる**ので lang.py が持つ(日本語 8 / 英語 22)。根拠は各プロファイル。
+# 下の定数は互換のために残してある。切り替えを効かせるには引数を None で渡す。
+MIN_MATCHED = lang.JA.matching.min_matched
 
 # 開始がこれ以上ずれていたら提案する。これ未満は誤差の範囲。
 # 終了のずれでは提案しない。記録に出るのも頭出しに効くのも開始時刻で、
@@ -51,7 +53,8 @@ TIME_DELTA = 0.75
 # いまの区間の長さを保つ。終了は「最後に一致した文字」から取るので、
 # 末尾が欠けると手前に出て発言の途中で切れる。
 # 実会議の聴き取り: 欠け 3 字以上の 2 件はどちらも終了が外れ、2 字以下は全部当たり。
-TAIL_GAP_LIMIT = 3
+# **言語で変わる**(日本語 3 / 英語 8。英語の 3 文字は 1 語に満たない)。
+TAIL_GAP_LIMIT = lang.JA.matching.tail_gap_limit
 
 # 提案に付ける境界の余白(秒)。whisper の単語時刻は発話の立ち上がりを
 # 少し遅く取る癖があるため、開始側は厚めに取る。
@@ -59,10 +62,11 @@ TAIL_GAP_LIMIT = 3
 START_PAD = 0.30
 END_PAD = 0.20
 
-# 一致した文字の密度(字/秒)。正常な発話は実測で 4〜11 字/秒。これを大きく
-# 下回る「一致」は、広い範囲に散らばった偶然の一致を拾っている。
+# 一致した文字の密度(字/秒)。これを大きく下回る「一致」は、広い範囲に
+# 散らばった偶然の一致を拾っている。
 # 聴き取り 2 回目: 本文が発話と食い違っていた区間は 0.8 字/秒だった。
-MIN_DENSITY = 1.5
+# **言語で変わる**(日本語 1.5 / 英語 4.0。英語は空白抜きで約 11 字/秒ある)。
+MIN_DENSITY = lang.JA.matching.min_density
 
 # 頭の欠けの秒換算がこれを超えたら、開始そのものが測れていないとみなして
 # 提案しない(補正が実測より大きくなったら、それはもう推定であって実測ではない)。
@@ -182,11 +186,13 @@ def inspect_times(
     proj: Project,
     words: Sequence[Word],
     *,
+    # **MIN_COVERAGE は言語ではなく帯で変わる**ので、ここは定数のまま
+    # (lang.py 冒頭の説明を参照)。
     min_coverage: float = MIN_COVERAGE,
-    min_matched: int = MIN_MATCHED,
-    min_density: float = MIN_DENSITY,
+    min_matched: Optional[int] = None,
+    min_density: Optional[float] = None,
     time_delta: float = TIME_DELTA,
-    tail_gap_limit: int = TAIL_GAP_LIMIT,
+    tail_gap_limit: Optional[int] = None,
     head_comp_max: float = HEAD_COMP_MAX,
     stretch_ratio: float = STRETCH_RATIO,
     **anchor_kw: Any,
@@ -201,6 +207,16 @@ def inspect_times(
       - 話者の `reviewed` はスキップ理由にしない。時刻を直しても話者は
         変わらないため。
     """
+    # **既定は import 時ではなく呼ばれた時に決める。**既定引数に書くと
+    # 値が import 時に固定され、lang.use() の切り替えが効かない。
+    m = lang.current().matching
+    if min_matched is None:
+        min_matched = m.min_matched
+    if min_density is None:
+        min_density = m.min_density
+    if tail_gap_limit is None:
+        tail_gap_limit = m.tail_gap_limit
+
     result = InspectResult()
     if not proj.segments or not words:
         return result

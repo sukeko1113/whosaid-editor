@@ -1,0 +1,1 @@
+source_id,engine,band_id,band_rule,band_start_sec,band_end_sec,truth_id,truth_segments,truth_chars,truth_words,metrics_scope,wer,cer,filler_retention,filler_hit,filler_total,backchannel_retention,backchannel_hit,backchannel_total,short_utterance_rate,short_hit,short_total,missed_recovery,missed_hit,missed_total,notes

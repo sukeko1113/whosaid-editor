@@ -1,0 +1,83 @@
+whosaid-editor — 同梱している第三者の部品と、その利用条件
+===========================================================
+
+このソフトウェアには、次のものを同梱しています。
+
+
+■ 話者分離のモデル
+
+  nemo_en_titanet_small.onnx
+    NVIDIA NeMo TitaNet-Small（話者の声を数値にする部分）
+    ライセンス: CC BY 4.0
+      https://creativecommons.org/licenses/by/4.0/
+    作成者: NVIDIA Corporation
+    ※ このライセンスは表示（クレジット）を条件としています。
+       本ファイルがその表示にあたります。
+
+  sherpa-onnx-pyannote-segmentation-3-0/model.onnx
+    pyannote/segmentation-3.0（声の切れ目を見つける部分）
+    ライセンス: MIT
+    作成者: Hervé Bredin ほか
+    ONNX への変換: k2-fsa / sherpa-onnx
+
+
+■ ライブラリ
+
+  sherpa-onnx           Apache License 2.0    k2-fsa
+  onnxruntime           MIT                   Microsoft
+  faster-whisper        MIT                   SYSTRAN
+  CTranslate2           MIT                   OpenNMT
+  PyAV                  BSD 3-Clause          PyAV 開発者
+  tokenizers            Apache License 2.0    Hugging Face
+  python-docx           MIT                   Steve Canny
+  google-genai          Apache License 2.0    Google LLC
+
+
+■ GPU 用の部品（CTranslate2 に同梱されているもの）
+
+  cuDNN ランタイム      NVIDIA Proprietary    NVIDIA Corporation
+    cudnn64_9.dll（呼び出し口だけの 0.3MB。演算本体は含みません）。
+    CTranslate2 の配布物に元から入っており、外すと GPU で動きません。
+    NVIDIA の再頒布条件に従って同梱しています。本ソフトウェア本体の
+    MIT ライセンスは、この部品には及びません。
+    条件: https://docs.nvidia.com/deeplearning/cudnn/sla/
+
+
+■ 音声の変換・再生
+
+  FFmpeg / ffplay       LGPL v2.1 以降        FFmpeg 開発者
+    https://ffmpeg.org/
+    ※ 同梱しているのは LGPL 構成のビルドです。
+
+
+■ 音声認識のモデル
+
+  Whisper（small）      MIT                   OpenAI
+    CTranslate2 形式への変換: SYSTRAN
+    配布元: https://huggingface.co/Systran/faster-whisper-small
+    ※ 同梱しているのはこの small のみです。GPU のある端末では
+       large-v3（同じく OpenAI / MIT）を初回に取得することがあります。
+       取得先は同じ Systran のリポジトリで、通信は Hugging Face とのみ
+       行われます（録音や本文は送りません）。
+
+
+■ 同梱していないもの（利用者の端末が配布元から直接取得します）
+
+  large-v3          MIT                   OpenAI
+    GPU のある端末で、利用者が選んだときだけ取得します。
+    配布元: https://huggingface.co/Systran/faster-whisper-large-v3
+
+  cuBLAS            NVIDIA Proprietary    NVIDIA Corporation
+    GPU で動かすために要る部品です。**同梱していません。**
+    NVIDIA の利用条件（LicenseRef-NVIDIA-Proprietary）は本ソフトウェアの
+    MIT ライセンスとは別のもので、混同を避けるため再配布しません。
+    利用者の端末が NVIDIA の配布物（PyPI の nvidia-cublas-cu12）から
+    直接取得し、その利用条件は NVIDIA と利用者の間で適用されます。
+    条件: https://pypi.org/project/nvidia-cublas-cu12/
+
+  ※ どちらの取得でも、録音や本文は送信しません。
+
+
+-----------------------------------------------------------
+各ライセンスの全文は、それぞれの配布元を参照してください。
+この表示は、話者分離設計書 §9「クレジット表記」に基づいて置いています。
