@@ -2260,6 +2260,9 @@ def run() -> int:
 # ======================================================================
 # メイン画面(処理経路の選択)
 #
+# **差し替えは本物と同じ形にする。**save_config は「包めずに落とした項目の
+# 並び」を返す。None を返す差し替えのままだと、画面側でそれを見る処理が
+# 落ちる（2026-08-29 に実際に踏んだ）。
 # 設定ファイルには触らない。load_config / save_config を差し替えて、
 # 利用者の config.json を書き換えないようにする。
 # ======================================================================
@@ -2522,7 +2525,7 @@ def run_main_window() -> int:
     saved: dict = {}
     real_load, real_save = main_gui.load_config, main_gui.save_config
     main_gui.load_config = lambda: {}
-    main_gui.save_config = lambda d: saved.update(d)
+    main_gui.save_config = lambda d: (saved.update(d), [])[1]
 
     print("\n[メイン画面 / 処理経路]")
     try:
@@ -2645,7 +2648,7 @@ def run_main_window() -> int:
                 _saved = {}
                 _real_save = main_gui.save_config
                 try:
-                    main_gui.save_config = lambda d: _saved.update(d)
+                    main_gui.save_config = lambda d: (_saved.update(d), [])[1]
                     app.var_model.set("large-v3")
                     app._on_model_chosen()
                     check("選んだモデルを覚える",
@@ -2834,7 +2837,7 @@ def run_main_window() -> int:
                 _proj.parent.mkdir()
                 _proj.write_text("{}", encoding="utf-8")
                 _saved3 = {}
-                main_gui.save_config = lambda x: _saved3.update(x)
+                main_gui.save_config = lambda x: (_saved3.update(x), [])[1]
                 app._remember_project(str(_proj))
                 check("開いた作業ファイルを覚える",
                       app.cfg.get(app.LAST_PROJECT_KEY) == str(_proj))
@@ -2849,7 +2852,7 @@ def run_main_window() -> int:
             # **本物には戻さない。**ここで real_save に戻したせいで、
             # 続きの操作が利用者の config.json を書いた（2026-08-22）。
             # 戻すのは、この関数の最後の一箇所だけ。
-            main_gui.save_config = lambda d: saved.update(d)
+            main_gui.save_config = lambda d: (saved.update(d), [])[1]
 
             # --- 出力先は覚える / 押す前に見える -----------------------
             # **起動のたびに空へ戻っていた。**毎回選び直しになり、
@@ -2868,7 +2871,7 @@ def run_main_window() -> int:
                       app.lbl_dest.master is app.btn_start.master)
 
                 _saved4 = {}
-                main_gui.save_config = lambda x: _saved4.update(x)
+                main_gui.save_config = lambda x: (_saved4.update(x), [])[1]
                 app.cfg[app.OUTPUT_KEY] = _d4
                 app.cfg[app.USE_INPUT_DIR_KEY] = False
                 _app4 = main_gui.App.__new__(main_gui.App)
@@ -2896,7 +2899,7 @@ def run_main_window() -> int:
                 finally:
                     _app5.destroy()
                     main_gui.load_config = lambda: {}
-                main_gui.save_config = lambda d: saved.update(d)
+                main_gui.save_config = lambda d: (saved.update(d), [])[1]
                 app.var_use_input_dir.set(True)
                 app._on_toggle_use_input_dir()
 
@@ -2907,7 +2910,7 @@ def run_main_window() -> int:
             check("保存しないを選べる", hasattr(app, "var_keep_api"))
 
             _saved_api = {}
-            main_gui.save_config = lambda x: _saved_api.update(x)
+            main_gui.save_config = lambda x: (_saved_api.update(x), [])[1]
             _real_yes = assign_gui.messagebox.askyesno
             _real_info = main_gui.messagebox.showinfo
             main_gui.messagebox.askyesno = lambda *a2, **k2: True
@@ -2932,7 +2935,7 @@ def run_main_window() -> int:
             finally:
                 main_gui.messagebox.askyesno = _real_yes
                 main_gui.messagebox.showinfo = _real_info
-                main_gui.save_config = lambda d: saved.update(d)
+                main_gui.save_config = lambda d: (saved.update(d), [])[1]
 
             # **開始の経路からも漏らさない。**設定を扱う場所が複数あるので、
             # 画面のチェックだけ直しても、こちらから書けば元の木阿弥になる。
@@ -2985,7 +2988,7 @@ def run_main_window() -> int:
                 main_gui.align.suggest_gpu_model = lambda: "large-v3"
                 app.cfg.pop(app.ASKED_KEY, None)
                 _saved2 = {}
-                main_gui.save_config = lambda d: _saved2.update(d)
+                main_gui.save_config = lambda d: (_saved2.update(d), [])[1]
 
                 app._maybe_offer_gpu_model()
                 check("GPU があって未取得なら一度は聞く", _asked["n"] == 1)
@@ -3011,7 +3014,7 @@ def run_main_window() -> int:
             finally:
                 main_gui.align.suggest_gpu_model = _real_sug
                 _af.fetch = _real_fetch
-                main_gui.save_config = lambda d: saved.update(d)
+                main_gui.save_config = lambda d: (saved.update(d), [])[1]
                 app._model_by_engine[main_gui.ENGINE_LOCAL] = "small"
                 app.var_model.set("small")
 
@@ -3038,7 +3041,7 @@ def run_main_window() -> int:
             app.var_mode.set(_want["mode"])
 
             _out = {}
-            main_gui.save_config = lambda d: _out.update(d)
+            main_gui.save_config = lambda d: (_out.update(d), [])[1]
             main_gui.messagebox.askyesno = lambda *a, **k: True
             app._start()
             for _k, _v in _want.items():

@@ -4178,6 +4178,55 @@ def test_installer_names_a_real_publisher():
     assert m and m.group(1).strip(), "発行者が空"
 
 
+def test_api_key_is_dropped_when_it_cannot_be_protected():
+    """**包めないなら書かない。**平文へ静かに落ちない。
+
+    以前は DPAPI が失敗すると平文のまま書いていた。PRIVACY.md も画面も
+    「DPAPI で暗号化する」と断言しているので、**成立しないことがある
+    安全性を利用者に約束している**状態だった（2026-08-29）。
+
+    秘密でない項目は書く。鍵が包めないからといって名簿まで失わせない。
+    """
+    from unittest import mock
+    from src import config as cfg
+    key = "AIzaSyTESTKEY-1234567890abcdefghij"
+    with tempfile.TemporaryDirectory() as d:
+        real = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = d
+        try:
+            # DPAPI が使えない機械を作る（包めずに平文が返る）
+            with mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+                dropped = cfg.save_config({"api_key": key, "roster": "佐藤"})
+            assert dropped == ["api_key"], f"知らせていない: {dropped}"
+            raw = cfg.config_path().read_text(encoding="utf-8")
+            assert key not in raw, "**包めないのに平文で書いている**"
+            assert "api_key" not in raw, "空でも項目を残している"
+            assert "佐藤" in raw, "秘密でない項目まで落としている"
+            assert cfg.load_config().get("api_key") is None
+        finally:
+            if real is not None:
+                os.environ["APPDATA"] = real
+
+
+def test_saving_a_protected_key_reports_nothing_dropped():
+    """包めたときは何も落とさない（上の検査が常に真にならないこと）。"""
+    from src import config as cfg
+    if sys.platform != "win32":
+        print("       (DPAPI が無いので飛ばします)")
+        return
+    with tempfile.TemporaryDirectory() as d:
+        real = os.environ.get("APPDATA")
+        os.environ["APPDATA"] = d
+        try:
+            dropped = cfg.save_config({"api_key": "AIzaSyOK-0123456789",
+                                       "roster": "佐藤"})
+            assert dropped == [], f"包めたのに落としている: {dropped}"
+            assert cfg.load_config().get("api_key") == "AIzaSyOK-0123456789"
+        finally:
+            if real is not None:
+                os.environ["APPDATA"] = real
+
+
 def test_api_key_is_not_stored_in_the_clear():
     """**API キーを平文で置かない。**
 
@@ -4254,6 +4303,27 @@ def test_public_documents_exist_and_say_the_truth():
         from src import config as cfg
         assert hasattr(cfg, "protect_secret"), "書いてあるのに実装が無い"
         assert "api_key" in cfg.SECRET_KEYS
+
+    # **「平文では保存しない」と書くなら、包めないとき本当に書かないこと。**
+    # ここは文書のほうが実装より強いことを約束しがちな箇所で、実際に
+    # 食い違っていた（2026-08-29 に発覚。DPAPI 失敗時は平文で書いていた）。
+    if "平文で保存することはありません" in priv:
+        import tempfile as _tf
+        from unittest import mock
+        from src import config as cfg
+        with _tf.TemporaryDirectory() as _d:
+            _real = os.environ.get("APPDATA")
+            os.environ["APPDATA"] = _d
+            try:
+                with mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+                    cfg.save_config({"api_key": "AIzaSyPLAIN-0123456789"})
+                _raw = cfg.config_path().read_text(encoding="utf-8")
+                assert "AIzaSyPLAIN-0123456789" not in _raw, (
+                    "PRIVACY.md は「平文で保存することはありません」と書いて"
+                    "いるのに、平文で書いている")
+            finally:
+                if _real is not None:
+                    os.environ["APPDATA"] = _real
 
     # **README が「既定では端末から出ない」と書くなら、既定がローカルであること。**
     readme = (root / "README.md").read_text(encoding="utf-8")

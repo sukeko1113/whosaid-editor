@@ -958,7 +958,20 @@ class App(tk.Tk):
                 "保存するには、先にチェックを入れてください。")
             return
         self.cfg["api_key"] = api
-        save_config(self.cfg)
+        # **包めたかを確かめてから知らせる。**以前は無条件に「暗号化して
+        # あります」と出しており、DPAPI が失敗して平文で書かれた場合でも
+        # 同じ文言が出ていた(2026-08-29)。いまは包めなければ書かれない。
+        dropped = save_config(self.cfg)
+        if "api_key" in dropped:
+            messagebox.showerror(
+                "API キー",
+                "API キーを保存できませんでした。\n\n"
+                "この Windows の暗号化の仕組み（DPAPI）が使えないため、"
+                "このパソコンには保存していません。\n"
+                "**平文では保存しません。**\n\n"
+                "入力欄の鍵は今回の実行には使えます。"
+                "次に起動したときは入れ直してください。")
+            return
         messagebox.showinfo(
             "API キー",
             "API キーを保存しました。\n"
@@ -1175,11 +1188,18 @@ class App(tk.Tk):
             self.OUTPUT_KEY: out_dir,
             self.USE_INPUT_DIR_KEY: bool(self.var_use_input_dir.get()),
         })
-        save_config(self.cfg)
+        _dropped = save_config(self.cfg)
 
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
+        # **ここでも黙らない。**開始ボタンの経路からも鍵を書いているので、
+        # 保存できなかったことを伝えないと「保存したつもり」が残る。
+        if "api_key" in _dropped:
+            self._append_log(
+                "※ API キーはこのパソコンに保存できませんでした"
+                "（Windows の暗号化の仕組みが使えないため）。"
+                "平文では保存しません。今回の実行には使えます。")
 
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")

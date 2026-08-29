@@ -180,11 +180,33 @@ def load_config() -> dict[str, Any]:
     return data
 
 
-def save_config(data: dict[str, Any]) -> None:
-    """**秘密の項目は包んでから書く。**呼び出し側は平文のまま渡してよい。"""
+def save_config(data: dict[str, Any]) -> list[str]:
+    """**秘密の項目は包んでから書く。**呼び出し側は平文のまま渡してよい。
+
+    **包めなかった項目は書かない。**戻り値はその項目名の並び。
+
+    以前は包めないとき平文のまま書いていた。しかし PRIVACY.md も画面も
+    「DPAPI で暗号化する」と断言しており、**成立しないことがある安全性を
+    利用者に約束している**状態だった(2026-08-29 に判明)。書かなければ
+    約束は破れない。鍵を入れ直す手間は増えるが、黙って平文で置くよりよい。
+
+    秘密でない項目は書く。鍵が包めないからといって名簿や出力先まで
+    失わせる理由が無い。
+
+    **戻り値を見るのは呼び出し側の仕事。**画面は「保存できなかった」と
+    伝えること——ここで黙ると、名前が変わっただけで同じ穴になる。
+    """
     out = dict(data)
+    dropped: list[str] = []
     for k in SECRET_KEYS:
-        if isinstance(out.get(k), str):
-            out[k] = protect_secret(out[k])
+        if not isinstance(out.get(k), str) or not out[k]:
+            continue
+        wrapped = protect_secret(out[k])
+        if is_protected(wrapped):
+            out[k] = wrapped
+        else:
+            del out[k]
+            dropped.append(k)
     p = config_path()
     p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    return dropped
