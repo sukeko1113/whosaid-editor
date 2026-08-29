@@ -54,6 +54,18 @@ def real_config_path() -> Path | None:
 # 見分けはつく。意図して隠した部品（pack_forget）は pack の管理下から
 # 外れるが、入りきらずに消えた部品は管理下に残ったまま unmap される。
 # 実測で確認した（pack_slaves に残り、ismapped は False）。
+#
+# ----------------------------------------------------------------------
+# **画素数は機械ごとに違う。CI の数字を手元の数字と比べないこと。**
+#
+# 同じ 1024x768・同じ拡大率でも、右ペインの幅が CI では 535px、開発機では
+# 620px だった（2026-08-29 に実測）。字形とテーマがランナーと手元で違う
+# ため。**「手元で 30px 余っているから CI も通る」とは言えない。**
+#
+# だから検査は絶対値を書かず、その場で測った 要 と 幅 を比べる形にして
+# ある。落ちたときにどちらがどれだけ足りなかったかがログに出るのは、
+# 手元で再現できない差をログだけで追うため。
+# ----------------------------------------------------------------------
 # ======================================================================
 
 def squeezed_out(parent) -> list:
@@ -1675,6 +1687,30 @@ def run() -> int:
               awin.winfo_width() <= awin.winfo_screenwidth()
               and awin.winfo_height() <= awin.winfo_screenheight())
         _bottom_bar = awin.winfo_children()[-1]
+        # **これは素通りしていた。**下の帯は grid で最下段に固定されるので、
+        # 「下端 <= 窓の高さ」はどんな条件でも真になる(実測: どの画面・
+        # どの拡大率でも余り 0)。高さが足りているかを測っていなかった。
+        #
+        # 測るべきは**縮まない行が最後まで見えているか**。時刻・確定などは
+        # 高さが固定で、入らなければ下から切れる(本文と候補は縮む側なので
+        # 対象にしない)。行を足す変更を重ねているので、ここが効いていないと
+        # 「幅は直したが下が見えない」に気づけない。
+        _fixed_rows = (list(awin._time_rows)
+                       + [awin.btn_confirm_time.master,
+                          awin.btn_del_added.master,
+                          awin.chk_apply_cluster.master,
+                          awin.btn_undo.master])
+        _clipped = []
+        for _r in _fixed_rows:
+            if not _r.winfo_ismapped():
+                _clipped.append(_r)
+                continue
+            # 窓の中に、下端まで入っていること
+            _bot = _r.winfo_rooty() + _r.winfo_height()
+            if _bot > awin.winfo_rooty() + awin.winfo_height():
+                _clipped.append(_r)
+        check(f"縮まない行が下まで見えている（切れ {len(_clipped)} 行）",
+              not _clipped)
         check("いちばん下の帯（保存など）が窓の中にある",
               _bottom_bar.winfo_y() + _bottom_bar.winfo_height()
               <= awin.winfo_height())

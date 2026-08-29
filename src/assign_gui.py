@@ -645,7 +645,8 @@ class AssignWindow(tk.Toplevel):
         self.title(f"話者の割当 - {Path(self.proj.audio_path).name}")
         # **既定で全部見えること。**窓を広げないと押せないボタンがあり、
         # 高さも足りずに下の［保存］が隠れていた(実機の指摘・2026-08-18)。
-        #   幅 1320 … 右ペインのいちばん広い行(571px)が収まる
+        #   幅 1320 … 右ペインのいちばん広い行(426px)が収まる
+        #             (時刻と確定を 2 行ずつに分ける前は 571px だった)
         #   高さ 900 … 中身が 845px まであり、800 では下端が窓の縁に接する
         # ただし画面より大きくはしない(小さい画面では入るところまで)。
         want_w, want_h = 1320, 900
@@ -828,10 +829,26 @@ class AssignWindow(tk.Toplevel):
         # 全体一律のずれ補正では直せないので、区間ごとに耳で合わせられるようにする。
         frm_time = ttk.Frame(right)
         frm_time.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 2))
-        row_time = ttk.Frame(frm_time)
-        row_time.pack(side="top", anchor="w")
-        ttk.Label(row_time, text="時刻:").pack(side="left", padx=(0, 8))
+        # **開始と終了で行を分ける。**13 個を 1 行に詰めていたが、
+        # 1280x720@125% で 要 713px / 幅 706px と足りず、確定の行を 2 行に
+        # したあとはここが律速だった(実測 2026-08-29)。開始と終了は
+        # 別のものなので、分ける線としても素直。
+        #
+        # **微調整ボタン 8 個をまとめて 1 行にはしない。**開始側と終了側の
+        # ［−1］［+1］が隣り合い、取り違える。幅のために操作を危うくしない。
+        #
+        # 2 行目の頭には［時刻:］と同じ幅の空きを置き、［開始］［終了］の
+        # 左端を揃える。
+        self._time_rows: list = []
         for which, label in (("start", "開始"), ("end", "終了")):
+            row_time = ttk.Frame(frm_time)
+            row_time.pack(side="top", anchor="w", pady=(0, 2))
+            self._time_rows.append(row_time)
+            head = ttk.Label(row_time, text="時刻:" if which == "start" else "")
+            head.pack(side="left", padx=(0, 8))
+            if which == "end":
+                # 空文字だと幅 0 になり揃わない。頭の文字と同じ幅を確保する。
+                head.configure(width=len("時刻:"))
             ttk.Label(row_time, text=label).pack(side="left", padx=(6, 2))
             ent = ttk.Entry(
                 row_time, width=11, justify="center",
