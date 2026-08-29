@@ -3605,6 +3605,19 @@ def test_engine_descriptions_match_reality():
     # 逐語モードはローカルでは使えない（こちらは今も本当）
     assert "逐語" in gui.ENGINE_LOCAL_DESC
 
+    # **説明は 1 か所ではない。**この検査は ENGINE_LOCAL_DESC しか見ておらず、
+    # 「話者の決め方」側の注記(lbl_diar_note)は
+    # 「※ ローカルでは声のまとまりを作らないため、全区間が未判別になります。」
+    # のまま残っていた。**同じ画面の上と下で逆のことを言っていた**のを、
+    # 配布版の画面を見て見つけた（2026-08-29）。検査の網が狭かった。
+    import inspect
+    src = inspect.getsource(gui.App._update_local_diar_note)
+    on_branch = src.split("else:")[0]      # 話者分離が入っている側の文面
+    for bad in ("作らない", "作られない", "作られず"):
+        assert bad not in on_branch, (
+            f"話者分離が入っているのに「{bad}」と書いてある: {on_branch}")
+    assert "話者分離" in on_branch, "どこで作るのかが書かれていない"
+
 
 def test_licence_names_a_holder():
     """**公開する前に著作権者を埋める。**プレースホルダのままにしない。"""

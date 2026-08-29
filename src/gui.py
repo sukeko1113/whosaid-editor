@@ -560,6 +560,23 @@ class App(tk.Tk):
         else:
             self.lbl_diarize_note.configure(
                 text="※ 切ると全区間が未判別になり、割当は 1 件ずつになります。")
+        # **上の「話者の決め方」の注記もここに連動する。**片方だけ直すと、
+        # 同じ画面の 2 か所で逆のことを言う状態に戻る(それが実際に起きた)。
+        self._update_local_diar_note()
+
+    def _update_local_diar_note(self) -> None:
+        """ローカル経路のときの「話者の決め方」の注記。実際の設定を見て言う。"""
+        if getattr(self, "lbl_diar_note", None) is None:
+            return
+        if (self.var_mode.get() != MODE_MANUAL
+                or self.var_engine.get() != ENGINE_LOCAL):
+            return
+        if self.var_diarize_local.get():
+            self.lbl_diar_note.configure(
+                text="※ 声のまとまり(A/B/C…)は下の「話者分離」で端末内に作ります。")
+        else:
+            self.lbl_diar_note.configure(
+                text="※ 話者分離を切っているため、全区間が未判別になります。")
 
     def _update_engine_state(self) -> None:
         """処理経路の切替に応じて、要らない設定を触れなくする。
@@ -668,10 +685,13 @@ class App(tk.Tk):
             self.chk_timestamps.configure(state="disabled")
             self.chk_diarization.configure(state="disabled")
             if self.var_engine.get() == ENGINE_LOCAL:
-                # 中身は「処理経路」の説明で言い切っているので、ここでは繰り返さない
-                self.lbl_diar_note.configure(
-                    text="※ ローカルでは声のまとまりを作らないため、全区間が未判別になります。"
-                )
+                # **同じ画面の上と下で逆のことを言っていた。**処理経路の説明は
+                # 「声のまとまりも端末内で作れます」と書いているのに、ここは
+                # 「ローカルでは声のまとまりを作らない」と書いたままだった
+                # ——話者分離(diarize.py)を入れる前の文言で、2026-08-16 以降
+                # 事実と違う。**無料経路の値打ちそのものを否定する表示**
+                # だったので、実際の設定を見て言う形にする(2026-08-29)。
+                self._update_local_diar_note()
             else:
                 self.lbl_diar_note.configure(
                     text="※ この方式では名簿を AI に渡しません。声質だけで区切った区間を、"
