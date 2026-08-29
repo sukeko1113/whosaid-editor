@@ -1037,11 +1037,21 @@ class AssignWindow(tk.Toplevel):
 
         # 直前の操作の結果。区間を移動しても消えないように専用の行にする
         # (一括適用が何区間に効いたのかが分からないと、事故に気づけない)
+        # **row=2 を opts と共有していた**ので、あとから作る opts が上に
+        # 重なってこの文字列が見えていなかった(実測 y=256..275 と y=250..275)。
+        # 行を分けた。
         ttk.Label(frm_cand, textvariable=self.var_action, foreground="#1B5E20",
                   wraplength=560).grid(row=2, column=0, sticky="w", padx=8, pady=(2, 0))
 
+        # **確定まわりは 2 行に分ける。**6 つを 1 行に詰めていたが、
+        # 1920x1080 でも余りが +5px しかなく、1280x720@125% では 40px
+        # 足りずに右端の［取り消し］が押し出されていた(実測 2026-08-29)。
+        # 文字列を短くしても仕切りを動かしても、次に何か足せばまた壊れる
+        # ——§10.3.6 で 3 度目を数えているのは、この行が常に限界だから。
+        # **構造で余裕を作る。**切り替え(チェック)と操作(ボタン)は
+        # 種類が違うので、分ける線としても素直。
         opts = ttk.Frame(frm_cand)
-        opts.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 6))
+        opts.grid(row=3, column=0, sticky="ew", padx=6, pady=(2, 0))
         self.chk_apply_cluster = ttk.Checkbutton(
             opts, text="同じ声のまとまり全体に適用 (A)",
             variable=self.var_apply_cluster, takefocus=False)
@@ -1051,17 +1061,27 @@ class AssignWindow(tk.Toplevel):
         ttk.Checkbutton(opts, text="足した発言も行で出す",
                         variable=self.var_added_rows, takefocus=False,
                         command=self._on_added_rows_toggled).pack(side="left")
-        ttk.Button(opts, text="不明 (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))\
-            .pack(side="right")
-        ttk.Button(opts, text="未確定に戻す (D)", command=self.unassign).pack(side="right", padx=6)
-        ttk.Button(opts, text="取り消し (Ctrl+Z)", command=self.undo).pack(side="right")
+
+        # **キー表示は削らない。**(U) (D) (Ctrl+Z) は操作を覚えるための
+        # 手がかりで、幅のために落とすと可用性が下がる。
+        opts_btn = ttk.Frame(frm_cand)
+        opts_btn.grid(row=4, column=0, sticky="ew", padx=6, pady=(2, 6))
+        self.btn_unknown = ttk.Button(
+            opts_btn, text="不明 (U)", command=lambda: self.assign(SPECIAL_UNKNOWN))
+        self.btn_unknown.pack(side="right")
+        self.btn_unassign = ttk.Button(opts_btn, text="未確定に戻す (D)",
+                                       command=self.unassign)
+        self.btn_unassign.pack(side="right", padx=6)
+        self.btn_undo = ttk.Button(opts_btn, text="取り消し (Ctrl+Z)",
+                                   command=self.undo)
+        self.btn_undo.pack(side="right")
 
         # **注記はチェックボックスの文字列に埋めない。**埋めたら 353px になり、
         # 右端の[取り消し]を押し出した(要 734px / 幅 713px。2026-08-21 に実測)。
         # §10.3.6・GPU の注記と同じ種類の失敗。**別の行に置く。**
         self.lbl_cluster_note = ttk.Label(frm_cand, foreground="#B26500",
                                           wraplength=700, justify="left", text="")
-        self.lbl_cluster_note.grid(row=3, column=0, sticky="w",
+        self.lbl_cluster_note.grid(row=5, column=0, sticky="w",
                                    padx=8, pady=(0, 4))
 
         # --- 下部: ボタン ----------------------------------------------

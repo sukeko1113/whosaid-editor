@@ -85,7 +85,10 @@ def lost_names(lost: list) -> str:
         try:
             out.append(str(c.cget("text")) or c.winfo_class())
         except Exception:
-            out.append(c.winfo_class())
+            # 文字列を持たない部品や、すでに壊した窓。**名前が出せなくても
+            # 落とさない**——ここで例外を投げると、検査の失敗そのものが
+            # 読めない traceback に化ける。
+            out.append(str(c))
     return " / ".join(out)
 
 
@@ -1614,15 +1617,23 @@ def run() -> int:
         # **注記をチェックボックスの文字列に埋めない。**埋めたら 353px に
         # なり、右端の[取り消し]を押し出した(要 734px / 幅 713px。実機の
         # 指摘・2026-08-21)。§10.3.6・GPU の注記と同じ種類の失敗で 3 度目。
+        # **確定まわりは 2 行ある**(切り替え / 操作)。片方だけ見ていると、
+        # もう片方が溢れても気づけない。両方測る。
         _opts = awin.chk_apply_cluster.master
-        _need, _lost = visible_need(_opts, 20)
-        _kids = [c for c in _opts.winfo_children() if c.winfo_ismapped()]
-        check(f"確定の行が収まる（要 {_need} / 幅 {_opts.master.winfo_width()}）",
-              _opts.master.winfo_width() >= _need)
-        # **この行に排他の部品は無い**(assign_gui.py:1045-1057 で 6 つとも
-        # 素直に pack している)。消えていたら押し出されたということ。
-        check(f"確定の行で押し出された部品が無い（{lost_names(_lost) or 'なし'}）",
-              not _lost)
+        _opts_btn = awin.btn_undo.master
+        check("確定まわりを 2 行に分けてある（1 行に詰めない）",
+              _opts is not _opts_btn)
+        _kids = []
+        for _label, _row in (("切り替え", _opts), ("操作", _opts_btn)):
+            _need, _lost = visible_need(_row, 20)
+            _have = _row.master.winfo_width()
+            _kids += [c for c in _row.winfo_children() if c.winfo_ismapped()]
+            check(f"確定の行（{_label}）が収まる（要 {_need} / 幅 {_have}）",
+                  _have >= _need)
+            # **この 2 行に排他の部品は無い**(assign_gui.py で 6 つとも
+            # 素直に pack している)。消えていたら押し出されたということ。
+            check(f"確定の行（{_label}）で押し出された部品が無い"
+                  f"（{lost_names(_lost) or 'なし'}）", not _lost)
         check("チェックの文字列に注記を埋めていない",
               len(str(awin.chk_apply_cluster.cget("text"))) <= 32)
         check("[取り消し]が窓の右端をはみ出さない",
