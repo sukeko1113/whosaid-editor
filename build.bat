@@ -12,7 +12,7 @@ setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 
-echo === Gemini Transcriber Build ===
+echo === WhosaidEditor Build ===
 echo.
 
 REM ----- 0) ffmpeg 確認 -----
