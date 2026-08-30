@@ -3,7 +3,9 @@ REM ============================================================
 REM WhosaidEditor - Build Script (Windows)
 REM ------------------------------------------------------------
 REM 必要環境:
-REM   - Python 3.11 以上(PATH 通っていること)
+REM   - Python 3.12(PATH 通っていること)
+REM     ※ 検証しているのは 3.12 のみ(CI と同じ)。python_requires は
+REM        設定していないので、他の版でも技術的には弾かれない
 REM   - ffmpeg/ffmpeg.exe を配置(後述)
 REM   - Inno Setup 6 をインストール、iscc.exe へパス通すか
 REM     C:\Program Files (x86)\Inno Setup 6\ISCC.exe を呼ぶ

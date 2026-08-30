@@ -546,12 +546,21 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
 | ツール | 用途 | 入手先 |
 | --- | --- | --- |
-| Python 3.11 以上 | アプリ本体 | https://www.python.org/downloads/ (PATH 追加にチェック) |
+| Python **3.12** | アプリ本体 | https://www.python.org/downloads/ (PATH 追加にチェック) |
 | ffmpeg + ffplay(**LGPL 版**) | 音声分割・区間再生 | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) の `ffmpeg-master-latest-win64-lgpl.zip` ← **GPL 版は不可**(手順 2) |
 | 話者分離のモデル(44MB) | 声のまとまりを作る | `python tools\fetch_diarize_models.py`(手順 3) |
 | 転写のモデル small(486MB) | 本文を作る | `python tools\fetch_asr_model.py small` |
 | Inno Setup 6 | インストーラ作成 | https://jrsoftware.org/isdl.php |
 | Gemini API キー(任意) | クラウド経路を使うときだけ | https://aistudio.google.com/apikey |
+
+> **Python の版について。** 検証しているのは **3.12 のみ**です(CI と同じ版)。
+> **3.11 以下や 3.13 以上で動くかは確かめていません。** ただし
+> `python_requires` / `requires-python` を設定していないので、
+> **他の版でも技術的に弾かれることはありません。** 試す場合は、
+> テストを個別実行して通ることを確かめてから使ってください(下の「テスト」)。
+>
+> なお**利用者に Python は要りません。** Releases の `.exe` は Python を
+> 同梱しています。この表はビルドする人向けです。
 
 ### 手順
 

@@ -10,7 +10,7 @@ AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴�
 
 - **ローカル（既定）**: faster-whisper。端末内で完結し、API キーも要らない。
   **話者分離も端末内で動く**（`src/diarize.py` / sherpa-onnx + pyannote-segmentation-3.0
-  + NeMo TitaNet。設計書 `claude/claude_話者分離_設計書.md`）。モデル 46MB は
+  + NeMo TitaNet。設計書 `claude/claude_話者分離_設計書.md`）。モデル 44MB は
   `build.spec` が同梱し、無ければビルドを止める。
   **クラスタは音声の全長で作る**ので `g:A` `g:B`（画面表示は `声A`）。
   チャンクをまたいで同じ人は同じ記号になる。
