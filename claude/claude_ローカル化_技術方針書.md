@@ -552,6 +552,45 @@ API で測った**（`-a-general`・keepFillerToken=1・ログ保存なし・無
 | gemini-2.5-flash | 29.5% | 106.0% | **130.0%** | 41.8% | **13/33** |
 | **AmiVoice API（-a-general）** | 28.3% | **152.2%** | 70.0% | 47.3% | 5/33 |
 
+#### この表の各行がどのファイルから出たか（2026-08-30 に追記）
+
+**書いていなかったので、測り直そうとして 3 手無駄にした。**入力を取り違えると
+数字が合わず、正解データのほうを疑うことになる（実際そうなった）。
+
+| 行 | 入力 |
+|---|---|
+| **local（small）** | `test-audio\01+02edited.premerge.speakers.json` |
+| large-v3-turbo | `test-audio\bench\large-v3-turbo.srt` |
+| aTrain | `test-audio\bench\atrain.srt` |
+| Notta | `test-audio\bench\notta.srt` |
+| gemini-2.5-flash | `test-audio\bench\gemini-2.5-flash.srt` |
+| AmiVoice API | `test-audio\bench\amivoice.a.general.srt` |
+
+**local 行の正本は `premerge` である。**この作業ファイルは
+**人手がまったく入っていない**（`text_edited` 0 件・`edit_log` 0 件）。
+2026-08-30 に `tools\report_verbatim.py` で再測定し、
+**27.3% / 9.0% / 16.7% / 57.3% / 1-33 が完全に再現した**（turbo も同様に再現）。
+
+**`01+02edited.speakers.json`（premerge でないほう）を使ってはいけない。**
+測定後に人が編集しており（本文修正 113 件・相づちの追加）、いま測ると
+26.6% / 16.4% / 36.7% / 57.3% / 3-33 になる。フィラーと相づちが上がるのは
+**人が足したから**で、エンジンの性能ではない。
+
+**`bench\small.srt` も local 行ではない。**あれは
+**faster-whisper を直接回した生の出力**で、製品経路（チャンク分割・
+`initial_prompt`・区間の組み立て）を通っていない。いま測ると
+33.3% / 20.9% / 26.7% / 36.4% / 3-33 と、まったく別の値になる。
+**別の目的（素の faster-whisper がどう振る舞うか）には使えるが、
+製品の数字としては使えない。**
+
+再測定のしかた:
+
+```
+.venv\Scripts\python.exe tools\report_verbatim.py C:\dev\01\test-audio\truth ^
+  local=C:\dev\01\test-audio\01+02edited.premerge.speakers.json ^
+  turbo=C:\dev\01\test-audio\bench\large-v3-turbo.srt
+```
+
 ### 11.6 事業計画の指摘「Whisper 系採用は AmiVoice 系に対する構造的劣位」
 
 **否定された。**
