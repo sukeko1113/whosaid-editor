@@ -240,6 +240,41 @@ def cer(truth: str, hyp: str) -> float:
     return edit_distance(t, h) / len(t)
 
 
+def edit_ops(truth: str, hyp: str) -> dict:
+    """編集操作の内訳。`cer()` と**同じ正規化・同じ整列**で数える。
+
+    返すのは {"len": 正解長, "sub": 置換, "dele": 削除, "ins": 挿入}。
+    `(sub + dele + ins) / len` は `cer()` と一致する（検査で縛ってある）。
+
+    **なぜ要るか。**画面には「誤字」という指標が出ているが（`gui.py:850`
+    ほか）、**それを計算する実装がリポジトリに無い**（HANDOFF「画面に出て
+    いる『(実測)』の 1 つは、誰も再現できない」）。定義を決め直すための
+    材料として、まず内訳を出せるようにする。
+
+    **この関数は内訳を返すだけで、「誤字」を定義しない。**どれを誤字と
+    呼ぶかは測ってから決める——先に定義を確定させると、結果を見てから
+    定義を選び直したくなる。
+    """
+    a, b = normalize_for_cer(truth), normalize_for_cer(hyp)
+    n, m = len(a), len(b)
+    # dp[j] = (コスト, 置換, 削除, 挿入)。cer() と同じ重み(すべて 1)。
+    prev = [(j, 0, 0, j) for j in range(m + 1)]
+    for i in range(1, n + 1):
+        cur = [(i, 0, i, 0)] + [(0, 0, 0, 0)] * m
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                cur[j] = prev[j - 1]
+            else:
+                cur[j] = min(
+                    (prev[j - 1][0] + 1, prev[j - 1][1] + 1, prev[j - 1][2], prev[j - 1][3]),
+                    (prev[j][0] + 1, prev[j][1], prev[j][2] + 1, prev[j][3]),
+                    (cur[j - 1][0] + 1, cur[j - 1][1], cur[j - 1][2], cur[j - 1][3] + 1),
+                )
+        prev = cur
+    _cost, sub, dele, ins = prev[m]
+    return {"len": n, "sub": sub, "dele": dele, "ins": ins}
+
+
 def count_terms(text: str, terms: Iterable[str]) -> int:
     """語の出現回数を数える(単純な部分一致)。
 

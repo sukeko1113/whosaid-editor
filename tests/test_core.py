@@ -2566,6 +2566,51 @@ def test_edit_distance_basics():
     assert evaluate.edit_distance("あい", "") == 2
 
 
+def test_edit_ops_breakdown():
+    """内訳の 3 つが、それぞれ正しく数えられているか。"""
+    same = evaluate.edit_ops("あいう", "あいう")
+    assert (same["sub"], same["dele"], same["ins"]) == (0, 0, 0)
+    assert same["len"] == 3
+
+    sub = evaluate.edit_ops("あいう", "あかう")          # 1 文字が別の字に
+    assert (sub["sub"], sub["dele"], sub["ins"]) == (1, 0, 0)
+
+    dele = evaluate.edit_ops("あいう", "あう")           # 1 文字が落ちた
+    assert (dele["sub"], dele["dele"], dele["ins"]) == (0, 1, 0)
+
+    ins = evaluate.edit_ops("あいう", "あいえう")        # 1 文字が増えた
+    assert (ins["sub"], ins["dele"], ins["ins"]) == (0, 0, 1)
+
+    # cer() と同じ正規化を通ること（句読点は落ちる）
+    assert evaluate.edit_ops("はい、そうです。", "はいそうです")["sub"] == 0
+
+
+def test_edit_ops_sums_to_cer():
+    """**内訳の合計は cer() と一致する。**
+
+    別実装にすると、内訳と CER が食い違っても気づけない。**「同じ整列で
+    数えている」ことをここで縛る。**画面に出ている「誤字」に再現できる
+    定義が無いのは、まさにこの縛りが無かったためである
+    (HANDOFF「画面に出ている『(実測)』の 1 つは、誰も再現できない」)。
+    """
+    pairs = [
+        ("あいうえお", "あいうえか"),
+        ("あの、そうですね", "そうですね"),
+        ("はい", "はいはいはい"),
+        ("議事を始めます", "議事をはじめマス"),
+        ("あい", "まったくちがうながいぶんしょう"),
+        ("", "なにか"),
+    ]
+    for t, h in pairs:
+        o = evaluate.edit_ops(t, h)
+        if not o["len"]:
+            continue
+        total = (o["sub"] + o["dele"] + o["ins"]) / o["len"]
+        assert abs(total - evaluate.cer(t, h)) < 1e-9, (
+            f"内訳の合計が cer() と一致しません: {t!r} / {h!r} "
+            f"→ 内訳 {total} vs cer {evaluate.cer(t, h)}")
+
+
 def test_retention_rate_reports_both_counts():
     """保持率は 1.0 を超えうる。頭打ちにせず、実数も返す。"""
     rate, got, want = evaluate.retention_rate(
