@@ -22,6 +22,108 @@ from . import lang
 
 SCHEMA_VERSION = 5
 
+# ======================================================================
+# 作業ファイルの項目の分類
+#
+# **項目を足したら、下のどれかに分類するまで tests/test_schema_fields.py が
+# 落ちる。**`CACHE_KEY_ENGINE_FIELDS`(pipeline.py)と同じ形。
+#
+# ただしキャッシュ鍵と違い、**版を据え置いてもその場では何も起きない。**
+# 何も起きないものは、規約では止まらない——「誤字」の定義が失われたのは、
+# 数字を出す仕組みを作った人が、その定義を残す仕組みで縛られていなかった
+# ためだった(HANDOFF)。**だから据え置きには理由を書かせる。**
+#
+# ----------------------------------------------------------------------
+# ## この分類が守れる範囲・守れない範囲
+#
+# **守れる**: 項目がどれかに挙がっていること。挙げ忘れたら落ちる。
+# 据え置きを選んだなら理由が書いてあること(空文字は通らない)。
+#
+# **守れない**: **理由が正しいかどうか。**「読み手が既定値で困らない」と
+# 書いてあっても、実際に困るかは機械には判定できない。分類は「考えた跡」を
+# 残させるだけで、考えが正しいことは保証しない。
+# ======================================================================
+
+# schema 2 の時点で既にあった項目。
+# **v2.0.6 の実際の出力で確認した**(2026-08-31・725 区間の作業ファイル)。
+SCHEMA_BASE: frozenset[str] = frozenset({
+    # Project
+    "audio_path", "duration", "chunk_seconds", "model", "verbatim",
+    "audio_fingerprint", "time_offset", "speakers", "segments",
+    # Segment
+    "index", "start", "end", "text", "cluster", "chunk",
+    "speaker_id", "reviewed", "note", "text_edited",
+    # Speaker
+    "id", "name", "order",
+})
+
+# 足すときに版を上げた項目 → 上げた先の版。
+# 版は git 履歴で確認した(v3: 11b9032 / v4: ec40d51 / v5: 66ac7a0)。
+SCHEMA_BUMPED: dict[str, int] = {
+    "orig_start": 3,        # AI が出した元の時刻。人が直しても動かさない
+    "orig_end": 3,
+    "time_edited": 3,       # 時刻を直したか
+    "time_reviewed": 4,     # 時刻を**耳で確かめた**か(3 までは区別が無かった)
+    "source_sha256": 5,     # 元音声の SHA-256。第三者が検算するための値
+    "engine": 5,            # 処理経路の記録
+    "doc_revision": 5,      # Word を出力するたびに +1
+    "edit_log": 5,          # 追記型の編集履歴
+}
+
+# 足したが版を上げなかった項目 → **据え置いた理由(必須。空は通らない)**。
+#
+# **いまは空である。**これまでの追加はすべて版を上げてきた。
+# 据え置くときは、旧版が**その項目を知らなくても記録として成立する**ことを
+# 書くこと。「小さい変更だから」は理由にならない——版は変更の大きさではなく、
+# **旧版で開いたときに何が失われるか**で決める。
+SCHEMA_HELD: dict[str, str] = {}
+
+# 作業ファイルに保存しない項目 → 保存しない理由。
+SCHEMA_NOT_SERIALIZED: dict[str, str] = {
+    "json_path": "そのファイル自身の位置。中に書くと、移動したとたんに嘘になる",
+    "loaded_schema": "読んだファイルの版。**こちらの版で書き戻すと嘘になる**"
+                     "(保存を止めるかの判断にだけ使う)",
+    "unknown_keys": "読んだときに知らなかったキーの名前。同上、実行中だけの情報",
+}
+
+
+class NewerSchemaError(RuntimeError):
+    """こちらが知らない版で作られた作業ファイルを、上書きしようとした。
+
+    **利用者にそのまま見せてよい文面を持つ。**「保存できません」だけだと
+    理由が分からず、別名保存や再インストールで回避しようとする。
+    **何が失われるかを並べる。**
+    """
+
+    def __init__(self, file_schema: int, unknown_keys: Sequence[str] = ()):
+        self.file_schema = file_schema
+        self.unknown_keys = tuple(unknown_keys)
+        lost = ("\n".join(f"　・{k}" for k in self.unknown_keys)
+                if self.unknown_keys else "　・(このファイルに固有の記録)")
+        super().__init__(
+            f"この作業ファイルは新しい版で作られています"
+            f"(ファイル: 版 {file_schema} / このアプリ: 版 {SCHEMA_VERSION})。\n\n"
+            "開いて中身を読むことはできますが、保存はできません。\n"
+            "このアプリで保存すると、次のものが失われるためです。\n\n"
+            f"{lost}\n\n"
+            "編集を残すには、新しい版のアプリで開いてください。\n"
+            "このまま読むだけなら、何も起きません。")
+
+
+def unknown_keys_of(d: dict[str, Any]) -> tuple[str, ...]:
+    """作業ファイルの中で、こちらが知らないキーを拾う。
+
+    **失われるものを、名前で言えるようにするため。**将来の版が何を持つかは
+    こちらには分からないので、固定の一覧は書けない。読んだその場で数える。
+    """
+    known = set(SCHEMA_BASE) | set(SCHEMA_BUMPED) | set(SCHEMA_HELD) | {"schema"}
+    found: set[str] = set(d) - known
+    for key in ("segments", "speakers"):
+        for row in (d.get(key) or []):
+            if isinstance(row, dict):
+                found |= set(row) - known
+    return tuple(sorted(found))
+
 UNKNOWN_LABEL = "発言者不明"
 MULTI_LABEL = "発言者複数・重複"
 
@@ -696,6 +798,9 @@ class Project:
     speakers: list[Speaker] = field(default_factory=list)
     segments: list[Segment] = field(default_factory=list)
     json_path: Optional[str] = None      # 保存先(load 時に設定)
+    # **未来の版を上書きさせないための実行時の情報。**保存しない。
+    loaded_schema: Optional[int] = None  # 読んだファイルの版(新規作成なら None)
+    unknown_keys: tuple[str, ...] = ()   # 読んだとき知らなかったキーの名前
 
     # -------------------------------------------------- 話者アクセス
     def speaker(self, speaker_id: Optional[str]) -> Optional[Speaker]:
@@ -1420,9 +1525,32 @@ class Project:
             edit_log=list(d.get("edit_log") or []),
             speakers=[Speaker.from_dict(x) for x in d.get("speakers", [])],
             segments=[Segment.from_dict(x) for x in d.get("segments", [])],
+            # **読んだファイルの版と、こちらが知らないキーを覚えておく。**
+            # 保存を止めるかどうかの判断に使う(save() を見ること)。
+            loaded_schema=(int(d["schema"]) if isinstance(d.get("schema"), int)
+                           else None),
+            unknown_keys=unknown_keys_of(d),
         )
 
+    # ------------------------------------------------------------------
+    # 未来の版の扱い
+    # ------------------------------------------------------------------
+    def is_from_newer_schema(self) -> bool:
+        """こちらが知らない版で作られたファイルか。"""
+        return (self.loaded_schema or 0) > SCHEMA_VERSION
+
     def save(self, path: Optional[Path | str] = None) -> Path:
+        # **未来の版は、読めるが上書きさせない。**
+        #
+        # 読むのを拒む案(A)も検討したが採らなかった。**中身が見えないまま
+        # 拒む形になる**——確認できることを売っている製品で、確認そのものを
+        # 塞ぐのは方向が逆。二台で作業していて「新しい機械で作ったファイルを
+        # 古い機械で確認したい」も現実に起きる。
+        #
+        # v2.0.6 → v2.1.0 の往復で確かめた性質(開くだけなら何も起きず、
+        # 保存したときに落ちる)とも揃う。
+        if self.is_from_newer_schema():
+            raise NewerSchemaError(self.loaded_schema or 0, self.unknown_keys)
         target = Path(path or self.json_path or "")
         if not str(target):
             raise ValueError("保存先が指定されていません。")

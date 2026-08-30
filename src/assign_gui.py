@@ -3068,6 +3068,14 @@ class AssignWindow(tk.Toplevel):
     def _autosave_tick(self) -> None:
         if not self.winfo_exists():
             return
+        # **未来の版は保存できない。**試みても必ず失敗するので、4 秒ごとに
+        # 書き込みを叩き続けない。開くときに知らせてある(gui.py)。
+        if self.proj.is_from_newer_schema():
+            try:
+                self.after(4000, self._autosave_tick)
+            except tk.TclError:
+                pass
+            return
         if self._dirty and self.proj.json_path:
             try:
                 self.proj.save()

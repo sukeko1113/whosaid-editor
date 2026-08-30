@@ -28,7 +28,7 @@ DEFAULT_LOCAL_MODEL = _default_local_model()
 from .diarize import DEFAULT_NUM_SPEAKERS
 from .pipeline import DEFAULT_CLOUD_MODEL, EngineSpec, run_pipeline, run_segment_pipeline
 from .transcribe import FatalTranscriptionError
-from .segments import ENGINE_CLOUD, ENGINE_LOCAL, Project
+from .segments import ENGINE_CLOUD, ENGINE_LOCAL, NewerSchemaError, Project
 
 
 APP_TITLE = "Whosaid 反訳エディタ"
@@ -763,6 +763,15 @@ class App(tk.Tk):
             return
         if not self._warn_if_audio_changed(proj):
             return
+        # **未来の版は、開く前に知らせる。**保存できないことを、作業を
+        # 始めたあとに知るのでは遅い(1 時間割り当ててから「保存できません」は
+        # 最悪の順序)。読むだけなら安全なので、開くこと自体は止めない。
+        if proj.is_from_newer_schema():
+            if not messagebox.askyesno(
+                    "新しい版で作られたファイルです",
+                    f"{NewerSchemaError(proj.loaded_schema or 0, proj.unknown_keys)}\n\n"
+                    "読むだけなら安全です。このまま開きますか?"):
+                return
         self._remember_project(path)
         self._open_assign(proj)
 
