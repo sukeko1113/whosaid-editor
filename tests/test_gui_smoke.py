@@ -2638,8 +2638,12 @@ def run_main_window() -> int:
                 app.update()
                 _txt = str(app.lbl_gpu_hint.cget("text"))
                 check("GPU があるのに small なら注記が出る", "large-v3" in _txt)
+                # 2026-08-31 まで「誤字」と「速く」で見ていたが、**どちらも
+                # 撤回した主張**である(誤字は定義が復元できず、測り直すと
+                # 向きが逆。速さは機械で変わるので比を書かない。
+                # 設計書 §9.5.1 の注記)。**残った根拠は固有名詞だけ。**
                 check("理由も書いてある（判断できるように）",
-                      "誤字" in _txt and "速く" in _txt)
+                      "固有名詞" in _txt)
                 check("勝手に切り替えない", app.var_model.get() == "small")
 
                 # **選んだら、その場で覚える。**覚える処理が「経路を

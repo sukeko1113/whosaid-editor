@@ -758,8 +758,8 @@ def run_segment_pipeline(
                 and best == align.GPU_DEFAULT_MODEL
                 and transcriber.model != best):
             on_log(f"※ この機械には GPU があります。いまの設定は "
-                   f"{transcriber.model} ですが、{best} なら誤字が約 4 割減り、"
-                   "処理も速くなります(実測)。"
+                   f"{transcriber.model} ですが、{best} なら固有名詞の誤りが"
+                   "減ります(実測)。"
                    "設定画面のモデル欄で変えられます。")
 
     # 話者分離も先に確かめる。ただし**使えなくても止めない**——転写は 25 分

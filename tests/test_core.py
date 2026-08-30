@@ -4026,13 +4026,21 @@ def test_model_advice_never_recommends_a_smaller_model():
     が small を返し、案内文が「いまの設定は large-v3 ですが、small なら
     誤字が約 4 割減り…」になっていた（実機で発生・2026-08-22）。
     勧めてよいのは large-v3 へ上げるときだけ。
+
+    **目印を移した(2026-08-31)。**以前は案内文の「誤字が約 4 割減り」を
+    目印にしていたが、**その主張を撤回した**ため文言が変わり、検査が
+    落ちた(設計書 §9.5.1 の注記)。**勧める理由は今後も変わりうる**ので、
+    理由ではなく「GPU の案内であること」を指す文言に目印を移す。
     """
     import inspect
     from src import pipeline
     src = inspect.getsource(pipeline.run_segment_pipeline)
-    i = src.index("誤字が約 4 割減り")
+    anchor = "この機械には GPU があります"
+    assert anchor in src, "GPU の案内が見つからない(目印を確かめること)"
+    i = src.index(anchor)
     cond = src[max(0, i - 700):i]
-    assert "best == align.GPU_DEFAULT_MODEL" in cond,         "小さいモデルを勧める経路が残っている"
+    assert "best == align.GPU_DEFAULT_MODEL" in cond, \
+        "小さいモデルを勧める経路が残っている"
 
 
 def test_gpu_failure_says_where_it_looked():
@@ -4090,7 +4098,10 @@ def test_cpu_fallback_says_the_model_changed():
     assert "に切り替えます" in src
     # 落ちた先のモデル名を出しているか（変数で出していること）
     assert "self.model != was" in src, "モデルが変わったかを見ていない"
-    assert "誤字" in src, "品質が落ちることを伝えていない"
+    # 2026-08-31 まで「誤字」という語で見ていたが、**その指標は撤回した**
+    # (定義が復元できず、測り直すと向きが逆だった。設計書 §9.5.1 の注記)。
+    # 落ちる品質として言えるのは固有名詞なので、そちらで見る。
+    assert "固有名詞" in src, "品質が落ちることを伝えていない"
 
 
 def test_diarize_runs_in_a_child_process():

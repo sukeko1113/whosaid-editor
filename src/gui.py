@@ -670,8 +670,8 @@ class App(tk.Tk):
         show = (local and best != align.DEFAULT_MODEL
                 and self.var_model.get() != best)
         self.lbl_gpu_hint.configure(text=(
-            f"※ この機械には GPU があります。{best} なら誤字が約 4 割減り、"
-            "処理も速くなります(実測)。" if show else ""))
+            f"※ この機械には GPU があります。{best} なら固有名詞の誤りが"
+            "減ります(実測)。" if show else ""))
 
     def _update_mode_state(self) -> None:
         """モード切替に応じてチェックボックスと名簿欄の有効/無効を整える。
@@ -846,10 +846,17 @@ class App(tk.Tk):
         total = mb + (cuda_fetch.WHEEL_SIZE_MB if need_cuda else 0)
         want = messagebox.askyesno(
             "この PC の GPU を使えます",
-            f"{model} を使うと、実測で\n"
-            "　・誤字が約 4 割減ります（11.9% → 7.0%）\n"
-            "　・聞き取れなかった発言も拾えます（11/34 → 17/34）\n"
-            "　・処理も速くなります（67 分の音声に 24 分 → 15 分）\n\n"
+            f"{model} を使うと、固有名詞の誤りが減ります。\n\n"
+            "実測（67 分の会議・2026-08-31）では、実際の利用で誤りとして\n"
+            "気づいた 5 語（同窓会・文科省・耐震・新潟・建て替え）のうち、\n"
+            f"同梱の {align.DEFAULT_MODEL} が拾えたのは 2 語、"
+            f"{model} は 5 語とも拾いました。\n\n"
+            "　※ この 5 語は「誤っていた語」として選んだものです。\n"
+            "　　 固有名詞一般に強いことの証拠ではありません。\n"
+            "　※ 文字全体の誤り率はほとんど変わりません（27.3% → 27.8%）。\n"
+            "　　 効くのは固有名詞です。\n"
+            f"　※ 処理時間は機械によって変わります（この実測では {model} で\n"
+            "　　 67 分の音声が 20 分でした）。\n\n"
             "初回だけ、次の取得が要ります。\n"
             + "\n".join(parts) + f"\n　　合計 約 {total:,} MB\n\n"
             "取得元は Hugging Face"
