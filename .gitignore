@@ -46,10 +46,20 @@ __pycache__/
 
 # 動作確認用に repo 直下へ展開したポータブル版・ビルド成果物
 # (上の build/ dist/ Output/ では拾えない位置に置かれることがある)
-GeminiTranscriber.exe
-GeminiTranscriberSetup-*.exe
+#
+# **名前で書かない。**2026-08-21 の改名(GeminiTranscriber → WhosaidEditor)で、
+# ここだけ旧名のまま取り残されていた。守りが旧名を指したままなので、
+# WhosaidEditor.exe / WhosaidEditorSetup-*.exe / WhosaidEditor/ は
+# **どれも追跡対象になっていた**(ポータブル版はモデル同梱で約 1.1GB)。
+# 名前で書くかぎり、次の改名でまた同じ穴が空く。
+#
+# 追跡している .exe は 1 つも無い(`git ls-files | grep '\.exe$'` が空)ので、
+# 拡張子で丸ごと落とす。ポータブル版の中身は `<名前>.exe` と `_internal/` の
+# 2 つだけなので、この 2 行でフォルダ名によらず拾える。
+#
+# **追跡したい .exe ができたら、ここに例外を足すこと**(例: `!tools/foo.exe`)。
+*.exe
 _internal/
-gemini-transcriber/
 
 # ffplay も同梱バイナリ(ローカル/CI で配置)
 ffmpeg/ffplay.exe

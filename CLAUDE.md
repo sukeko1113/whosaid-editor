@@ -81,5 +81,12 @@ AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴�
   `installer.iss` の `AppId` は**変えない**（変えると PC に 2 つ入る）。
   名前は APP_NAME / APP_TITLE / build.spec / installer.iss / build.bat /
   GitHub Actions / README が連動する。変えるときは一括で。
+  **この一覧は一度取りこぼしている。** 2026-08-21 の改名で `.gitignore` が
+  旧名のまま残り、**新名のビルド成果物（`WhosaidEditor.exe` /
+  `WhosaidEditorSetup-*.exe` / ポータブル版 `WhosaidEditor/` 約 1.1GB）が
+  すべて追跡対象になっていた**（2026-08-30 に発見）。
+  `.gitignore` は名前で書かない形（`*.exe` + `_internal/`）に直したので
+  **一覧には入れない**——次の改名でも直す必要が無い。
+  **名前を直書きする箇所を新しく作ったら、この一覧に足すこと。**
 - 一部スクリプトは Git Bash 前提で PowerShell では動かない
   （`& "C:\Program Files\Git\bin\bash.exe"` で開いて実行する）。
