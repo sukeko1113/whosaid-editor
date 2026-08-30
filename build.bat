@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM Gemini Transcriber - Build Script (Windows)
+REM WhosaidEditor - Build Script (Windows)
 REM ------------------------------------------------------------
 REM 必要環境:
 REM   - Python 3.11 以上(PATH 通っていること)
@@ -104,7 +104,10 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  完了!
-echo  インストーラ: Output\WhosaidEditorSetup-2.0.6.exe
+rem 版はここに書かない。installer.iss の MyAppVersion が決めるので、
+rem 直書きすると版を上げるたびに古くなる(2.0.6 のまま v2.1.0 を迎えた)。
+rem 実際にできたファイルを並べる。
+for %%f in (Output\WhosaidEditorSetup-*.exe) do echo  インストーラ: %%f
 echo ============================================================
 pause
 endlocal
