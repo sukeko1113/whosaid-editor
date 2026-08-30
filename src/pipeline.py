@@ -1045,8 +1045,15 @@ def run_segment_pipeline(
                 all_segments = _carry_over_assignments(old, all_segments, on_log)
                 carried_revision = old.doc_revision
                 carried_log = old.edit_log
-        except Exception as e:  # 壊れた JSON は無視して作り直す
+        except Exception as e:
+            # **読めなくても、消す前に退避する。**上の 2 分岐(音声が変わった・
+            # 経路が変わった)は正常系で、どちらも退避している。**異常系の
+            # ここだけ退避が無かった**——このあと proj.save(json_path) が
+            # 上書きするので、ログ 1 行を残して作業が消えていた。
+            # 「読めない」には KeyError: 'index' も入る。725 区間のうち 1 つが
+            # 欠けただけの、手で直せば救えるファイルもここへ来る。
             on_log(f"既存の作業ファイルを読めませんでした({e})。新規作成します。")
+            _backup_stale_project(json_path, on_log)
             speakers = parse_roster(roster)
 
     proj = Project(

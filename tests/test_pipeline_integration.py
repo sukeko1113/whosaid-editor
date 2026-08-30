@@ -618,6 +618,121 @@ def _raise_unavailable(*a, **k):
     raise pipeline.diarize_mod.DiarizeUnavailable("モデルがありません(検査用)")
 
 
+def run_broken_project_backup() -> int:
+    """読めない作業ファイルを、上書きする前に退避するか(pipeline.py の except)。
+
+    **同じ関数の上 2 分岐(音声が変わった・経路が変わった)は正常系で、どちらも
+    退避している。異常系のここだけ退避が無かった。**このあと
+    proj.save(json_path) が上書きするので、ログ 1 行だけ残して作業が消えていた。
+
+    壊し方は `KeyError: 'index'` を選ぶ。**実態にいちばん近い壊れ方**で、区間
+    1 つから index が欠けただけの、手で直せば救えるファイルがこの経路へ来る。
+    JSON ごと壊れた場合より、失うものが大きい。
+    """
+    if not shutil.which("ffmpeg"):
+        print("SKIPPED: ffmpeg が無いので壊れた作業ファイルの検査は"
+              "実行されていません。")
+        return 0
+
+    failures = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    class FakeLocal:
+        def __init__(self, model="small", model_dir=None, **kw):
+            self.model, self.model_dir = model, model_dir
+            self.device, self.compute_type = "cpu", "int8"
+            self.prompt_ver = 0
+
+        def ensure_available(self):
+            pass
+
+        def transcribe(self, audio_path, *, on_log=None, on_progress=None,
+                       is_cancelled=None):
+            return pipeline.local_asr.ChunkResult(
+                utterances=[
+                    pipeline.local_asr.Utterance(0.0, 3.5, "議事を始めます。"),
+                    pipeline.local_asr.Utterance(4.0, 9.0, "資料の確認を。"),
+                ],
+                words=[], duration=60.0,
+            )
+
+    real_local = pipeline.local_asr.LocalTranscriber
+    pipeline.local_asr.LocalTranscriber = FakeLocal        # type: ignore[misc]
+
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 60)
+
+            print("\n[壊れた作業ファイルの退避]")
+            proj = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1,
+                on_log=lambda m: None, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n鈴木",
+            )
+            assert proj is not None
+            json_path = Path(proj.json_path)
+            check("1 回目で作業ファイルができる", json_path.is_file())
+
+            # **人が確定した印を立ててから壊す。**退避されなければ、この ✓ が
+            # 消える。区間の数だけでなく「何が失われるか」を検査に出す。
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data["segments"][0]["speaker_id"] = "sp01"
+            data["segments"][0]["reviewed"] = True
+            n_before = len(data["segments"])
+            del data["segments"][-1]["index"]        # KeyError: 'index'
+            json_path.write_text(json.dumps(data, ensure_ascii=False),
+                                 encoding="utf-8")
+            broken_bytes = json_path.read_bytes()
+
+            # 壊れていることを検査自身で確かめる。**壊せていないまま
+            # 「退避された」と読むのを防ぐ。**
+            try:
+                Project.load(json_path)
+                check("壊したファイルが読めなくなっている", False)
+            except Exception:
+                check("壊したファイルが読めなくなっている", True)
+
+            logs: list[str] = []
+            proj2 = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1,
+                on_log=logs.append, on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤\n鈴木",
+            )
+            assert proj2 is not None
+
+            baks = sorted(tmp.glob("*.bak.json"))
+            check("壊れた作業ファイルが .bak.json へ退避される", len(baks) == 1)
+            if baks:
+                check("退避したものが、壊れる前の中身そのもの",
+                      baks[0].read_bytes() == broken_bytes)
+                saved = json.loads(baks[0].read_text(encoding="utf-8"))
+                check("人が確定した印(✓)が退避先に残っている",
+                      saved["segments"][0].get("reviewed") is True
+                      and saved["segments"][0].get("speaker_id") == "sp01")
+                check("区間が欠けずに退避されている",
+                      len(saved["segments"]) == n_before)
+            check("退避したことをログに出す",
+                  any(".bak.json" in m for m in logs))
+            # 退避して終わりではない。作り直しは通常どおり進むこと
+            check("作り直しは進む(新しい作業ファイルができる)",
+                  json_path.is_file() and len(proj2.segments) > 0)
+            check("作り直したファイルは読める",
+                  Project.load(json_path) is not None)
+    finally:
+        pipeline.local_asr.LocalTranscriber = real_local   # type: ignore[misc]
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 def run_speaker_merge() -> int:
     """名簿の突き合わせ(設計書 §11.8)。**同じ人が 2 つの ID になるのを防ぐ。**
 
@@ -993,4 +1108,5 @@ if __name__ == "__main__":
     rc_cloud = run()
     rc_local = run_local()
     rc_merge = run_speaker_merge()
-    sys.exit(rc_cloud or rc_local or rc_merge)
+    rc_broken = run_broken_project_backup()
+    sys.exit(rc_cloud or rc_local or rc_merge or rc_broken)
