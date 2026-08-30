@@ -271,7 +271,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 | ツール | 用途 | 入手先 |
 | --- | --- | --- |
 | Python 3.11 以上 | アプリ本体 | https://www.python.org/downloads/ (PATH 追加にチェック) |
-| ffmpeg + ffplay(static build) | 音声分割・区間再生 | https://www.gyan.dev/ffmpeg/builds/ の **release-essentials** |
+| ffmpeg + ffplay(**LGPL 版**) | 音声分割・区間再生 | [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) の `ffmpeg-master-latest-win64-lgpl.zip` ← **GPL 版は不可**(手順 2) |
 | 話者分離のモデル(44MB) | 声のまとまりを作る | `python tools\fetch_diarize_models.py`(手順 3) |
 | 転写のモデル small(486MB) | 本文を作る | `python tools\fetch_asr_model.py small` |
 | Inno Setup 6 | インストーラ作成 | https://jrsoftware.org/isdl.php |
@@ -282,7 +282,25 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 1. **このフォルダを任意の場所に展開**します。
 
 2. **ffmpeg.exe と ffplay.exe を配置**します。
-   `ffmpeg-release-essentials.zip` を解凍 → `bin\` の 2 つをプロジェクトの `ffmpeg\` にコピー。
+
+   > **必ず LGPL 版を使ってください。** `ffmpeg-master-latest-win64-lgpl.zip` です。
+   > 本体は MIT で、**GPL 版の ffmpeg を同梱すると「同梱物全体を GPL にせよ」と
+   > 衝突します。** 別プロセスで起動する使い方なので、LGPL なら MIT のまま配れます。
+   > `resources\CREDITS.txt` も LGPL と表示しており、GPL 版を入れるとこの表示が
+   > 嘘になります。
+   >
+   > よく使われる gyan.dev の `release-essentials` は **`--enable-gpl` でビルド
+   > された GPL 版**です（2026-08-21 に実測して判明。以前はここにその手順を
+   > 書いていました）。CI は取得した ffmpeg の構成を検査して、GPL 版なら
+   > ビルドを止めます（[build.yml](.github/workflows/build.yml)）。手元で
+   > 確かめるには次を実行し、`--enable-gpl` と `--enable-nonfree` が
+   > **出ないこと**を見てください。
+   >
+   > ```
+   > ffmpeg\ffmpeg.exe -version
+   > ```
+
+   zip を解凍 → `bin\` の 2 つをプロジェクトの `ffmpeg\` にコピー。
    ```
    whosaid-editor\
      ├─ ffmpeg\
