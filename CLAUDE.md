@@ -56,6 +56,7 @@ AI は話者を A/B/C の記号でしか出さず、実名は人が音声を聴�
   - `python tests\test_lang.py`
   - `python tests\test_cache_key.py`
   - `python tests\test_measure_header.py`
+  - `python tests\test_docs_sync.py`
 - 実モデル（faster-whisper）を使う確認は `python tests\test_align_integration.py`。
   CI 対象外で、SAPI 合成音声を作って align.py と local_asr.py の両方を見る。
 - 新設テストも、個別実行で全チェックが走る構成にすること。

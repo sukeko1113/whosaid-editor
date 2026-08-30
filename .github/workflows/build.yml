@@ -135,7 +135,10 @@ jobs:
             # このリポジトリで何度も踏んだ形。
             'tests/test_lang.py',
             'tests/test_cache_key.py',
-            'tests/test_measure_header.py'
+            'tests/test_measure_header.py',
+            # 文書とコードの突き合わせ。**列挙している場所を直し忘れる型**を
+            # 機械に見張らせる(HANDOFF「検査で縛れる型と、縛れない型」)
+            'tests/test_docs_sync.py'
           )
 
           $results = @()

@@ -711,6 +711,7 @@ python -m src.main
 python tests\test_core.py                  # データモデル・パーサ・候補学習
 python tests\test_pipeline_integration.py  # 分割〜セグメント化(ffmpeg 必要 / API は呼ばない)
 python tests\test_gui_smoke.py             # 割当画面の動作(画面が一瞬開きます)
+python tests\test_docs_sync.py             # 文書とコードの突き合わせ(ファイル構成)
 ```
 
 ---
