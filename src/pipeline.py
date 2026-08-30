@@ -6,6 +6,7 @@ GUI から別スレッドで run_pipeline() を呼ぶ想定。
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -154,6 +155,102 @@ class EngineSpec:
                 rec["requested_model"] = asked
                 rec["fell_back"] = "GPU が使えず、CPU 向けのモデルに切り替えた"
         return rec
+
+
+class StageTimer:
+    """段階ごとの所要時間を測って、**読める形**でログに出す。
+
+    **手元の時計で読むより確実で、以後も残る。**「音声の長さの 2 割ほど」と
+    いった見積もりを、実データで直せるようにするのが目的。
+
+    ----------------------------------------------------------------------
+    ## 出し方の方針
+
+    **利用者が読むログなので、秒単位の羅列にしない。**「転写 26分」で足りる。
+    合計にだけ時刻を添える(「18:12 開始 / 18:48 完了(36分)」)。
+
+    **既存のログ行は置き換えない。**足すだけ。いまの読みやすさは保つ。
+
+    **走らなかった段階は出さない。**話者分離を切ったときに「話者分離 0分」と
+    出ると、切ったのか一瞬で終わったのか分からない。
+
+    ----------------------------------------------------------------------
+    ## 秒はファイルに残す
+
+    画面から読み直さずに比較できるように、`.work_<名前>/timings.jsonl` へ
+    **1 実行 1 行で追記**する。上書きしないのは、**比較したいのは実行の間**
+    だから。
+
+    作業ファイル(`.speakers.json`)には入れない。**所要時間は版を分ける性質の
+    情報ではない**ので、schema の判断を持ち込まない
+    (`segments.SCHEMA_BUMPED` / `SCHEMA_HELD` の分類を参照)。
+    """
+
+    def __init__(self, on_log: LogFn):
+        self._log = on_log
+        self._t0 = time.monotonic()
+        self._wall0 = datetime.now()
+        self._open: Optional[tuple[str, float]] = None
+        self.stages: list[tuple[str, float]] = []
+
+    def start(self, name: str) -> None:
+        """段階を開始する。前の段階が開いていれば閉じる。"""
+        self.stop()
+        self._open = (name, time.monotonic())
+
+    def stop(self) -> None:
+        if self._open is None:
+            return
+        name, t = self._open
+        self._open = None
+        self.stages.append((name, time.monotonic() - t))
+
+    @staticmethod
+    def _human(sec: float) -> str:
+        """1分未満は秒、それ以上は分。**小数点は出さない。**
+
+        1 秒未満を「0秒」と出さない。**走らなかったのか一瞬で終わったのかが
+        分からなくなる**——話者分離を切ったときに行そのものを出さないのと
+        同じ理由。
+        """
+        if sec < 1:
+            return "1秒未満"
+        if round(sec) < 60:          # 59.6 秒を「60秒」と出さない(→「1分」)
+            return f"{round(sec)}秒"
+        return f"{sec / 60:.0f}分"
+
+    def report(self, on_log: Optional[LogFn] = None) -> dict:
+        """内訳と合計をログに出し、記録用の dict を返す。"""
+        self.stop()
+        log = on_log or self._log
+        total = time.monotonic() - self._t0
+        end = datetime.now()
+        log("---- 所要時間 ----")
+        for name, sec in self.stages:
+            # **走らなかった段階はここに入っていない**(start を呼んでいない)
+            log(f"  {name}: {self._human(sec)}")
+        log(f"  {self._wall0:%H:%M} 開始 / {end:%H:%M} 完了"
+            f"({self._human(total)})")
+        return {
+            "started_at": self._wall0.isoformat(timespec="seconds"),
+            "finished_at": end.isoformat(timespec="seconds"),
+            "total_seconds": round(total, 1),
+            "stages": {name: round(sec, 1) for name, sec in self.stages},
+        }
+
+    def save(self, work_dir: Path, record: dict, on_log: LogFn) -> None:
+        """`.work_<名前>/timings.jsonl` へ 1 行追記する。
+
+        **失敗しても止めない。**時間の記録が取れないことで、できあがった
+        転写を捨てるのは割に合わない。
+        """
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            path = work_dir / "timings.jsonl"
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as e:
+            on_log(f"※ 所要時間を記録できませんでした({e})。転写には影響しません。")
 
 
 def _make_client(api_key: str) -> genai.Client:
@@ -713,6 +810,9 @@ def run_segment_pipeline(
     cache_dir = work_dir / "transcripts"
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # **時計は最初に起こす。**利用者が実行を押した時点からを測る。
+    timer = StageTimer(on_log)
+
     json_path = Project.default_json_path(output_dir, audio_path)
     model = engine.resolved_model()
 
@@ -782,6 +882,7 @@ def run_segment_pipeline(
     # 音声の中身から指紋(キャッシュ同一性)と SHA-256(第三者の検算用)を、
     # 1 回の読みで同時に取る。ファイル名が同じでも中身が変わっていれば
     # 別物として扱い、古い転写や割当を引き継がない。
+    timer.start("音声の確認")
     on_log("音声の内容を確認しています...")
     fingerprint, source_sha = audio_hashes(audio_path)
     if fingerprint:
@@ -789,9 +890,11 @@ def run_segment_pipeline(
     if source_sha:
         on_log(f"元音声の SHA-256: {source_sha}")
 
+    timer.start("分割")
     on_log(f"音声を {chunk_minutes} 分単位で分割します...")
     chunks = split_audio(audio_path, chunks_dir, chunk_minutes * 60)
     on_log(f"{len(chunks)} 個のチャンクに分割しました。")
+    timer.stop()
 
     if is_cancelled():
         on_log("キャンセルされました。")
@@ -825,6 +928,9 @@ def run_segment_pipeline(
     all_segments: list[Segment] = []
     failed_chunks = 0
     last_failure: str = ""
+    # **キャッシュから戻ったぶんも含む。**「今回どれだけ待ったか」を測る
+    # ものなので、取り直さなかった実行が短く出るのは正しい。
+    timer.start("転写")
     for i, chunk in enumerate(chunks):
         if is_cancelled():
             on_log("キャンセルされました。")
@@ -930,10 +1036,14 @@ def run_segment_pipeline(
     # ---- 話者分離(ローカル経路のみ・話者分離設計書 §4・§8) ----------------
     # 全長で 1 回走らせる。チャンクをまたいで同じ人を同じまとまりにできるのが
     # 要点で、Gemini のチャンク内クラスタ(実測 70 個)が 6 個になる。
+    timer.stop()                      # 転写ここまで
     roster_speakers = parse_roster(roster)
     diarize_record: Optional[dict] = None
     turns = None                      # 聴く順番の計算にも使う(下の §listen)
     if do_diarize and all_segments:
+        # **切ったときは start を呼ばない。**呼ぶと「話者分離 0分」と出て、
+        # 切ったのか一瞬で終わったのかが分からなくなる。
+        timer.start("話者分離")
         n_speakers = (engine.num_speakers or len(roster_speakers)
                       or diarize_mod.DEFAULT_NUM_SPEAKERS)
         try:
@@ -956,6 +1066,7 @@ def run_segment_pipeline(
             on_log("キャンセルされました。")
             return None
         if turns:
+            timer.start("まとまりの整理")
             all_segments = sorted(all_segments, key=lambda s: (s.start, s.index))
             for seg, cluster in zip(
                     all_segments, assign_speaker_clusters(all_segments, turns)):
@@ -982,6 +1093,7 @@ def run_segment_pipeline(
     # 転写は捨てない。順番が無くても作業は成立する。
     listen_path = listen_order.hints_path(work_dir, fingerprint)
     if turns and all_segments:
+        timer.start("聴く順番")
         try:
             hints = listen_order.score_segments(all_segments, turns)
             listen_order.save_hints(listen_path, hints)
@@ -1081,4 +1193,18 @@ def run_segment_pipeline(
         on_log(f"完了: {len(all_segments)} 区間 / 声のまとまり {len(real)} 種類")
     else:
         on_log(f"完了: {len(all_segments)} 区間(話者は全て未判別)")
+
+    # **所要時間は最後に出す。**割当画面を開く直前が「終わった」時点。
+    record = timer.report()
+    # 比較に要る素性を一緒に残す。装置とモデルが違えば時間は比べられない。
+    record.update({
+        "audio": audio_path.name,
+        "audio_seconds": round(float(duration or 0.0), 1),
+        "chunk_seconds": chunk_seconds,
+        "chunks": len(chunks),
+        "segments": len(all_segments),
+        "engine": proj.engine,
+        "diarize": bool(diarize_record),
+    })
+    timer.save(work_dir, record, on_log)
     return proj

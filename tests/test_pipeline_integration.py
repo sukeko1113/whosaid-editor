@@ -618,6 +618,104 @@ def _raise_unavailable(*a, **k):
     raise pipeline.diarize_mod.DiarizeUnavailable("モデルがありません(検査用)")
 
 
+def run_timing_log() -> int:
+    """所要時間の記録(StageTimer)。
+
+    **測る前に、測る道具が正しいことを確かめる。**手元の時計で読むより確実に
+    するために入れたものなので、ここが狂っていると以後の実測が全部ずれる。
+
+    見るもの:
+      - 段階ごとの行と、合計に時刻が付くこと
+      - **走らなかった段階の行を出さないこと**(話者分離を切ったときに
+        「話者分離 0分」と出ると、切ったのか一瞬で終わったのか分からない)
+      - 既存のログ行を消していないこと
+      - `.work_<名前>/timings.jsonl` に**追記**されること(上書きでない)
+    """
+    if not shutil.which("ffmpeg"):
+        print("SKIPPED: ffmpeg が無いので所要時間の検査は実行されていません。")
+        return 0
+
+    failures = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    class FakeLocal:
+        def __init__(self, model="small", model_dir=None, **kw):
+            self.model, self.model_dir = model, model_dir
+            self.device, self.compute_type = "cpu", "int8"
+            self.prompt_ver = 0
+
+        def ensure_available(self):
+            pass
+
+        def transcribe(self, audio_path, *, on_log=None, on_progress=None,
+                       is_cancelled=None):
+            return pipeline.local_asr.ChunkResult(
+                utterances=[pipeline.local_asr.Utterance(0.0, 3.5, "議事を始めます。")],
+                words=[], duration=60.0)
+
+    real_local = pipeline.local_asr.LocalTranscriber
+    pipeline.local_asr.LocalTranscriber = FakeLocal        # type: ignore[misc]
+
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            audio = tmp / "meeting.m4a"
+            make_tone(audio, 120)
+
+            print("\n[所要時間の記録]")
+            logs: list[str] = []
+            proj = pipeline.run_segment_pipeline(
+                audio_path=audio, output_dir=tmp, engine=LOCAL,
+                chunk_minutes=1, on_log=logs.append,
+                on_progress=lambda c, t: None,
+                is_cancelled=lambda: False, roster="佐藤")
+            assert proj is not None
+            text = "\n".join(logs)
+
+            check("所要時間の見出しが出る", "---- 所要時間 ----" in text)
+            check("段階の行が出る", "転写:" in text and "分割:" in text)
+            check("合計に時刻が付く",
+                  any("開始 /" in m and "完了" in m for m in logs))
+            # **切った段階の行を出さない。**ここが今回の要点。
+            check("話者分離を切ったら、その行を出さない", "話者分離:" not in text)
+            # **部分一致で見ない。**「0秒」で探すと「10秒」「20秒」に当たる
+            # (最初にそう書いて誤検出した)。区切りごと見る。
+            check("1 秒未満を 0秒 と出さない", ": 0秒" not in text)
+            # 既存のログを消していないこと(足す形にした)
+            check("既存のログ行は残っている",
+                  any("作業ファイル:" in m for m in logs)
+                  and any("完了:" in m for m in logs))
+
+            f = tmp / f".work_{audio.stem}" / "timings.jsonl"
+            check("timings.jsonl ができる", f.is_file())
+            if f.is_file():
+                lines = [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln]
+                rec = json.loads(lines[0])
+                check("段階ごとの秒が残る",
+                      isinstance(rec.get("stages"), dict) and "転写" in rec["stages"])
+                check("切った段階は記録にも入らない", "話者分離" not in rec["stages"])
+                check("比較に要る素性が入る",
+                      all(k in rec for k in ("audio_seconds", "chunks", "engine",
+                                             "diarize", "total_seconds")))
+                # **追記であること。**上書きだと実行の間で比較できない
+                pipeline.run_segment_pipeline(
+                    audio_path=audio, output_dir=tmp, engine=LOCAL,
+                    chunk_minutes=1, on_log=lambda m: None,
+                    on_progress=lambda c, t: None,
+                    is_cancelled=lambda: False, roster="佐藤")
+                lines2 = [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln]
+                check("2 回目は追記される(上書きしない)", len(lines2) == len(lines) + 1)
+    finally:
+        pipeline.local_asr.LocalTranscriber = real_local   # type: ignore[misc]
+
+    print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
+    return 1 if failures else 0
+
+
 def run_broken_project_backup() -> int:
     """読めない作業ファイルを、上書きする前に退避するか(pipeline.py の except)。
 
@@ -1109,4 +1207,5 @@ if __name__ == "__main__":
     rc_local = run_local()
     rc_merge = run_speaker_merge()
     rc_broken = run_broken_project_backup()
-    sys.exit(rc_cloud or rc_local or rc_merge or rc_broken)
+    rc_timing = run_timing_log()
+    sys.exit(rc_cloud or rc_local or rc_merge or rc_broken or rc_timing)
