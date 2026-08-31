@@ -2750,8 +2750,18 @@ def run_main_window() -> int:
                 # 選んで放置すると元に戻っていた(実機の指摘・2026-08-20)。
                 _saved = {}
                 _real_save = main_gui.save_config
+                # **検査環境では large-v3 が「未取得」に見える**(APPDATA を
+                # 差し替えてあるため)。そのままモデル欄で選ぶと**取得ダイアログが
+                # 実際に開き、検査が止まる**——aac6d05 で CI が 30 分で
+                # 打ち切られたのと同じ形。取得済みに見せてから確かめる。
+                _real_find = _al.find_bundled_model
+                _real_ask = main_gui.messagebox.askyesno
                 try:
                     main_gui.save_config = lambda d: (_saved.update(d), [])[1]
+                    _al.find_bundled_model = lambda m: (
+                        Path("x") if m == "large-v3" else _real_find(m))
+                    # 万一ここを通っても止まらないようにする(二重の備え)
+                    main_gui.messagebox.askyesno = lambda *a, **k: False
                     app.var_model.set("large-v3")
                     app._on_model_chosen()
                     check("選んだモデルを覚える",
@@ -2775,8 +2785,24 @@ def run_main_window() -> int:
                     check("設定のクラウド側も汚れていない",
                           _saved.get("model", main_gui.MODELS[0])
                           in main_gui.MODELS)
+                    # **未取得のものを選んだら、その場で取得を尋ねる。**
+                    # 黙って選ばせると、転写を始めてから 3GB を落としに行く。
+                    # 断ったら標準へ戻す(選んだままにすると、次の転写で
+                    # やはり落としに行く)。
+                    _asked = []
+                    _al.find_bundled_model = lambda m: (
+                        None if m == "large-v3" else _real_find(m))
+                    main_gui.messagebox.askyesno = lambda *a, **k: (
+                        _asked.append(a[0] if a else ""), False)[1]
+                    app.var_model_label.set(main_gui.MODEL_LABEL_NEEDS_FETCH)
+                    app._on_model_chosen()
+                    check("未取得の高精度を選んだら取得を尋ねる", bool(_asked))
+                    check("断ったら標準に戻る",
+                          app.var_model.get() == _al.DEFAULT_MODEL)
                 finally:
                     main_gui.save_config = _real_save
+                    _al.find_bundled_model = _real_find
+                    main_gui.messagebox.askyesno = _real_ask
                     app.var_model.set("small")
                     app._model_by_engine[main_gui.ENGINE_LOCAL] = "small"
                     app._update_gpu_hint()
@@ -3134,6 +3160,13 @@ def run_main_window() -> int:
                 "diarize": False,
                 "mode": main_gui.MODE_MANUAL,
             }
+            # **検査環境では large-v3 が未取得に見える**(APPDATA を差し替えて
+            # あるため)。取得済みに見せないと、モデル欄で選んだ時点で
+            # **取得ダイアログが開いて検査が止まる**(aac6d05 と同じ形)。
+            _rt_find = _al2.find_bundled_model
+            _al2.find_bundled_model = lambda m: (
+                Path("x") if m == "large-v3" else _rt_find(m))
+            main_gui.messagebox.askyesno = lambda *a, **k: False
             app.var_engine.set(_want["engine"])
             app._update_engine_state()
             app.var_model.set(_want["local_model"])
@@ -3169,6 +3202,9 @@ def run_main_window() -> int:
             finally:
                 _app2.destroy()
                 main_gui.load_config = real_load
+                # **差し替えを戻す。**戻さないと後続の検査に漏れ、
+                # 「large-v3 が取得済み」の世界のまま進む。
+                _al2.find_bundled_model = _rt_find
             app.var_diarize_local.set(True)
             main_gui._ask_speaker_count = real_ask_count
         finally:

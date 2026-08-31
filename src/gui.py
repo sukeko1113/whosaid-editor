@@ -19,7 +19,19 @@ from typing import Optional
 from . import align
 from . import asr_fetch
 from . import cuda_fetch
-from .align import AVAILABLE_MODELS as LOCAL_MODELS
+# **画面に出すのは 2 つだけ。**align.AVAILABLE_MODELS には base / medium も
+# あるが、画面からは選ばせない(2026-08-31):
+#   - **測っていない。**技術方針書 §11.5 で測ったのは small と
+#     large-v3-turbo で、base と medium の数字は無い。
+#     根拠の無い選択肢を出すことになる
+#   - **同梱していない。**選ぶと転写の最中に黙って落としに行く
+#     (base 145MB / medium 1.5GB)。README の「通信を遮断したままでも
+#     動きます」と衝突する
+#   - **4 つ並ぶと選べない。**base / small / medium / large-v3 は
+#     Whisper のモデルサイズの名前で、開発側の都合でしかない
+# 手で置いたフォルダを使う経路(model_dir)は残してあるので、
+# base / medium を使いたい人はそちらで使える。
+LOCAL_MODELS = ("small", "large-v3")
 # **既定はこの機械の装置で決まる。**GPU があれば large-v3、無ければ
 # small(CPU で large-v3 は実時間比が数倍で実用外)。呼び出しのたびに
 # 判定すると重いので、起動時に 1 回だけ決める。
@@ -33,6 +45,22 @@ from .segments import ENGINE_CLOUD, ENGINE_LOCAL, NewerSchemaError, Project
 
 APP_TITLE = "Whosaid 反訳エディタ"
 MODELS = [DEFAULT_CLOUD_MODEL, "gemini-2.5-pro"]
+
+# ローカルのモデルを、画面では日本語で出す(内部名・設定・キャッシュ鍵は
+# `small` / `large-v3` のまま)。
+#
+# **選ぶときに要るのは 2 つだけ**——速いか遅いか、追加の取得が要るか。
+# 「すぐ使えます」「固有名詞に強い」まで書くと説明が増えて、また分からなく
+# なる。細かい数字は取得ダイアログのほうに置いてある。
+#
+# **「標準」を劣ったものに見せない。**「速さ優先 / 正確さ優先」にすると、
+# 標準を選ぶ人が損をしているように読める。実際には標準で足りる場面が多い。
+MODEL_LABELS = {
+    "small": "標準（速い）",
+    "large-v3": "高精度（遅い）",
+}
+# 未取得のときだけ、取得が要ることを添える。
+MODEL_LABEL_NEEDS_FETCH = "高精度（遅い・3.0GB の取得が要ります）"
 
 MODE_MANUAL = "manual"
 MODE_AUTO = "auto"
@@ -304,6 +332,11 @@ class App(tk.Tk):
         # クラウドで選んでいた逐語モードの控え(ローカルの間は外しておく)
         self._verbatim_for_cloud = False
         self.var_model = tk.StringVar(value=DEFAULT_LOCAL_MODEL)
+        # **画面に出す名前は別の変数で持つ。**var_model は内部名(small /
+        # large-v3)のままにする——設定・キャッシュ鍵・EngineSpec がこれを
+        # 見ているので、表示名を入れると全部が別物になる。
+        self.var_model_label = tk.StringVar()
+        self.var_model.trace_add("write", lambda *_: self._sync_model_label())
         # 経路ごとに選んだモデルを覚えておく。切り替えて戻ったときに
         # 選び直させない(クラウドの gemini とローカルの small は別物)。
         self._model_by_engine = {
@@ -318,7 +351,7 @@ class App(tk.Tk):
                        padx=6, pady=4)
         model_box.columnconfigure(0, weight=1)
         self.cmb_model = ttk.Combobox(
-            model_box, values=list(LOCAL_MODELS), textvariable=self.var_model,
+            model_box, values=[], textvariable=self.var_model_label,
             state="readonly")
         self.cmb_model.grid(row=0, column=0, sticky="ew")
         self.cmb_model.bind("<MouseWheel>", self._on_wheel_over_value)
@@ -485,6 +518,13 @@ class App(tk.Tk):
         if lmodel := self.cfg.get("local_model"):
             if lmodel in LOCAL_MODELS:
                 self._model_by_engine[ENGINE_LOCAL] = str(lmodel)
+            else:
+                # **黙って変えない。**base / medium は選べなくなったので
+                # 既定に戻るが、意図してそれを選んでいた人には何も言わずに
+                # 別のモデルになる。この製品は「変わったことを人が知っている」
+                # 状態を守っている(✓ と △ を分けるのと同じ)。
+                # **一度だけ知らせる。**毎回言うと煩わしい。
+                self._retired_model = str(lmodel)
         if self.cfg.get("engine") in (ENGINE_LOCAL, ENGINE_CLOUD):
             self.var_engine.set(str(self.cfg["engine"]))
         if "diarize" in self.cfg:
@@ -520,6 +560,11 @@ class App(tk.Tk):
         self._refresh_dest()
         # 経路を反映してからモデル欄と有効/無効を整える(mode の状態もここで揃う)
         self._update_engine_state()
+        # 選べなくなったモデルが設定に残っていたら、一度だけ知らせる。
+        # **窓が出てから出す**——__init__ の途中でダイアログを出すと、
+        # 背後に何も描かれていない状態で出る。
+        if getattr(self, "_retired_model", ""):
+            self.after(400, self._warn_retired_model)
 
     # 自分でスクロールする欄。この上ではホイールを窓に回さない
     # (両方動くと、行を 1 つ送るつもりが画面ごと飛ぶ)。
@@ -609,10 +654,16 @@ class App(tk.Tk):
             self.var_verbatim.set(self._verbatim_for_cloud)
 
         engine = ENGINE_LOCAL if local else ENGINE_CLOUD
-        values = list(LOCAL_MODELS) if local else list(MODELS)
-        self.cmb_model.configure(values=values)
-        remembered = self._model_by_engine.get(engine, values[0])
-        self.var_model.set(remembered if remembered in values else values[0])
+        if local:
+            choices = self._local_model_choices()
+            ids = [m for m, _ in choices]
+            self.cmb_model.configure(values=[lb for _, lb in choices])
+        else:
+            ids = list(MODELS)
+            self.cmb_model.configure(values=ids)
+        remembered = self._model_by_engine.get(engine, ids[0])
+        self.var_model.set(remembered if remembered in ids else ids[0])
+        self._sync_model_label()
 
         state = "disabled" if local else "normal"
         for w in (self.lbl_api, self.entry_api, self.btn_api_show,
@@ -636,6 +687,80 @@ class App(tk.Tk):
         self._update_gpu_hint()
         self._update_mode_state()
 
+    def _warn_retired_model(self) -> None:
+        """選べなくなったモデルが設定に残っていたら、一度だけ知らせる。
+
+        **知らせたら記録して、二度と言わない。**毎回言うと煩わしい。
+        """
+        old = getattr(self, "_retired_model", "")
+        if not old:
+            return
+        self._retired_model = ""
+        now = self._model_label(self.var_model.get())
+        messagebox.showinfo(
+            "モデルの選択肢が変わりました",
+            f"設定に残っていた「{old}」は、選択肢から外しました。\n\n"
+            "この 2 つは実際に測っておらず、しかも同梱していないため、\n"
+            "選ぶと転写の最中に黙ってダウンロードが始まる状態でした。\n"
+            f"（{old} は約 {asr_fetch.SIZES_MB.get(old, 0):,} MB）\n\n"
+            f"いまは「{now}」が選ばれています。\n"
+            "モデル欄から選び直せます。",
+            parent=self)
+        # 設定からも消しておく。残しておくと毎回ここへ来る
+        self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # モデルの表示名（内部名 small / large-v3 との対応）
+    # ------------------------------------------------------------------
+    def _local_model_choices(self) -> list[tuple[str, str]]:
+        """この機械で選べるモデルを (内部名, 表示名) で返す。
+
+        **GPU が無ければ「高精度」を出さない。**CPU で large-v3 は実時間比が
+        数倍で、67 分の音声に数時間かかる。しかも**止める仕組みが無い**——
+        CPU 落ちの分岐は「GPU があって読み込みに失敗したとき」しか動かず、
+        もともと GPU が無い機械では `pick_device()` が最初から cpu を返すので
+        その分岐に入らない。**選べてしまうと、警告も切り替えも無いまま
+        数時間待たされる。**
+
+        **未取得でも出す。**隠すと、GPU があるのに高精度の存在を知らないまま
+        使い続ける人が出る。選んだ時点で取得を尋ね、断れば標準に戻す。
+        """
+        out = [("small", MODEL_LABELS["small"])]
+        if align.pick_device()[0] == align.GPU_DEVICE:
+            got = bool(align.find_bundled_model("large-v3"))
+            out.append(("large-v3",
+                        MODEL_LABELS["large-v3"] if got
+                        else MODEL_LABEL_NEEDS_FETCH))
+        return out
+
+    def _model_label(self, model_id: str) -> str:
+        for mid, label in self._local_model_choices():
+            if mid == model_id:
+                return label
+        return MODEL_LABELS.get(model_id, model_id)
+
+    def _model_id(self, label: str) -> str:
+        for mid, lb in self._local_model_choices():
+            if lb == label:
+                return mid
+        return label            # クラウドは表示名を使わない(gemini-… のまま)
+
+    def _sync_model_label(self) -> None:
+        """`var_model`(内部名)から、画面に出す名前を作り直す。
+
+        **既存の `var_model.set(...)` を全部書き換えずに済ませる**ため、
+        trace で追随させている。検査も内部名のまま書ける。
+        """
+        if not hasattr(self, "var_model_label"):
+            return
+        mid = self.var_model.get()
+        local = self.var_engine.get() == ENGINE_LOCAL
+        self.var_model_label.set(self._model_label(mid) if local else mid)
+
     def _on_model_chosen(self) -> None:
         """モデルを選んだら、その場で覚えて設定に書く。
 
@@ -645,6 +770,17 @@ class App(tk.Tk):
         開始時だけだったので、アプリを閉じると消えていた。
         """
         engine = self.var_engine.get()
+        # 画面で選ばれたのは表示名。内部名に戻してから扱う。
+        if engine == ENGINE_LOCAL:
+            picked = self._model_id(self.var_model_label.get())
+            if picked and picked != self.var_model.get():
+                self.var_model.set(picked)
+            # **未取得の「高精度」を選んだら、その場で取得を尋ねる。**
+            # 黙って選ばせると、転写を始めてから 3GB を落としに行く。
+            if picked == "large-v3" and not align.find_bundled_model("large-v3"):
+                if self._offer_fetch_now("large-v3"):
+                    return          # 取得中。終わったら画面が追いつく
+                self.var_model.set(align.DEFAULT_MODEL)   # 断られた → 標準へ戻す
         value = self.var_model.get()
         if value:
             self._model_by_engine[engine] = value
@@ -672,6 +808,11 @@ class App(tk.Tk):
         if show:
             text = (f"※ この機械には GPU があります。{best} なら固有名詞の誤りが"
                     "減ります(実測)。")
+        elif local and align.pick_device()[0] != align.GPU_DEVICE:
+            # **なぜ「高精度」が出ないのかを言う。**黙って 1 つしか出さないと、
+            # README を読んだ人が「高精度が選べない」と思う。理由(GPU が要る)は
+            # README 側に書いてあるので、ここは一行で足りる。
+            text = "※ この機械では標準のみ使えます。"
         elif local and getattr(self, "_gpu_declined", False):
             # **断ったあとに何も出ないと、「取得しないと使えないのか」と読まれる。**
             # いちばん誤解されたくない点(ローカル完結)がそこで崩れる。
@@ -856,6 +997,43 @@ class App(tk.Tk):
         if not model:
             return
 
+        want = self._ask_fetch(model)
+        # **聞いたことは、答えに関わらず記録する。**毎回出ては邪魔になる。
+        self.cfg[self.ASKED_KEY] = True
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        if want:
+            self._start_model_fetch(model)
+        else:
+            # **断ったことを覚えて、モデル欄の下に案内を出す。**
+            # 3.6GB なので断るほうが多い経路のはずだが、これまで**断った側には
+            # 何も出ていなかった**(取得に失敗したときだけ「small のまま使えます」が
+            # 出る)。README には書いてあるが、画面に出ていなければ届かない。
+            self._gpu_declined = True
+            self._update_gpu_hint()
+
+    def _offer_fetch_now(self, model: str) -> bool:
+        """モデル欄で未取得のものを選んだときに、その場で取得を尋ねる。
+
+        **一度だけ聞く `_maybe_offer_gpu_model` とは別物。**あちらは
+        「勧める」で、こちらは**利用者が自分で選んだ**ので毎回聞いてよい。
+        取得を始めたら True、断られたら False。
+        """
+        if self._worker is not None and self._worker.is_alive():
+            return False                # 転写中に割り込まない
+        if self._ask_fetch(model):
+            self._start_model_fetch(model)
+            return True
+        return False
+
+    def _ask_fetch(self, model: str) -> bool:
+        """取得してよいかを尋ねる。**文面はここ 1 箇所。**
+
+        勧める経路(一度だけ)と、自分で選んだ経路の 2 つから呼ぶ。2 通りに
+        書くと、片方だけ数字が古くなる。
+        """
         # **足りないものを両方まとめて聞く。**モデルだけ取っても、GPU で
         # 動かす部品(cuBLAS)が無ければ CPU に落ちる。2 回に分けて聞くと
         # 「取得したのに速くならない」になる。
@@ -866,7 +1044,7 @@ class App(tk.Tk):
             parts.append("　・GPU で動かすための部品（約 "
                          f"{cuda_fetch.WHEEL_SIZE_MB:,} MB）")
         total = mb + (cuda_fetch.WHEEL_SIZE_MB if need_cuda else 0)
-        want = messagebox.askyesno(
+        return messagebox.askyesno(
             "この PC の GPU を使えます",
             f"{model} を使うと、固有名詞の誤りが減ります。\n"
             "　ただし、処理は遅くなります。\n\n"
@@ -889,22 +1067,6 @@ class App(tk.Tk):
             + "で、録音や本文は送りません。\n\n"
             "取得しますか？（あとで設定画面から選ぶこともできます）",
             parent=self)
-
-        # **聞いたことは、答えに関わらず記録する。**毎回出ては邪魔になる。
-        self.cfg[self.ASKED_KEY] = True
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
-        if want:
-            self._start_model_fetch(model)
-        else:
-            # **断ったことを覚えて、モデル欄の下に案内を出す。**
-            # 3.6GB なので断るほうが多い経路のはずだが、これまで**断った側には
-            # 何も出ていなかった**(取得に失敗したときだけ「small のまま使えます」が
-            # 出る)。README には書いてあるが、画面に出ていなければ届かない。
-            self._gpu_declined = True
-            self._update_gpu_hint()
 
     def _start_model_fetch(self, model: str) -> None:
         """別スレッドで取得する。**画面は止めない。**
