@@ -709,6 +709,32 @@ def run_timing_log() -> int:
                     is_cancelled=lambda: False, roster="佐藤")
                 lines2 = [ln for ln in f.read_text(encoding="utf-8").splitlines() if ln]
                 check("2 回目は追記される(上書きしない)", len(lines2) == len(lines) + 1)
+
+            # --- 実行ログがファイルに残るか -------------------------------
+            # **窓を閉じたら消える、をやめた。**ここにしか無い情報がある:
+            # **転写の暴走の検出**(local_asr が on_log に流すだけで、作業
+            # ファイルにも timings にも入らない)と、**チャンクごとの区間数
+            # (マージ前)**。作業ファイルにあるのはマージ後で別の数字になる
+            # (実測: 1088 対 799)。
+            wdir = tmp / f".work_{audio.stem}"
+            names = sorted(p.name for p in wdir.glob("run-*.log"))
+            check("実行ログのファイルができる", len(names) >= 1)
+            if names and f.is_file():
+                recs = [json.loads(ln) for ln
+                        in f.read_text(encoding="utf-8").splitlines() if ln]
+                # **timings と突き合わせられること。**名前を推測させない
+                check("timings に log の名前が入る",
+                      all(r.get("log") for r in recs))
+                check("その名前のファイルが実在する",
+                      all((wdir / r["log"]).is_file() for r in recs))
+                check("実行ごとに別のログになる", len(names) == len(recs))
+                body = (wdir / recs[0]["log"]).read_text(encoding="utf-8")
+                # **冒頭から末尾まで入ること。**包む位置を間違えると端が欠ける
+                # ——最初 report() が包む前の on_log を握っていて、
+                # **所要時間だけファイルに残らなかった**(実測で発覚)。
+                check("ログの冒頭が入っている", "作業ファイル:" in body)
+                check("所要時間も入っている", "---- 所要時間 ----" in body)
+                check("開始時刻が header にある", "started_at:" in body)
     finally:
         pipeline.local_asr.LocalTranscriber = real_local   # type: ignore[misc]
 

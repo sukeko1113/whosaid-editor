@@ -192,6 +192,63 @@ class StageTimer:
         self._wall0 = datetime.now()
         self._open: Optional[tuple[str, float]] = None
         self.stages: list[tuple[str, float]] = []
+        self.log_name: str = ""          # tee() を呼んだら埋まる
+        self._log_path: Optional[Path] = None
+
+    # ------------------------------------------------------------------
+    # ログをファイルにも残す
+    # ------------------------------------------------------------------
+    def tee(self, on_log: LogFn, work_dir: Path) -> LogFn:
+        """画面に出しているログを、ファイルにも書く関数を返す。
+
+        **窓を閉じたら消える、をやめる。**この製品は「誰が確認したか」を
+        ✓ と △ で残しているのに、**機械が何をしたかは残していなかった。**
+        利用者が「昨日の処理で何が起きたか」を後から見られない。
+
+        ここにしか無い情報がある:
+          - **転写の暴走の検出**(local_asr.py が on_log に流すだけ。
+            作業ファイルにも timings にも入らない)
+          - **チャンクごとの区間数(マージ前)**。作業ファイルにあるのは
+            マージ後で、別の数字になる(実測: 1088 対 799)
+
+        **同じ実行の記録が 2 ファイルに分かれる**ので、突き合わせられる形に
+        する。ファイル名は開始時刻から作り、**その名前を timings.jsonl にも
+        書く**(`log` の項)。名前を推測させない。
+
+        **書けなくても止めない。**ログが残らないことで転写を捨てるのは
+        割に合わない。
+        """
+        self.log_name = f"run-{self._wall0:%Y%m%d-%H%M%S}.log"
+        path = work_dir / self.log_name
+        try:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
+                f.write("# whosaid-editor 実行ログ\n")
+                f.write(f"# started_at: "
+                        f"{self._wall0.isoformat(timespec='seconds')}\n")
+                f.write(f"# 同じ実行の所要時間は timings.jsonl にあります"
+                        f"（この名前が log の項に入っています）\n\n")
+            self._log_path = path
+        except OSError as e:
+            on_log(f"※ 実行ログをファイルに残せません({e})。処理は続きます。")
+            self.log_name = ""
+            return on_log
+
+        def tee_log(msg: str) -> None:
+            on_log(msg)
+            if self._log_path is None:
+                return
+            try:
+                with self._log_path.open("a", encoding="utf-8") as f:
+                    f.write(msg + "\n")
+            except OSError:
+                # **一度失敗したら諦める。**毎行エラーを出すと画面が埋まる
+                self._log_path = None
+
+        # **自分の握りも差し替える。**report() は self._log に出すので、
+        # ここを更新しないと**所要時間だけファイルに残らない**(実測で発覚)。
+        self._log = tee_log
+        return tee_log
 
     def start(self, name: str) -> None:
         """段階を開始する。前の段階が開いていれば閉じる。"""
@@ -236,6 +293,8 @@ class StageTimer:
             "finished_at": end.isoformat(timespec="seconds"),
             "total_seconds": round(total, 1),
             "stages": {name: round(sec, 1) for name, sec in self.stages},
+            # **同じ実行のログの名前。**突き合わせを推測に頼らせない
+            "log": self.log_name,
         }
 
     def save(self, work_dir: Path, record: dict, on_log: LogFn) -> None:
@@ -812,6 +871,9 @@ def run_segment_pipeline(
 
     # **時計は最初に起こす。**利用者が実行を押した時点からを測る。
     timer = StageTimer(on_log)
+    # **ここから先のログはファイルにも残す。**1 行目より前に包まないと、
+    # 冒頭(作業ファイル・処理経路・音声長)が記録から抜ける。
+    on_log = timer.tee(on_log, work_dir)
 
     json_path = Project.default_json_path(output_dir, audio_path)
     model = engine.resolved_model()
