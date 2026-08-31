@@ -155,6 +155,82 @@ def test_guard_actually_fires() -> None:
         f"（増えたのは {sorted(ghosts_after - ghosts_before)}）")
 
 
+def test_version_is_written_in_one_shape_everywhere():
+    r"""**版を書いてある場所を全部そろえる。**
+
+    名前（WhosaidEditor）の側には 8 箇所ぶんの検査があるのに、**版の側は
+    0 件だった**（2026-08-31 に気づいた）。`config.py` のコメント自身が
+    「現状は手動同期」と書いている。
+
+    **同じ構造で一度取りこぼしている。**`build.bat` に版を直書きしていて、
+    **2.0.6 のまま v2.1.0 を迎えた**（build.bat の rem に残っている）。
+    いまは build.bat から版が消えたが、残り 7 箇所は手で揃えるままだった。
+
+    ## 見る場所
+
+    | 場所 | 形 |
+    | --- | --- |
+    | `src/config.py` | `APP_VERSION`（**ここが正**） |
+    | `installer.iss` | `#define MyAppVersion` |
+    | `PRIVACY.md` / `TERMS_OF_USE.md` | 「対象バージョン: x.y.z」 |
+    | `README.md` | インストーラのファイル名 / `git tag` の例 / 作業ファイルの例 |
+
+    ## わざと見ない場所
+
+    - **README の「630MB（vX.Y.Z の実測）」。**ビルドしないと分からない数字で、
+      **版を上げた時点では古いのが正しい。**検査に入れると常に落ちる。
+      ビルドしてから手で更新する（README にもそう書いてある）。
+    - **履歴として残す記述。**`README.md` の「v2.0.6 からの変更点」、
+      `build.bat` の rem、`HANDOFF.md`、`segments.py` のコメント。
+      **一括置換すると、残すべき履歴まで書き換わる。**
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    def read(rel):
+        return (root / rel).read_text(encoding="utf-8")
+
+    m = re.search(r'^APP_VERSION = "([^"]+)"', read("src/config.py"), re.M)
+    assert m, "src/config.py の APP_VERSION が読めない"
+    ver = m.group(1)
+    assert re.fullmatch(r"\d+\.\d+\.\d+", ver), f"版の形が違う: {ver}"
+
+    # (説明, ファイル, 正規表現)。**取り出した値が APP_VERSION と一致すること**
+    places = [
+        ("installer.iss の MyAppVersion", "installer.iss",
+         r'#define MyAppVersion\s+"([^"]+)"'),
+        ("PRIVACY.md の対象バージョン", "PRIVACY.md",
+         r"対象バージョン:\s*([0-9]+\.[0-9]+\.[0-9]+)"),
+        ("TERMS_OF_USE.md の対象バージョン", "TERMS_OF_USE.md",
+         r"対象バージョン:\s*([0-9]+\.[0-9]+\.[0-9]+)"),
+        ("README のインストーラのファイル名", "README.md",
+         r"WhosaidEditorSetup-([0-9]+\.[0-9]+\.[0-9]+)\.exe"),
+        ("README の git tag の例", "README.md",
+         r"git tag v([0-9]+\.[0-9]+\.[0-9]+)"),
+        ("README の作業ファイルの例", "README.md",
+         r'"app_version":\s*"([0-9]+\.[0-9]+\.[0-9]+)"'),
+    ]
+    for why, rel, pat in places:
+        found = re.findall(pat, read(rel))
+        assert found, f"{why}: 見つからない（形を変えたなら検査も直すこと）"
+        for got in found:
+            assert got == ver, f"{why}: {got} だが APP_VERSION は {ver}"
+
+    # **履歴は触られていないこと。**一括置換の巻き添えを検出する
+    readme = read("README.md")
+    assert "## v2.0.6 からの変更点" in readme, \
+        "**v2.0.6 からの移行の説明が消えた。**2.0.6 から上げる人には今も要る"
+    assert "2.0.6 のまま v2.1.0 を迎えた" in read("build.bat"), \
+        "**取りこぼしの記録が消えた。**この検査が在る理由そのもの"
+
+    # 630MB の行は版を含んだままでよい（ビルド後に手で直す）。
+    # **ここで縛らないことを、意図として残しておく**
+    assert re.search(r"ダウンロードは約 [0-9,]+MB\*\*\(v[0-9.]+ の実測\)", readme), \
+        "サイズの行の形が変わった。検査の対象外にしている理由を読み直すこと"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
