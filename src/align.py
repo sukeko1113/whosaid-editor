@@ -317,6 +317,51 @@ def resolve_model(model: str = DEFAULT_MODEL,
     return model
 
 
+def model_source(model: str = DEFAULT_MODEL,
+                 model_dir: Optional[Path | str] = None) -> str:
+    r"""モデルを**どこから読むか**を、画面に出せる短い言葉で返す。
+
+    **絶対パスを出さないため**にある（2026-08-31）。ログの
+    「モデルの場所: <絶対パス>」が、旧版から更新した利用者の画面で
+
+        モデルの場所: C:\...\GeminiTranscriber\_internal\models\asr\small
+
+    と出ていた。**「録音も本文も外へ出しません」の数行下に Gemini と出る**のは、
+    この製品の主張と正面から衝突する。`installer.iss` の `AppId` は互換のため
+    変えられない（変えると 1 台に 2 つ入る）ので、旧版から更新した人の
+    インストール先は旧名のまま残る。**ログ側で出さないのが正しい。**
+
+    **アプリの名前も出さない。**「設定フォルダ」で足りる。新名であっても、
+    パスを出せば同じ形の問題を繰り返す余地が残る。
+
+    **手動で指定したフォルダだけはパスを出す。**利用者が自分で入れた値なので、
+    そのまま返して見せる意味がある（指定を間違えたときに気づける）。
+
+    元の行は 2026-08-22 に**意図して**足された——「同じ実行ファイルなのに
+    前は落ちた」を追う手掛かりが何も無かったため。**消さずに置き換える。**
+    診断で効くのは絶対パスではなく「同梱か、あとから取得したか」の区別なので、
+    手掛かりは残る。
+    """
+    if model_dir:
+        return f"手動で指定したフォルダ: {Path(model_dir)}"
+    found = find_bundled_model(model)
+    if found is None:
+        return "この PC には無いので、faster-whisper が取りに行きます"
+    try:
+        found.relative_to(downloaded_model_root())
+        return "あとから取得したもの（設定フォルダ）"
+    except ValueError:
+        pass
+    env = os.environ.get("WHOSAID_ASR_MODELS")
+    if env:
+        try:
+            found.relative_to(Path(env))
+            return f"環境変数 WHOSAID_ASR_MODELS の場所: {found}"
+        except ValueError:
+            pass
+    return "同梱（実行ファイルに入っています）"
+
+
 def model_tag(model: str, model_dir: Optional[Path | str] = None) -> str:
     """キャッシュのファイル名に入れる「モデルの素性」。
 

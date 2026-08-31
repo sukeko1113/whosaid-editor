@@ -35,6 +35,7 @@ from .align import (
     whisper_language,
     Word,
     default_model,
+    model_source,
     model_tag,
     pick_device,
     resolve_model,
@@ -443,7 +444,11 @@ class LocalTranscriber:
                 # することが変わる。別 PC で動かしたときに、遅い理由が
                 # 分からなかった(実機・2026-08-23)。
                 on_log(f"  GPU は使いません（{self._why_not_gpu()}）。")
-            on_log(f"  モデルの場所: {self.target}")
+            # **絶対パスは出さない。**旧版から更新した人のインストール先は
+            # 旧名（GeminiTranscriber）のままで、「録音も本文も外へ出しません」
+            # の数行下にそれが出ていた。align.model_source の docstring を参照。
+            on_log(f"  モデルの場所: "
+                   f"{model_source(self.model, self.model_dir)}")
 
         def build(device: str, ctype: str):
             m = WhisperModel(self.target, device=device, compute_type=ctype)

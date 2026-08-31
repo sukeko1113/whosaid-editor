@@ -3314,6 +3314,88 @@ def test_gpu_uses_int8_not_plain_float16():
     assert align.GPU_COMPUTE_TYPE == "int8_float16"
 
 
+
+def test_model_source_does_not_leak_the_install_path():
+    """**ログに絶対パスを出さない。**
+
+    `installer.iss` の `AppId` は互換のため変えられない（変えると 1 台に
+    2 つ入る）ので、**旧版から更新した人のインストール先は旧名のまま**残る。
+    v2.0.6 の `DefaultDirName` は `{autopf}\\GeminiTranscriber` だった。
+
+    その結果、ログに
+
+        ローカル転写は端末内で完結します。録音も本文も外へ出しません。
+        ...
+        モデルの場所: C:\\...\\GeminiTranscriber\\_internal\\models\\asr\\small
+
+    と出ていた。**主張の数行下に Gemini と出る。**
+
+    **アプリの名前も出さない。**新名（WhosaidEditor）であっても、パスを
+    出せば同じ形の問題を繰り返す余地が残る。「設定フォルダ」で足りる。
+    """
+    import os
+    import tempfile
+    from pathlib import Path
+    from src import align
+
+    NG = ("GeminiTranscriber", "WhosaidEditor", "AppData", "Program Files",
+          "_internal", "_MEIPASS")
+
+    def clean(s, why):
+        for bad in NG:
+            assert bad not in s, f"{why}: 「{bad}」が出ている → {s}"
+        # ドライブレターから始まる絶対パスも出さない
+        assert ":\\" not in s, f"{why}: 絶対パスが出ている → {s}"
+
+    # --- 同梱 / 取得済み / 見つからない、いずれもパスを出さない -------
+    real_find = align.find_bundled_model
+    real_root = align.downloaded_model_root
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            dl = Path(d) / "dl"
+            bundled = Path(d) / "app" / "_internal" / "models" / "asr" / "small"
+            (dl / "small").mkdir(parents=True)
+            bundled.mkdir(parents=True)
+            align.downloaded_model_root = lambda: dl
+
+            align.find_bundled_model = lambda m: dl / m
+            got = align.model_source("small")
+            clean(got, "あとから取得したもの")
+            assert "取得" in got and "設定フォルダ" in got, got
+
+            align.find_bundled_model = lambda m: bundled
+            got = align.model_source("small")
+            clean(got, "同梱")
+            assert "同梱" in got, got
+
+            align.find_bundled_model = lambda m: None
+            got = align.model_source("small")
+            clean(got, "見つからない")
+
+            # --- 手動指定だけはパスを出す（利用者が入れた値）---------
+            manual = Path(d) / "私が置いた場所"
+            got = align.model_source("small", manual)
+            assert str(manual) in got, "手動指定はパスを返して見せる"
+            assert "手動" in got, got
+    finally:
+        align.find_bundled_model = real_find
+        align.downloaded_model_root = real_root
+        os.environ.pop("WHOSAID_ASR_MODELS", None)
+
+
+def test_local_asr_logs_the_source_not_the_path():
+    """**ログ本文にも絶対パスが出ないこと。**関数だけ直しても、
+    呼び出し側が `self.target` を出していたら意味が無い。
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "src" / "local_asr.py"
+           ).read_text(encoding="utf-8")
+    assert 'モデルの場所: {self.target}' not in src, \
+        "絶対パスを出す書き方に戻っている"
+    assert "model_source(" in src, "種別を出す関数を呼んでいない"
+    # 診断の行そのものは残っていること（2026-08-22 に意図して足された）
+    assert "モデルの場所" in src, "**行ごと消してはいけない。**置き換えるだけ"
+
 def test_cache_key_separates_device_and_prompt():
     """**装置の精度とプロンプトの版が違えば、別のキャッシュになる。**
 
