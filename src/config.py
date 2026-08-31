@@ -20,7 +20,7 @@ LEGACY_APP_NAMES = ("GeminiTranscriber",)
 
 # アプリの版。installer.iss の MyAppVersion と揃えること(現状は手動同期。
 # Day 60 のインストーラ作業で一元化を検討)。Word の検証要約に併記される。
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # ライセンス表記のファイル名。**同梱している TitaNet は CC-BY-4.0 で、
 # 表示が配布の条件**(claude/claude_話者分離_設計書.md §9)。

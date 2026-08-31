@@ -9,7 +9,7 @@
 
 #define MyAppName        "Whosaid 反訳エディタ"
 #define MyAppNameAscii   "WhosaidEditor"
-#define MyAppVersion     "2.1.0"
+#define MyAppVersion     "2.2.0"
 #define MyAppPublisher   "西村香介"
 #define MyAppExeName     "WhosaidEditor.exe"
 

@@ -310,6 +310,8 @@ Microsoft は同州で voice enrollment を停止しています。
 
 文字起こしと話者分離のモデル(合計 510MB)を**インストーラに同梱**しているためです。
 インストーラは圧縮されているので、**ダウンロードは約 630MB**(v2.1.0 の実測)、
+<!-- このサイズと版は、ビルドしてから手で更新する。ビルドしないと分からない
+     数字なので、版の突き合わせ検査（tests/test_docs_sync.py）の対象外。 -->
 **展開後に約 1.1GB** を使います。
 
 **初回起動時のダウンロードはありません。** インストールした直後から、通信を
@@ -641,7 +643,7 @@ whosaid-editor/
   "source_sha256": "",     // 元音声の SHA-256。第三者が検算するための値
   // 処理経路の記録。Word の検証要約に「クラウド/ローカル」として出る
   "engine": { "mode": "local", "model": "small", "compute_type": "int8",
-              "app_version": "2.1.0", "at": "2026-08-14T…Z" },
+              "app_version": "2.2.0", "at": "2026-08-14T…Z" },
   "doc_revision": 0,       // Word を出力するたびに +1(書面に「版」として併記)
   "edit_log": [],          // 追記型の編集履歴(編集履歴の実装で記録される)
   "speakers": [ { "id": "sp01", "name": "佐藤", "note": "理事長", "order": 0 } ],
@@ -758,7 +760,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
 4. **(任意) アイコンを置く**: `resources\icon.ico`。
 
-5. **`build.bat` をダブルクリック** → `Output\WhosaidEditorSetup-2.1.0.exe`。
+5. **`build.bat` をダブルクリック** → `Output\WhosaidEditorSetup-2.2.0.exe`。
 
 > Inno Setup を入れずにビルドした場合は、`dist\WhosaidEditor\` をフォルダごと
 > コピーすれば動きます(ポータブル運用)。
@@ -769,7 +771,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 テスト(`tests/`)も同じジョブで実行されます。
 
 - **PR / push**: `Actions` タブから `WhosaidEditor-Installer` artifact をダウンロード可能
-- **タグ push** (`git tag v2.1.0 && git push --tags`): 自動で Release を作成し `.exe` を添付
+- **タグ push** (`git tag v2.2.0 && git push --tags`): 自動で Release を作成し `.exe` を添付
 
 ---
 
