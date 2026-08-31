@@ -13,7 +13,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from .assign_gui import RosterTable, open_assign_window
 from .audio import audio_fingerprint
-from .config import credits_text, load_config, save_config
+from .config import (UNREADABLE_MARK, credits_text, load_config,
+                     save_config)
 from typing import Optional
 
 from . import align
@@ -511,6 +512,12 @@ class App(tk.Tk):
             self.var_keep_api.set(bool(self.cfg.get(self.KEEP_API_KEY)))
         if api := self.cfg.get("api_key"):
             self.var_api.set(api)
+        # **保存されているのに、この PC では解けない鍵。**別の PC や別の
+        # Windows アカウントで包まれたもの（DPAPI は利用者ごと・機械ごと）。
+        # **鍵そのものは残してある**（config.save_config が上書きしない）。
+        self._api_unreadable = "api_key" in (
+            self.cfg.get(UNREADABLE_MARK) or [])
+        self._api_unreadable_told = False
         # 経路ごとにモデルを覚える。旧来の "model" はクラウドのモデル。
         if model := self.cfg.get("model"):
             if model in MODELS:
@@ -669,6 +676,7 @@ class App(tk.Tk):
         for w in (self.lbl_api, self.entry_api, self.btn_api_show,
                   self.btn_api_save, self.btn_api_del, self.chk_keep_api):
             w.configure(state=state)
+        self._update_api_note(local)
         self.chk_verbatim.configure(state=state)
         # 話者分離はローカル経路だけの設定(クラウドは Gemini が A/B/C を出す)
         self.chk_diarize.configure(state="normal" if local else "disabled")
@@ -686,6 +694,63 @@ class App(tk.Tk):
             self.lbl_auto_note.configure(text="")
         self._update_gpu_hint()
         self._update_mode_state()
+        if not local:
+            self._tell_api_unreadable()
+
+    # 注記の既定文。**灰色にした理由を書いておく。**灰色なのに理由が
+    # 無いと「壊れている」と読める（実装は前からあったが、注記が
+    # 暗号化の話しかしていなかった）。
+    API_NOTE_LOCAL = ("※ API キーは、クラウド経路を選んだときだけ要ります。"
+                      "いまはローカル経路なので使いません。")
+    API_NOTE_CLOUD = ("※ 保存する鍵は Windows の仕組みで暗号化します"
+                      "（このパソコンの、このユーザーでしか読めません）。"
+                      "共有のパソコンでは保存しないことを勧めます。")
+    API_NOTE_UNREADABLE = (
+        "※ 保存されている鍵を、このパソコンでは読めません。"
+        "別のパソコンで保存されたものかもしれません。"
+        "入力し直すと上書きされます。")
+
+    def _update_api_note(self, local: bool) -> None:
+        """API キー欄の注記。**読めない鍵があるなら、それを最優先で言う。**"""
+        if getattr(self, "lbl_api_note", None) is None:
+            return
+        if getattr(self, "_api_unreadable", False):
+            self.lbl_api_note.configure(text=self.API_NOTE_UNREADABLE,
+                                        foreground="#a00")
+            return
+        self.lbl_api_note.configure(
+            text=self.API_NOTE_LOCAL if local else self.API_NOTE_CLOUD,
+            foreground="#666")
+
+    def _tell_api_unreadable(self) -> None:
+        """クラウド経路を選んだときだけ、1 回だけ知らせる。
+
+        **起動時には出さない。**この鍵はクラウド経路でしか使わないので、
+        ローカルしか使わない人に毎回ダイアログを出すのは、要らない人に
+        出すことになる。ローカル完結が売りの製品で、起動のたびに
+        Gemini の鍵のダイアログが出るのは性格が真逆になる。
+
+        **閉じても行き止まりにならない。**開始を押した時点で
+        `_start()` が止める（分割もアップロードも走らない）。
+        """
+        if not getattr(self, "_api_unreadable", False):
+            return
+        if getattr(self, "_api_unreadable_told", False):
+            return
+        self._api_unreadable_told = True
+        self._append_log(
+            "※ 保存されている API キーを、このパソコンでは読めません"
+            "（別のパソコンで保存されたものかもしれません）。"
+            "鍵は消していません。入力し直すと上書きされます。")
+        messagebox.showwarning(
+            "API キー",
+            "保存されている鍵を、このパソコンでは読めません。\n\n"
+            "別のパソコンで保存されたものかもしれません"
+            "（暗号化は、このパソコンのこのユーザーだけが解けます）。\n\n"
+            "**入力し直すと上書きされます。**\n"
+            "元のパソコンで使う予定があるなら、先に控えてください。\n\n"
+            "鍵はまだ消していません。",
+            parent=self)
 
     def _warn_retired_model(self) -> None:
         """選べなくなったモデルが設定に残っていたら、一度だけ知らせる。
@@ -1194,6 +1259,10 @@ class App(tk.Tk):
                 "入力欄の鍵は今回の実行には使えます。"
                 "次に起動したときは入れ直してください。")
             return
+        # **上書きできたので、読めない状態は解消した。**印を残すと
+        # 赤い注記が出たままになる。
+        self._api_unreadable = False
+        self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo(
             "API キー",
             "API キーを保存しました。\n"
@@ -1219,6 +1288,9 @@ class App(tk.Tk):
             messagebox.showerror("API キー", f"消せませんでした: {e}")
             return
         self.var_api.set("")
+        # 消したのだから、読めない鍵はもう無い
+        self._api_unreadable = False
+        self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo("API キー", "API キーを消しました。")
 
     def _on_keep_api_toggled(self) -> None:
@@ -1329,7 +1401,16 @@ class App(tk.Tk):
         api = self.var_api.get().strip()
         # 鍵が要るのはクラウドのときだけ。ローカルは端末内で完結する。
         if engine_mode == ENGINE_CLOUD and not api:
-            messagebox.showwarning("API キー", "Gemini の API キーを入力してください。")
+            # **「入力してください」では的外れな人がいる。**入れたのに、
+            # この PC では読めないだけ、という場合がある。
+            if getattr(self, "_api_unreadable", False):
+                messagebox.showwarning(
+                    "API キー",
+                    "保存されている鍵を、このパソコンでは読めません。\n"
+                    "入力し直してください（上書きされます）。")
+            else:
+                messagebox.showwarning(
+                    "API キー", "Gemini の API キーを入力してください。")
             return
 
         mode = self.var_mode.get()

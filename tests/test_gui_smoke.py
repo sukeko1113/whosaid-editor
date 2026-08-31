@@ -3216,6 +3216,135 @@ def run_main_window() -> int:
     return 1 if failures else 0
 
 
+def run_api_unreadable() -> int:
+    """**解けない鍵の知らせ方。**要る人にだけ、要るときに出す。
+
+    起動時にダイアログを出すと、**ローカルしか使わない人にも毎回出る**——
+    しかも鍵を入れ直すか消すまで止まらない。ローカル完結が売りの製品で、
+    起動のたびに Gemini の鍵のダイアログが出るのは性格が真逆になる。
+    だから**クラウド経路を選んだときだけ、1 回だけ**にした。
+
+    注記は常時出す。欄が灰色でも読めるので、切り替える前に気づける。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[解けない API キーの知らせ方]")
+    from src import gui as guimod
+    from src.config import UNREADABLE_MARK
+    from src.segments import ENGINE_CLOUD, ENGINE_LOCAL
+
+    real_load = guimod.load_config
+    real_save = guimod.save_config
+    real_warn = guimod.messagebox.showwarning
+    shown: list[tuple] = []
+    guimod.messagebox.showwarning = lambda *a, **k: shown.append(a)
+    guimod.save_config = lambda cfg: []
+
+    def build(unreadable: bool):
+        cfg = {"api_key": "", UNREADABLE_MARK: ["api_key"]} if unreadable else {}
+        guimod.load_config = lambda: dict(cfg)
+        app = guimod.App()
+        app.withdraw()
+        return app
+
+    try:
+        # --- 読めない鍵がある場合 ---------------------------------
+        shown.clear()
+        app = build(True)
+        try:
+            check("起動しただけではダイアログを出さない", not shown)
+            # **通常の注記にも「読めません」がある**（「このユーザーでしか
+            # 読めません」）。この節にしか無い言い回しで見る
+            check("注記が「保存されている鍵を…読めません」になる",
+                  "保存されている鍵を、このパソコンでは"
+                  in app.lbl_api_note.cget("text"))
+            check("注記に「上書きされます」がある",
+                  "上書き" in app.lbl_api_note.cget("text"))
+            check("注記が赤い", str(app.lbl_api_note.cget("foreground")) == "#a00")
+            # クラウドへ切り替える → ここで初めて出る
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("クラウドを選んだら出る", len(shown) == 1)
+            check("文面に「上書きされます」がある",
+                  bool(shown) and "上書きされます" in shown[0][1])
+            check("文面に「消していません」がある",
+                  bool(shown) and "消していません" in shown[0][1])
+            # 行ったり来たりしても増えない
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("2 回目以降は出さない（1 回だけ）", len(shown) == 1)
+
+            # --- 開始を押しても、分割の前に止まる -----------------
+            shown.clear()
+            app.var_input.set(__file__)          # 実在するファイルなら何でもよい
+            app.var_api.set("")
+            started = {"n": 0}
+            real_thread = guimod.threading.Thread
+            guimod.threading.Thread = lambda *a, **k: started.__setitem__(
+                "n", started["n"] + 1) or real_thread(target=lambda: None)
+            try:
+                app._start()
+            finally:
+                guimod.threading.Thread = real_thread
+            check("開始を押しても処理を始めない", started["n"] == 0)
+            check("開始時の文面が「入力してください」ではない",
+                  bool(shown) and "読めません" in shown[0][1])
+
+            # --- 入れ直したら印が下りる ---------------------------
+            real_info = guimod.messagebox.showinfo
+            guimod.messagebox.showinfo = lambda *a, **k: None
+            try:
+                app.var_api.set("AIzaSyTEST-0123456789")
+                app.var_keep_api.set(True)
+                app._save_api_key()
+            finally:
+                guimod.messagebox.showinfo = real_info
+            # **目印に「読めません」は使えない。**通常の注記にも
+            # 「このユーザーでしか読めません」があり、常に当たってしまう
+            # （最初これで書いて、直っているのに落ちた）。
+            check("入れ直したら赤い注記が消える",
+                  str(app.lbl_api_note.cget("foreground")) == "#666")
+            check("入れ直したら「上書きされます」も消える",
+                  "上書きされます" not in app.lbl_api_note.cget("text"))
+        finally:
+            app.destroy()
+
+        # --- 読めない鍵が無い場合 ---------------------------------
+        shown.clear()
+        app = build(False)
+        try:
+            check("印が無ければ、クラウドに切り替えても出ない",
+                  (app.var_engine.set(ENGINE_CLOUD),
+                   app._update_engine_state(), not shown)[-1])
+            check("クラウドの注記は暗号化の話",
+                  "暗号化" in app.lbl_api_note.cget("text"))
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            check("ローカルの注記は「クラウド経路を選んだときだけ」",
+                  "クラウド経路を選んだときだけ" in app.lbl_api_note.cget("text"))
+            check("ローカルでは欄が灰色のまま",
+                  str(app.entry_api.cget("state")) == "disabled")
+        finally:
+            app.destroy()
+    finally:
+        guimod.load_config = real_load
+        guimod.save_config = real_save
+        guimod.messagebox.showwarning = real_warn
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
@@ -3223,5 +3352,7 @@ if __name__ == "__main__":
     rc_cand = run_candidate_scroll()
     rc_multi = run_multi_select()
     rc_main = run_main_window()
+    rc_api = run_api_unreadable()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
-    sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main or rc_cfg)
+    sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
+             or rc_api or rc_cfg)
