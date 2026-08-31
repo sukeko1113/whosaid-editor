@@ -3468,6 +3468,83 @@ def test_runaway_is_judged_by_count_and_speaking_rate():
     assert find_runaway(_run_of("はい。", [0.05, 0.05])) is None
 
 
+
+def test_runaway_log_says_which_one_was_kept():
+    """**3 つの分岐すべてで、字数と「どちらを残したか」を出す。**
+
+    「直りませんでした」の分岐だけ字数を出さず、元を残したことも
+    言っていなかった（2026-08-31 に実測で気づいた）。読み手は
+    **本物の相づちか本文が消えたか**を判断できず、しかも
+    **どちらの結果が残ったのかも分からなかった。**
+
+    あわせて「どの分岐でも元を返す」ことも縛る。起こし直しの結果で
+    上書きされることは無い——実データでも確かめた（最終チャンクの字数は、
+    暴走が出た回が最小ではなかった）。
+    """
+    import tempfile
+    from src.local_asr import ChunkResult, LocalTranscriber
+
+    def utts(text, n, dur=0.36):
+        return _run_of(text, [dur] * n)
+
+    def run(retry_result):
+        """元は暴走あり。起こし直しの結果を差し替えて 3 分岐を作る。"""
+        t = object.__new__(LocalTranscriber)
+        t.condition_on_previous_text = True
+        orig = ChunkResult(utterances=utts("ありがとうございます。", 5))
+        calls = {"n": 0}
+
+        def fake_once(*a, **k):
+            calls["n"] += 1
+            return orig if calls["n"] == 1 else retry_result
+
+        t._once = fake_once
+        logs = []
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            p = Path(f.name)
+        try:
+            got = LocalTranscriber.transcribe(t, p, on_log=logs.append)
+        finally:
+            p.unlink(missing_ok=True)
+        return got, orig, "\n".join(logs)
+
+    def varied(n):
+        """**本文を散らす。**同じ文を並べると、それ自体が暴走判定に当たる
+        （最初この検査を書いたとき、分岐1 のダミーが分岐3 に落ちた）。"""
+        from src.segments import Utterance
+        out, s = [], 0.0
+        for i in range(n):
+            out.append(Utterance(rel_start=s, rel_end=s + 1.0,
+                                 text=f"ちゃんと起きた {i} 番目の本文です。"))
+            s += 1.3
+        return out
+
+    # --- 分岐1: 直った（暴走が消え、本文も減っていない）---
+    longer = ChunkResult(utterances=varied(9))
+    got, orig, log = run(longer)
+    assert got is longer, "直ったら起こし直しを採る"
+    assert "直りました" in log
+    assert "字 → " in log, "分岐1 に字数が無い"
+
+    # --- 分岐2: 暴走は消えたが本文が減った → 元を残す ---
+    shorter = ChunkResult(utterances=_run_of("短い。", [1.0] * 2))
+    got, orig, log = run(shorter)
+    assert got is orig, "本文が減るなら元を残す"
+    assert "元のままにします" in log
+    assert "字 → " in log, "分岐2 に字数が無い"
+
+    # --- 分岐3: 起こし直しても暴走が残った → 元を残す ---
+    still = ChunkResult(utterances=utts("ありがとうございます。", 4))
+    got, orig, log = run(still)
+    assert got is orig, "**直らなくても元を返す。**起こし直しで上書きしない"
+    assert "直りませんでした" in log
+    # ここが今回の本題。**他の 2 分岐と揃っていること**
+    assert "字 → " in log, "分岐3 に字数が無い（他の 2 分岐にはある）"
+    assert "元のままにします" in log, "分岐3 がどちらを残したか言っていない"
+    # 断定していないこと。本物の相づちの可能性を落とさない
+    assert "本物の相づち" in log
+    assert "失われている可能性" in log
+
 def test_speaking_rate_line_sits_between_the_real_cases():
     """線の位置を実データで縛る。**本物 13〜14、暴走 23〜44 の間。**"""
     from src.local_asr import MAX_CHARS_PER_SECOND, LOOP_RUN_THRESHOLD
