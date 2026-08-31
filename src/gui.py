@@ -349,7 +349,7 @@ class App(tk.Tk):
             text="タイムスタンプを付ける(段落ごとに [時:分:秒] を挿入)",
             variable=self.var_timestamps,
         )
-        self.chk_timestamps.grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
+        self.chk_timestamps.grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
 
         # 話者識別チェックボックス
         self.var_diarization = tk.BooleanVar(value=False)
@@ -359,7 +359,7 @@ class App(tk.Tk):
             variable=self.var_diarization,
             command=self._update_diarization_state,
         )
-        self.chk_diarization.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
+        self.chk_diarization.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
 
         self.lbl_diar_note = ttk.Label(
             frm_adv,
@@ -367,7 +367,7 @@ class App(tk.Tk):
             foreground="#888",
             wraplength=700,
         )
-        self.lbl_diar_note.grid(row=5, column=0, columnspan=4, sticky="w", padx=24, pady=(0, 2))
+        self.lbl_diar_note.grid(row=7, column=0, columnspan=4, sticky="w", padx=24, pady=(0, 2))
 
         # 逐語モード・チェックボックス(v1.3.0)
         self.var_verbatim = tk.BooleanVar(value=False)
@@ -376,7 +376,7 @@ class App(tk.Tk):
             text="逐語モード(「えー」等のフィラー・言い直しを残し、整文しない。反訳・記録用)",
             variable=self.var_verbatim,
         )
-        self.chk_verbatim.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
+        self.chk_verbatim.grid(row=8, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
 
         # 話者分離(ローカル経路のみ)
         self.var_diarize_local = tk.BooleanVar(value=True)
@@ -386,11 +386,11 @@ class App(tk.Tk):
             variable=self.var_diarize_local,
             command=self._update_diarize_note,
         )
-        self.chk_diarize.grid(row=7, column=0, columnspan=4, sticky="w",
+        self.chk_diarize.grid(row=9, column=0, columnspan=4, sticky="w",
                               padx=6, pady=(0, 0))
         self.lbl_diarize_note = ttk.Label(
             frm_adv, text="", foreground="#888", wraplength=700)
-        self.lbl_diarize_note.grid(row=8, column=0, columnspan=4, sticky="w",
+        self.lbl_diarize_note.grid(row=10, column=0, columnspan=4, sticky="w",
                                    padx=24, pady=(0, 2))
 
         # やり直しチェックボックス(v2.0.1)
@@ -400,7 +400,7 @@ class App(tk.Tk):
             frm_adv,
             text="キャッシュを使わず最初からやり直す(結果がおかしいときに)",
             variable=self.var_force,
-        ).grid(row=9, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
+        ).grid(row=11, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 6))
 
         # === 出席者(候補者リスト) ===
         self.frm_roster = ttk.LabelFrame(body, text="出席者(候補者リスト)")
@@ -855,17 +855,20 @@ class App(tk.Tk):
         total = mb + (cuda_fetch.WHEEL_SIZE_MB if need_cuda else 0)
         want = messagebox.askyesno(
             "この PC の GPU を使えます",
-            f"{model} を使うと、固有名詞の誤りが減ります。\n\n"
-            "実測（67 分の会議・2026-08-31）では、実際の利用で誤りとして\n"
-            "気づいた 5 語（同窓会・文科省・耐震・新潟・建て替え）のうち、\n"
-            f"同梱の {align.DEFAULT_MODEL} が拾えたのは 2 語、"
-            f"{model} は 5 語とも拾いました。\n\n"
+            f"{model} を使うと、固有名詞の誤りが減ります。\n"
+            "　ただし、処理は遅くなります。\n\n"
+            "実測（67 分の会議・同じ GPU・話者分離あり・2026-08-31）:\n\n"
+            "　・固有名詞（同窓会・文科省・耐震・新潟・建て替えの 5 語）\n"
+            f"　　　{align.DEFAULT_MODEL} は 1〜2 語 → {model} は 5 語とも拾えました\n"
+            "　・終わるまでの時間\n"
+            f"　　　{align.DEFAULT_MODEL} は 12〜17 分 → {model} は 32 分\n\n"
+            f"　※ {align.DEFAULT_MODEL} の語数に幅があるのは、転写が苦しい箇所で\n"
+            "　　 実行ごとに結果が変わるためです（2 回測った値）。\n"
             "　※ この 5 語は「誤っていた語」として選んだものです。\n"
             "　　 固有名詞一般に強いことの証拠ではありません。\n"
             "　※ 文字全体の誤り率はほとんど変わりません（27.3% → 27.8%）。\n"
             "　　 効くのは固有名詞です。\n"
-            f"　※ 処理時間は機械によって変わります（この実測では {model} で\n"
-            "　　 67 分の音声が 20 分でした）。\n\n"
+            "　※ 時間は機械によって変わります。\n\n"
             "初回だけ、次の取得が要ります。\n"
             + "\n".join(parts) + f"\n　　合計 約 {total:,} MB\n\n"
             "取得元は Hugging Face"

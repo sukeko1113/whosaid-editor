@@ -2511,6 +2511,77 @@ def run_multi_select() -> int:
     return 1 if failures else 0
 
 
+def grid_overlaps(root) -> list[str]:
+    """grid で同じマスに 2 つ以上置かれている箇所を全部挙げる。
+
+    **同じ場所で 2 度目だったので、機械に見張らせる。**
+
+    2026-08-20 に「モデル欄を下の行(チャンク長)に直接置いたら重なった」を
+    直したが、**枠に入れる対処で、行の衝突そのものは残っていた。**
+    2026-08-31 に実機で再発（モデル欄が「タイムスタンプを付ける」に半分
+    かぶる／チャンク長の行が「話者を識別する」と重なる）。
+
+    ----------------------------------------------------------------------
+    ## この検査が守れる範囲・守れない範囲
+
+    **守れる**: 同じ親の中で、(行, 列) の矩形が重なっていること。
+    `columnspan` / `rowspan` も見る。
+
+    **守れない**: **重なっていない崩れ。**幅が足りずに押し出される、
+    文字がはみ出す、余白が詰まりすぎる——どれも grid の座標は正しいので
+    ここでは捕まらない（幅の検査は別にある）。
+
+    **守れない(2)**: `grid_remove()` で外したものは対象外。**外し忘れて
+    見えている**場合は捕まるが、**外すべきなのに外していない**という設計上の
+    判断は機械には分からない。
+    """
+    problems: list[str] = []
+
+    def name_of(w) -> str:
+        for attr in ("cget",):
+            try:
+                t = w.cget("text")
+                if t:
+                    return f"{w.winfo_class()}({str(t)[:26]})"
+            except Exception:
+                pass
+        return f"{w.winfo_class()}@{w.winfo_name()}"
+
+    def walk(parent) -> None:
+        try:
+            slaves = parent.grid_slaves()
+        except Exception:
+            slaves = []
+        boxes = []
+        for w in slaves:
+            try:
+                info = w.grid_info()
+            except Exception:
+                continue
+            if not info:
+                continue            # grid_remove 済み
+            r = int(info.get("row", 0))
+            c = int(info.get("column", 0))
+            rs = int(info.get("rowspan", 1) or 1)
+            cs = int(info.get("columnspan", 1) or 1)
+            boxes.append((w, r, r + rs - 1, c, c + cs - 1))
+        for i in range(len(boxes)):
+            for j in range(i + 1, len(boxes)):
+                _wa, r0a, r1a, c0a, c1a = boxes[i]
+                _wb, r0b, r1b, c0b, c1b = boxes[j]
+                if max(r0a, r0b) <= min(r1a, r1b) and \
+                   max(c0a, c0b) <= min(c1a, c1b):
+                    problems.append(
+                        f"{parent.winfo_class()}@{parent.winfo_name()}: "
+                        f"行{max(r0a, r0b)}〜{min(r1a, r1b)}／"
+                        f"列{max(c0a, c0b)}〜{min(c1a, c1b)} で "
+                        f"{name_of(boxes[i][0])} と {name_of(boxes[j][0])} が重なる")
+        for w in parent.winfo_children():
+            walk(w)
+
+    walk(root)
+    return problems
+
 def run_main_window() -> int:
     failures: list[str] = []
 
@@ -2535,6 +2606,12 @@ def run_main_window() -> int:
             # 中身は 1000px を超える。窓を画面より高くすると、下端の
             # 進捗とログがタスクバーの裏へ回って処理の様子が見えなくなる。
             app.update()
+            # **grid のマスが重なっていないか。**同じ場所で 2 度目の再発を
+            # 機械に見張らせる(2026-08-20 / 2026-08-31)。
+            _ov = grid_overlaps(app)
+            for _p in _ov:
+                print(f"       {_p}")
+            check("grid のマスが重なっていない", not _ov)
             check("窓が画面に収まる",
                   app.winfo_height() <= app.winfo_screenheight() - 40)
             bbox = app._canvas.bbox("all")
