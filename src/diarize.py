@@ -256,7 +256,7 @@ def diarize(
         # 2026-08-23)。**「落ちたと思われる」問題を直したはずが、別の形で
         # 再発していた。**
         on_log(f"話者を分けています(話者数 {num_speakers} を上限として指定)..."
-               "。音声の長さの 2 割ほど時間がかかります。")
+               "。音声の長さの 1〜2 割ほど時間がかかります。")
     got = _run(audio_path, num_speakers=num_speakers, model_dir=model_dir,
                on_log=on_log, on_progress=on_progress,
                is_cancelled=is_cancelled)

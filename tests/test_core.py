@@ -3276,9 +3276,14 @@ def test_replace_speaker_ignores_segments_of_other_people():
 def test_device_choice_pairs_with_the_model():
     """**装置とモデルは組で決まる。**CPU で large-v3 は実用外(実時間比が数倍)。
 
-    実測(2026-08-20・GTX 1660 SUPER)で、GPU + large-v3 + int8_float16 は
-    誤字 11.9% → 7.0%、67 分の音声が 24 分 → 15.5 分。**速くなって正確**
-    という珍しい形なので、利用者に選ばせる必要がない。
+    CPU の既定は small。GPU があれば large-v3 を**選べる**ようにしてある。
+
+    **かつてここには「速くなって正確」と書いてあったが、撤回した。**
+    根拠にしていた「24 分 → 15.5 分」は **small/CPU と large-v3/GPU を
+    比べた値**で、機械が違う。同じ GPU で測ると large-v3 のほうが遅い
+    （2026-08-31・7 回: 合計 13〜17 分 → 26〜32 分）。併記されていた
+    「誤字」の値も撤回した（定義が復元できない。設計書 §9.5.1）。
+    **large-v3 を勧める根拠は固有名詞だけで、速さではない。**
 
     **GPU 側の既定は `test_default_model_only_picks_what_is_there` が見る。**
     ここで `default_model(GPU_DEVICE)` を検査していたが、あれは large-v3 が
@@ -3297,8 +3302,13 @@ def test_device_choice_pairs_with_the_model():
 def test_gpu_uses_int8_not_plain_float16():
     """**float16 ではなく int8_float16。**同じ品質で 3.5 倍速い（実測）。
 
-    large-v3 で 67 分の音声が 53.7 分 → 15.5 分。誤字 7.1% → 7.0%、
+    large-v3 で 67 分の音声が 53.7 分 → 15.5 分（2026-08-20）。
     脱落 11.6% → 11.0%、落とした発言の回収は同じ 17/34。
+    **併記されていた「誤字」の値は撤回した**（設計書 §9.5.1）。
+
+    **この 15.5 分を「終わるまでの時間」と読まないこと。**転写だけの値で、
+    話者分離を含まない。2026-08-31 に測り直すと転写だけで 17〜20 分あり、
+    話者分離まで含めた合計は 26〜32 分だった。
     """
     from src import align
     assert align.GPU_COMPUTE_TYPE == "int8_float16"
