@@ -2723,6 +2723,28 @@ def run_main_window() -> int:
                       "固有名詞" in _txt)
                 check("勝手に切り替えない", app.var_model.get() == "small")
 
+                # **断ったときにも案内を出す。**3.6GB なので断るほうが多い
+                # 経路だが、これまで断った側には何も出ていなかった(取得に
+                # 失敗したときだけ「small のまま使えます」が出た)。
+                # 「取得しないと使えないのか」と読まれると、この製品で
+                # いちばん誤解されたくない点(ローカル完結)が崩れる。
+                # **断った直後は large-v3 が手元に無い。**上の差し替え
+                # (default_model が large-v3 を返す)のままだと GPU の案内が
+                # 優先され、ありえない状態を検査することになる。実態に戻す。
+                _al.default_model = lambda device=None: _al.DEFAULT_MODEL
+                app._gpu_declined = True
+                app._update_gpu_hint()
+                app.update()
+                _dec = str(app.lbl_gpu_hint.cget("text"))
+                check("断ったら「そのまま使える」と出る",
+                      "このまま使えます" in _dec and _al.DEFAULT_MODEL in _dec)
+                # **ログには出さない。**ログ欄は起動直後は窓の外(実測)。
+                check("その案内が窓の中に見えている",
+                      app.lbl_gpu_hint.winfo_ismapped()
+                      and app.lbl_gpu_hint.winfo_rooty()
+                      < app.winfo_rooty() + app.winfo_height())
+                app._gpu_declined = False
+
                 # **選んだら、その場で覚える。**覚える処理が「経路を
                 # 切り替えたとき」と「転写を開始したとき」にしか無く、
                 # 選んで放置すると元に戻っていた(実機の指摘・2026-08-20)。

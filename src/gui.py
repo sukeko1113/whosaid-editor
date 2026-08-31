@@ -669,9 +669,22 @@ class App(tk.Tk):
         best = align.default_model()
         show = (local and best != align.DEFAULT_MODEL
                 and self.var_model.get() != best)
-        self.lbl_gpu_hint.configure(text=(
-            f"※ この機械には GPU があります。{best} なら固有名詞の誤りが"
-            "減ります(実測)。" if show else ""))
+        if show:
+            text = (f"※ この機械には GPU があります。{best} なら固有名詞の誤りが"
+                    "減ります(実測)。")
+        elif local and getattr(self, "_gpu_declined", False):
+            # **断ったあとに何も出ないと、「取得しないと使えないのか」と読まれる。**
+            # いちばん誤解されたくない点(ローカル完結)がそこで崩れる。
+            #
+            # **ログには出さない。**ログ欄はスクロールしないと見えず(実測: 起動直後
+            # は窓の外)、しかもこの案内は音声を選んだ時点で出る。**モデル欄の
+            # すぐ下に置く**——「あとでモデル欄から選べます」の行き先そのものなので、
+            # 読んだ人がそのまま操作できる。
+            text = (f"※ 取得しなくても、同梱の {align.DEFAULT_MODEL} でこのまま"
+                    "使えます。あとで上のモデル欄から選べます。")
+        else:
+            text = ""
+        self.lbl_gpu_hint.configure(text=text)
 
     def _update_mode_state(self) -> None:
         """モード切替に応じてチェックボックスと名簿欄の有効/無効を整える。
@@ -885,6 +898,13 @@ class App(tk.Tk):
             pass
         if want:
             self._start_model_fetch(model)
+        else:
+            # **断ったことを覚えて、モデル欄の下に案内を出す。**
+            # 3.6GB なので断るほうが多い経路のはずだが、これまで**断った側には
+            # 何も出ていなかった**(取得に失敗したときだけ「small のまま使えます」が
+            # 出る)。README には書いてあるが、画面に出ていなければ届かない。
+            self._gpu_declined = True
+            self._update_gpu_hint()
 
     def _start_model_fetch(self, model: str) -> None:
         """別スレッドで取得する。**画面は止めない。**

@@ -37,6 +37,12 @@ BASE = "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
 # **SHA-256 で留める。**配布元の資産が差し替わったら、黙って別物を配るのではなく
 # 止まってほしい。ここに書いてあるのは、いま手元で動作を確認した実体の値。
+#
+# **転写のモデル（src/asr_fetch.py）は固定していない。片手落ちではない。**
+# あちらは Hugging Face Hub から取り、**LFS プロトコル自体がハッシュを照合する。**
+# こちらは GitHub Releases の生 URL で、**配布側に照合の仕組みが無い**ため、
+# 固定値を持つのがここだけの必要になる。理由の全文は asr_fetch.py の
+# NEEDED の直前にある。
 MODELS = (
     {
         "name": "pyannote segmentation-3.0（声の切れ目・MIT）",
