@@ -165,6 +165,10 @@ def is_protected(value: str) -> bool:
 # 包んで保存する項目。増やすときはここに足す。
 SECRET_KEYS = ("api_key",)
 
+# **画面へ渡すためだけの印。**`_` で始まる項目は save_config が
+# ファイルに書かない。設定として保存する値ではない。
+UNREADABLE_MARK = "_unreadable"
+
 
 def load_config() -> dict[str, Any]:
     p = config_path()
@@ -175,9 +179,36 @@ def load_config() -> dict[str, Any]:
     except Exception:
         return {}
     for k in SECRET_KEYS:
-        if isinstance(data.get(k), str):
-            data[k] = unprotect_secret(data[k])
+        raw = data.get(k)
+        if not isinstance(raw, str):
+            continue
+        plain = unprotect_secret(raw)
+        # **「解けなかった」と「元から空」を分ける。**どちらも "" で
+        # 表していたため、解けなかった鍵を**鍵と無関係な保存が空文字で
+        # 上書きしていた**（2026-08-31 に再現）。上書き前なら、正しい PC・
+        # 正しいアカウントへ戻れば復号できた。**上書き後は永久に失われる。**
+        # 起きる場面: 設定を別 PC からコピーした / Windows のプロファイルを
+        # 作り直した / バックアップから別機に戻した。どれも普通に起きる。
+        if not plain and is_protected(raw):
+            data.setdefault(UNREADABLE_MARK, []).append(k)
+        data[k] = plain
     return data
+
+
+def _read_raw() -> dict[str, Any]:
+    """ファイルの中身を**包みを解かずに**読む。
+
+    save_config が「渡されなかった鍵」を残すために要る。load_config を
+    使うと解けない鍵が "" になって戻るので、残すべき値が取れない。
+    """
+    p = config_path()
+    if not p.exists():
+        return {}
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def save_config(data: dict[str, Any]) -> list[str]:
@@ -195,13 +226,37 @@ def save_config(data: dict[str, Any]) -> list[str]:
 
     **戻り値を見るのは呼び出し側の仕事。**画面は「保存できなかった」と
     伝えること——ここで黙ると、名前が変わっただけで同じ穴になる。
+
+    **秘密の項目は「無い」と「空」で意味が違う（2026-08-31）。**
+
+    | 渡された状態 | すること |
+    | --- | --- |
+    | 平文がある | 包んで書く。包めなければ落として戻り値に載せる |
+    | **空文字** | **既存の値をそのまま残す。**渡すものが無いだけで、
+      消してよいという意味ではない |
+    | 項目が無い | 書かない（＝消す）。画面の「消す」は pop している |
+
+    **空を「消してよい」と読んでいたのが穴だった。**DPAPI で解けない鍵は
+    load_config が "" にして返すので、**出力先を変えただけの保存が、
+    復旧できたはずの鍵を消していた**（再現済み）。
     """
-    out = dict(data)
+    # `_` で始まる項目は画面へ渡すための印。ファイルには書かない
+    out = {k: v for k, v in data.items() if not str(k).startswith("_")}
+    prev = _read_raw()
     dropped: list[str] = []
     for k in SECRET_KEYS:
-        if not isinstance(out.get(k), str) or not out[k]:
+        if k not in out:
+            continue                      # 無い＝消す
+        v = out[k]
+        if not isinstance(v, str) or not v:
+            # 空＝渡すものが無い。**既存の値を残す**
+            old = prev.get(k)
+            if isinstance(old, str) and old:
+                out[k] = old
+            else:
+                del out[k]
             continue
-        wrapped = protect_secret(out[k])
+        wrapped = protect_secret(v)
         if is_protected(wrapped):
             out[k] = wrapped
         else:

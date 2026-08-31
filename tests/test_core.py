@@ -4438,6 +4438,112 @@ def test_secret_round_trip_and_idempotence():
         assert is_protected(enc) and not is_protected(v)
 
 
+
+def test_unreadable_secret_is_not_destroyed_by_an_unrelated_save():
+    """**解けない鍵を、鍵と無関係な保存が空文字で上書きしていた。**
+
+    筋道（2026-08-31 に再現した）:
+      1. `unprotect_secret` は DPAPI で解けないとき "" を返す
+      2. `load_config` が api_key = "" を dict に入れる
+      3. **出力先を変えただけの保存**が走ると、save_config が "" を素通しし、
+         包まれた元の値を "" で上書きする（save_config の呼び出しは 8 箇所）
+      4. `dropped` は空なので**警告も出ない**
+
+    **上書き前なら、正しい PC・正しいアカウントへ戻れば復号できた。**
+    上書き後は永久に失われる。設定を別 PC からコピーした・Windows の
+    プロファイルを作り直した・バックアップから別機に戻した——どれも普通に起きる。
+
+    直したあとの規則は「無い＝消す / 空＝残す / 平文＝包んで書く」。
+    """
+    import base64
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+            # 別の PC / 別アカウントで包まれた鍵（このマシンでは解けない）
+            bad = cfg._ENC_PREFIX + base64.b64encode(b"not-a-dpapi-blob").decode()
+            p.write_text(json.dumps({"api_key": bad, "roster": "佐藤",
+                                     "out_dir": "D:/x"}, ensure_ascii=False),
+                         encoding="utf-8")
+
+            c = cfg.load_config()
+            assert c["api_key"] == "", "解けない鍵は画面に出さない"
+            # **「解けなかった」と「元から空」を分けていること**
+            assert cfg.UNREADABLE_MARK in c, "解けなかった印が無い"
+            assert c[cfg.UNREADABLE_MARK] == ["api_key"]
+
+            # 鍵と無関係な保存
+            c["out_dir"] = "D:/y"
+            assert cfg.save_config(c) == [], "落としたものは無いはず"
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert after["api_key"] == bad, "**包まれた鍵が消えた**"
+            assert after["out_dir"] == "D:/y", "他の設定は保存される"
+            assert cfg.UNREADABLE_MARK not in after, "印がファイルに漏れている"
+
+            # --- 「無い＝消す」は残っていること（画面の「消す」が使う）---
+            c2 = cfg.load_config()
+            c2.pop("api_key", None)
+            cfg.save_config(c2)
+            assert "api_key" not in json.loads(p.read_text(encoding="utf-8")), \
+                "pop したら消えること（消す入口が壊れる）"
+
+            # --- 元から鍵が無いなら、空を渡しても項目を作らない ---
+            cfg.save_config({"api_key": "", "roster": "佐藤"})
+            assert "api_key" not in json.loads(p.read_text(encoding="utf-8"))
+
+            # --- 平文を渡せば、ちゃんと包んで上書きする ---
+            cfg.save_config({"api_key": "AIzaSyREAL-0123456789", "roster": "佐藤"})
+            got = json.loads(p.read_text(encoding="utf-8"))["api_key"]
+            if cfg.is_protected(cfg.protect_secret("x")):     # DPAPI がある環境
+                assert cfg.is_protected(got), "包まずに書いている"
+                assert got != bad, "古い値が残ってしまっている"
+
+            # --- 印はファイルへ書かない（`_` で始まる項目すべて）---
+            cfg.save_config({"roster": "佐藤", "_なにか": 1, "普通": 2})
+            got = json.loads(p.read_text(encoding="utf-8"))
+            assert "_なにか" not in got and got.get("普通") == 2
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_empty_secret_does_not_mean_delete():
+    """**空は「消してよい」ではない。**この読み違いが上の穴の正体だった。
+
+    別々に縛る——上のテストが長いので、規則そのものを短く残しておく。
+    消す入口は `pop` を使うこと（`""` を代入して消したつもりにしない）。
+    """
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            cfg.save_config({"api_key": "AIzaSyKEEP-0123456789"})
+            first = json.loads(cfg.config_path().read_text(encoding="utf-8"))
+            assert first.get("api_key"), "前提: 鍵が入っていること"
+            # 空を渡す＝渡すものが無い。**消さない**
+            cfg.save_config({"api_key": "", "roster": "田中"})
+            after = json.loads(cfg.config_path().read_text(encoding="utf-8"))
+            assert after.get("api_key") == first["api_key"], "空で消してはいけない"
+            assert after.get("roster") == "田中"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
 def test_public_documents_exist_and_say_the_truth():
     """**公開に必要な文書を、実態と揃えたまま保つ。**
 
