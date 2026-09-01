@@ -2707,7 +2707,15 @@ def run_main_window() -> int:
             # small のまま走り出すことがある(実機で発生・2026-08-20)。
             from src import align as _al
             _real_default = _al.default_model
+            # **その機械に GPU があるかを、検査に漏らさない。**
+            # `_local_model_choices()` は `pick_device()` を見て「高精度」を
+            # 出すか決める。差し替えないと、**GPU のある機械では通り、
+            # CI では落ちる**——実際に 19 回連続で落ちていた（2026-09-01 に発見）。
+            # `test_core.py` の `test_device_choice_pairs_with_the_model` に
+            # 同じ教訓が書いてある。
+            _real_pick = _al.pick_device
             try:
+                _al.pick_device = lambda prefer_gpu=True: (_al.GPU_DEVICE, _al.GPU_COMPUTE_TYPE)
                 _al.default_model = lambda device=None: "large-v3"
                 app.var_engine.set(main_gui.ENGINE_LOCAL)
                 app.var_model.set("small")
@@ -2843,10 +2851,25 @@ def run_main_window() -> int:
                 _al.default_model = lambda device=None: _al.DEFAULT_MODEL
                 app.var_model.set("small")
                 app._update_gpu_hint()
-                check("GPU が無ければ出さない",
+                # **名前と中身がずれていた。**ここは「GPU はあるが既定の
+                # モデルを選んでいる」場合で、GPU の有無の検査ではない。
+                check("既定のモデルなら注記を出さない",
                       str(app.lbl_gpu_hint.cget("text")) == "")
+
+                # --- GPU が無い機械（ここで初めて差し替える）-----------
+                # **CI がまさにこれ。**この道は今まで一度も検査していな
+                # かった（GPU のある機械でしか動かしていなかったため）。
+                _al.pick_device = lambda prefer_gpu=True: (_al.DEVICE,
+                                                           _al.COMPUTE_TYPE)
+                _ids = [m for m, _ in app._local_model_choices()]
+                check("GPU が無ければ高精度を出さない", _ids == ["small"])
+                app._update_gpu_hint()
+                check("GPU が無ければ理由を書く",
+                      "標準のみ" in str(app.lbl_gpu_hint.cget("text")))
+                _al.pick_device = lambda prefer_gpu=True: (_al.GPU_DEVICE, _al.GPU_COMPUTE_TYPE)
             finally:
                 _al.default_model = _real_default
+                _al.pick_device = _real_pick
                 app.var_model.set(main_gui.DEFAULT_LOCAL_MODEL)
                 app._update_gpu_hint()
 
@@ -3166,6 +3189,12 @@ def run_main_window() -> int:
             _rt_find = _al2.find_bundled_model
             _al2.find_bundled_model = lambda m: (
                 Path("x") if m == "large-v3" else _rt_find(m))
+            # **ここも GPU の有無が漏れる。**高精度を選ぶので、
+            # `pick_device()` が cpu を返す機械では候補から外れ、
+            # `_update_engine_state()` が標準へ戻してしまう。
+            _rt_pick = _al2.pick_device
+            _al2.pick_device = lambda prefer_gpu=True: (_al2.GPU_DEVICE,
+                                                        _al2.GPU_COMPUTE_TYPE)
             main_gui.messagebox.askyesno = lambda *a, **k: False
             app.var_engine.set(_want["engine"])
             app._update_engine_state()
@@ -3205,6 +3234,7 @@ def run_main_window() -> int:
                 # **差し替えを戻す。**戻さないと後続の検査に漏れ、
                 # 「large-v3 が取得済み」の世界のまま進む。
                 _al2.find_bundled_model = _rt_find
+                _al2.pick_device = _rt_pick
             app.var_diarize_local.set(True)
             main_gui._ask_speaker_count = real_ask_count
         finally:
