@@ -13,8 +13,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from .assign_gui import RosterTable, open_assign_window
 from .audio import audio_fingerprint
-from .config import (UNREADABLE_MARK, credits_text, load_config,
-                     save_config)
+from .config import (MIGRATE_DROPPED, PLAINTEXT_MARK, UNREADABLE_MARK,
+                     config_dir, credits_text, key_protected_on_disk,
+                     load_config, save_config)
 from typing import Optional
 
 from . import align
@@ -172,6 +173,7 @@ class App(tk.Tk):
         self._build_ui()
         self._populate_from_config()
         self._update_mode_state()
+        self._tell_plaintext_at_startup()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
 
@@ -518,6 +520,20 @@ class App(tk.Tk):
         self._api_unreadable = "api_key" in (
             self.cfg.get(UNREADABLE_MARK) or [])
         self._api_unreadable_told = False
+        # **暗号化されずに置かれている鍵**（旧版の設定・引き継いだ設定）。
+        # 読み込みは旧版互換で通るので、印が無ければ暗号文と同じ顔で出る。
+        # 黙って包み直さず、知らせて取り直しを勧める（2026-09-03）。
+        self._api_plaintext = "api_key" in (
+            self.cfg.get(PLAINTEXT_MARK) or [])
+        # 引き継ぎのときに包めず、落とした鍵（config._migrate_legacy）
+        self._api_migrate_dropped = "api_key" in (
+            self.cfg.get(MIGRATE_DROPPED) or [])
+        # 旧名フォルダから引き継いだなら、そちらにも平文の鍵が残っている。
+        # 触らない（消すかどうかは人が決める）が、残っていることは言う。
+        try:
+            self._legacy_folder_left = (config_dir() / "migrated-from.txt").is_file()
+        except OSError:
+            self._legacy_folder_left = False
         # 経路ごとにモデルを覚える。旧来の "model" はクラウドのモデル。
         if model := self.cfg.get("model"):
             if model in MODELS:
@@ -710,17 +726,64 @@ class App(tk.Tk):
         "別のパソコンで保存されたものかもしれません。"
         "入力し直すと上書きされます。")
 
+    # **暗号化されずに保存されていた鍵。**「保存を押せば元通り」とは書かない。
+    # 平文でディスクに置かれていた期間があり、複製もされうる（設定を別の
+    # PC へコピーした、バックアップに入った、同期フォルダにあった）。
+    # 包み直しても「安全になった」ことにはならないので、取り直しを勧める。
+    API_NOTE_PLAINTEXT = (
+        "※ この鍵は暗号化されずに保存されていました（旧版の設定）。"
+        "「保存」を押すと暗号化されますが、平文で置かれていた期間が"
+        "あるので、念のため取り直すことをお勧めします。")
+    API_NOTE_PLAINTEXT_LEGACY = "旧版のフォルダにも、平文のまま残っています。"
+    API_NOTE_MIGRATE_DROPPED = (
+        "※ 旧版の API キーは、この機械では暗号化できないため"
+        "引き継いでいません。入力し直してください"
+        "（「保存する」のチェックを外せば、起動のたびに入力する形で使えます）。")
+
     def _update_api_note(self, local: bool) -> None:
-        """API キー欄の注記。**読めない鍵があるなら、それを最優先で言う。**"""
+        """API キー欄の注記。**鍵に問題があるなら、それを最優先で言う。**
+
+        優先順: 読めない > 引き継げなかった > 平文のまま > 通常。
+        読めない鍵と平文の鍵は同時には立たない（config.load_config）。
+        """
         if getattr(self, "lbl_api_note", None) is None:
             return
         if getattr(self, "_api_unreadable", False):
             self.lbl_api_note.configure(text=self.API_NOTE_UNREADABLE,
                                         foreground="#a00")
             return
+        if getattr(self, "_api_migrate_dropped", False):
+            self.lbl_api_note.configure(text=self.API_NOTE_MIGRATE_DROPPED,
+                                        foreground="#a00")
+            return
+        if getattr(self, "_api_plaintext", False):
+            text = self.API_NOTE_PLAINTEXT
+            if getattr(self, "_legacy_folder_left", False):
+                text += self.API_NOTE_PLAINTEXT_LEGACY
+            self.lbl_api_note.configure(text=text, foreground="#a00")
+            return
         self.lbl_api_note.configure(
             text=self.API_NOTE_LOCAL if local else self.API_NOTE_CLOUD,
             foreground="#666")
+
+    def _tell_plaintext_at_startup(self) -> None:
+        """平文の鍵・引き継げなかった鍵を、起動時のログに 1 行残す。
+
+        注記は欄の下に常時出るが、ローカル経路では欄が灰色なので
+        目に入りにくい。ログにも書いておく。ダイアログは出さない
+        （ローカルしか使わない人に毎回出さない、の既存判断に合わせる）。
+        """
+        if getattr(self, "_api_migrate_dropped", False):
+            self._append_log(
+                "※ 旧版の API キーは、この機械では暗号化できないため"
+                "引き継いでいません。クラウド経路を使うなら入力し直してください。")
+        elif getattr(self, "_api_plaintext", False):
+            msg = ("※ 保存されている API キーは、暗号化されずに置かれていました"
+                   "（旧版の設定）。詳細設定の「保存」を押すと暗号化されます。"
+                   "念のため鍵を取り直すことをお勧めします。")
+            if getattr(self, "_legacy_folder_left", False):
+                msg += "旧版のフォルダにも平文のまま残っています。"
+            self._append_log(msg)
 
     def _tell_api_unreadable(self) -> None:
         """クラウド経路を選んだときだけ、1 回だけ知らせる。
@@ -1230,6 +1293,8 @@ class App(tk.Tk):
                 "保存するには、先にチェックを入れてください。")
             return
         self.cfg["api_key"] = api
+        # 入れ直すのだから「引き継げなかった」印は要らない（ファイルにも残さない）
+        self.cfg.pop(MIGRATE_DROPPED, None)
         # **包めたかを確かめてから知らせる。**以前は無条件に「暗号化して
         # あります」と出しており、DPAPI が失敗して平文で書かれた場合でも
         # 同じ文言が出ていた(2026-08-29)。いまは包めなければ書かれない。
@@ -1257,6 +1322,20 @@ class App(tk.Tk):
         # **上書きできたので、読めない状態は解消した。**印を残すと
         # 赤い注記が出たままになる。
         self._api_unreadable = False
+        self._api_migrate_dropped = False
+        # **平文の注記は、実物のファイルを読み直して下ろす。**保存処理が
+        # 例外を出さなかったことを根拠にすると、書き込みが別の場所へ行った
+        # 端末では届いていないのに注記が消える。注記が消えないこと自体を
+        # 「届いていない」の検出に使う（2026-09-03。一号機は 8-22 から
+        # 設定ファイルが書き換わっておらず、原因は未解明）。
+        if self._api_plaintext:
+            if key_protected_on_disk():
+                self._api_plaintext = False
+            else:
+                self._append_log(
+                    "※ 保存したはずの鍵が、設定ファイルでは暗号化された形に"
+                    "なっていません。設定が別の場所に書かれているか、"
+                    "書き込みが届いていない可能性があります。")
         self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo(
             "API キー",
@@ -1277,6 +1356,7 @@ class App(tk.Tk):
                 "入力欄も空にします。よろしいですか。"):
             return
         self.cfg.pop("api_key", None)
+        self.cfg.pop(MIGRATE_DROPPED, None)
         if self._save_cfg() is None:
             # **絶対パスを出さない。**以前は例外をそのまま出しており、
             # 設定ファイルの場所が丸ごと見えていた。種類はログ欄にある。
@@ -1285,8 +1365,10 @@ class App(tk.Tk):
                 "消せませんでした。設定ファイルを書けません（詳しくはログ欄）。")
             return
         self.var_api.set("")
-        # 消したのだから、読めない鍵はもう無い
+        # 消したのだから、読めない鍵も平文の鍵ももう無い
         self._api_unreadable = False
+        self._api_migrate_dropped = False
+        self._api_plaintext = False
         self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo("API キー", "API キーを消しました。")
 

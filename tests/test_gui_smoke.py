@@ -3375,6 +3375,142 @@ def run_api_unreadable() -> int:
     return 0
 
 
+def run_api_plaintext() -> int:
+    """**暗号化されずに保存されていた鍵の知らせ方。**
+
+    旧版の設定や引き継いだ設定には鍵が平文で入っている。読み込みは
+    旧版互換で通るので、印が無ければ暗号文と同じ顔で出る（2026-09-03 に
+    一号機・二号機で確認）。黙って包み直さず、注記と起動時のログで知らせ、
+    取り直しを勧める。
+
+    **注記を下ろす判定は、実物のファイルを読み直して行う。**保存処理が
+    例外を出さなかったことを根拠にすると、書き込みが別の場所へ行った端末で
+    届いていないのに注記が消える。注記が消えないこと自体が検出手段。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[暗号化されずに保存されていた API キーの知らせ方]")
+    from src import gui as guimod
+    from src.config import MIGRATE_DROPPED, PLAINTEXT_MARK
+    from src.segments import ENGINE_CLOUD, ENGINE_LOCAL
+
+    real_load = guimod.load_config
+    real_save = guimod.save_config
+    real_on_disk = guimod.key_protected_on_disk
+    real_info = guimod.messagebox.showinfo
+    real_warn = guimod.messagebox.showwarning
+    guimod.messagebox.showinfo = lambda *a, **k: None
+    guimod.messagebox.showwarning = lambda *a, **k: None
+    guimod.save_config = lambda cfg: []
+
+    def build(cfg: dict):
+        guimod.load_config = lambda: dict(cfg)
+        app = guimod.App()
+        app.withdraw()
+        return app
+
+    def note(app) -> str:
+        return app.lbl_api_note.cget("text")
+
+    def red(app) -> bool:
+        return str(app.lbl_api_note.cget("foreground")) == "#a00"
+
+    try:
+        # --- 平文の鍵がある ---------------------------------------
+        app = build({"api_key": "AIzaSyPLAIN-0123456789",
+                     PLAINTEXT_MARK: ["api_key"]})
+        try:
+            check("鍵は欄に入る（旧版互換で読める）", bool(app.var_api.get()))
+            check("注記が「暗号化されずに保存されていました」になる",
+                  "暗号化されずに保存されていました" in note(app))
+            check("注記が取り直しを勧める", "取り直す" in note(app))
+            check("注記に「保存を押すと暗号化」がある", "暗号化されます" in note(app))
+            check("注記が赤い", red(app))
+            log = app.txt_log.get("1.0", "end")
+            check("起動時のログにも出る", "暗号化されずに置かれていました" in log)
+            check("ログも取り直しを勧める", "取り直す" in log)
+            # ローカル/クラウドを行き来しても注記は残る
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("クラウドへ切り替えても注記は残る", "暗号化されずに" in note(app))
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            check("ローカルへ戻しても注記は残る", "暗号化されずに" in note(app))
+
+            # --- 保存: ファイルで包まれていなければ、注記は下りない ---
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            app.var_keep_api.set(True)
+            guimod.key_protected_on_disk = lambda key="api_key": False
+            app._save_api_key()
+            check("ファイルで包まれていなければ注記は消えない",
+                  "暗号化されずに" in note(app))
+            log = app.txt_log.get("1.0", "end")
+            check("届いていない可能性をログに出す", "届いていない" in log)
+
+            # --- 保存: ファイルで包まれていれば、注記が下りる ---
+            guimod.key_protected_on_disk = lambda key="api_key": True
+            app._save_api_key()
+            check("ファイルで包まれていれば注記が消える",
+                  "暗号化されずに" not in note(app))
+            check("通常の注記（灰色）に戻る", not red(app))
+        finally:
+            app.destroy()
+
+        # --- 引き継ぎで落とした鍵 ----------------------------------
+        app = build({MIGRATE_DROPPED: ["api_key"]})
+        try:
+            check("引き継げなかった鍵: 欄は空", not app.var_api.get())
+            check("注記が「引き継いでいません」になる", "引き継いでいません" in note(app))
+            check("チェックを外す道を案内する", "チェックを外せば" in note(app))
+            check("注記が赤い", red(app))
+            log = app.txt_log.get("1.0", "end")
+            check("起動時のログにも出る", "引き継いでいません" in log)
+            # 入れ直して保存 → 印が下り、ファイルにも残らない
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            app.var_keep_api.set(True)
+            app.var_api.set("AIzaSyNEW-0123456789")
+            guimod.key_protected_on_disk = lambda key="api_key": True
+            app._save_api_key()
+            check("入れ直したら注記が消える", "引き継いでいません" not in note(app))
+            check("印を設定から外して保存する", MIGRATE_DROPPED not in app.cfg)
+        finally:
+            app.destroy()
+
+        # --- 鍵が無い / 包まれた鍵: 注記は出ない ---------------------
+        app = build({})
+        try:
+            check("鍵が無ければ注記は出ない",
+                  "暗号化されずに" not in note(app) and "引き継いで" not in note(app))
+            check("鍵が無ければ起動時のログにも出ない",
+                  "暗号化されずに" not in app.txt_log.get("1.0", "end"))
+        finally:
+            app.destroy()
+        app = build({"api_key": "AIzaSyOK-0123456789"})     # 印なし＝包まれていた
+        try:
+            check("包まれた鍵なら注記は出ない", "暗号化されずに" not in note(app))
+        finally:
+            app.destroy()
+    finally:
+        guimod.load_config = real_load
+        guimod.save_config = real_save
+        guimod.key_protected_on_disk = real_on_disk
+        guimod.messagebox.showinfo = real_info
+        guimod.messagebox.showwarning = real_warn
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_save_failures() -> int:
     """**設定の保存が失敗しても、鍵を落としても、黙らない。**
 
@@ -3516,6 +3652,7 @@ if __name__ == "__main__":
     rc_main = run_main_window()
     rc_api = run_api_unreadable()
     rc_save = run_save_failures()
+    rc_plain = run_api_plaintext()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_save or rc_cfg)
+             or rc_api or rc_save or rc_plain or rc_cfg)

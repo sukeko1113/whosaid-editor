@@ -204,6 +204,18 @@ def is_protected(value: str) -> bool:
     return bool(value) and value.startswith(_ENC_PREFIX)
 
 
+def key_protected_on_disk(key: str = "api_key") -> bool:
+    """**いま設定ファイルに書かれている鍵が、包まれた形か。**ファイルを読み直す。
+
+    画面が「平文の鍵」の注記を下ろす判定に使う（2026-09-03）。保存処理が
+    例外を出さなかったことを根拠に下ろすと、**書き込みが別の場所へ行った
+    端末では、届いていないのに注記が消える。**注記が消えないこと自体を
+    「届いていない」の検出に使うので、実物のファイルで確かめる。
+    """
+    raw = _read_raw().get(key)
+    return isinstance(raw, str) and is_protected(raw)
+
+
 # 包んで保存する項目。増やすときはここに足す。
 SECRET_KEYS = ("api_key",)
 
