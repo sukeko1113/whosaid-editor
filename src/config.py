@@ -169,6 +169,18 @@ SECRET_KEYS = ("api_key",)
 # ファイルに書かない。設定として保存する値ではない。
 UNREADABLE_MARK = "_unreadable"
 
+# **包まれずに置かれている鍵の印。**旧版（v2.0.x 以前）が書いた設定や、
+# 旧名フォルダから引き継いだ設定には、鍵が平文のまま入っている
+# （2026-09-03 に一号機・二号機の両方で確認）。読み込みは旧版互換で
+# そのまま通すので、**画面は暗号文と同じ顔で出ていた。**
+#
+# 印を付けるだけで、**値は書き換えない。**黙って包み直すと「いつから
+# 平文だったか」を利用者が知れない。平文でディスクに置かれていた期間が
+# あり、複製もされうるので、包み直しても「安全になった」ことにはならない
+# ——知らせて、取り直しを勧めるところまでが仕事（解けない鍵を黙って
+# 消さないのと同じ考え方）。
+PLAINTEXT_MARK = "_plaintext"
+
 
 def load_config() -> dict[str, Any]:
     p = config_path()
@@ -178,6 +190,11 @@ def load_config() -> dict[str, Any]:
         data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    # **印はファイルから拾わない。**`_` 始まりの印は save_config が書かない
+    # 約束だが、万一ファイルに紛れていると、下の setdefault(...).append が
+    # 既存のリストに追記して、起動のたびに要素が増える。読むたびに
+    # 実物から立て直す——約束に頼らず、ここで構造として保証する。
+    data = {k: v for k, v in data.items() if not str(k).startswith("_")}
     for k in SECRET_KEYS:
         raw = data.get(k)
         if not isinstance(raw, str):
@@ -191,6 +208,12 @@ def load_config() -> dict[str, Any]:
         # 作り直した / バックアップから別機に戻した。どれも普通に起きる。
         if not plain and is_protected(raw):
             data.setdefault(UNREADABLE_MARK, []).append(k)
+        # **包まれていない鍵は、解けた鍵と区別する。**旧版互換で読める
+        # のは変えないが、平文で置かれている事実は画面に届ける。
+        # 毎回の起動で実物のファイルを見て立てるので、保存が届いて
+        # いない端末では印が消えない——それ自体が「届いていない」の検出。
+        elif plain and not is_protected(raw):
+            data.setdefault(PLAINTEXT_MARK, []).append(k)
         data[k] = plain
     return data
 

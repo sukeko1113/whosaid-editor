@@ -4626,6 +4626,140 @@ def test_empty_secret_does_not_mean_delete():
         else:
             os.environ["APPDATA"] = keep
 
+
+def test_plaintext_secret_is_marked_on_load_but_not_rewritten():
+    """**平文のまま置かれている鍵を、読み込み時に見分ける。**
+
+    旧版（v2.0.x 以前）が書いた設定や、旧名フォルダから引き継いだ設定には
+    鍵が平文で入っている（2026-09-03 に一号機・二号機で確認）。読み込みは
+    旧版互換でそのまま通すので、**画面は暗号文と同じ顔をしていた。**
+
+    印を付けるだけで、**値は書き換えない。**印はファイルに書かない。
+    「解けなかった」「元から空」「平文」は三つとも別の状態。
+    """
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+
+            # --- 平文の鍵 → 印が立ち、値はそのまま読める ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     "roster": "佐藤"}, ensure_ascii=False),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            assert c["api_key"] == "AIzaSyPLAIN-0123456789", "旧版互換で読めること"
+            assert c.get(cfg.PLAINTEXT_MARK) == ["api_key"], "平文の印が無い"
+            assert cfg.UNREADABLE_MARK not in c, "平文を「解けない」と混同している"
+            # **読んだだけでは書き換えない**（黙って包み直さない）
+            assert json.loads(p.read_text(encoding="utf-8"))["api_key"] \
+                == "AIzaSyPLAIN-0123456789", "読み込みがファイルを書き換えた"
+
+            # --- 元から空 / 無い → 印は立たない ---
+            p.write_text(json.dumps({"api_key": "", "roster": "佐藤"}),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "空に平文の印が立っている"
+            p.write_text(json.dumps({"roster": "佐藤"}), encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "無いのに平文の印が立っている"
+
+            # --- 解けない暗号文 → 平文の印ではなく、解けない印 ---
+            import base64
+            bad = cfg._ENC_PREFIX + base64.b64encode(b"not-a-dpapi-blob").decode()
+            p.write_text(json.dumps({"api_key": bad}), encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "解けない鍵に平文の印が立っている"
+            assert c.get(cfg.UNREADABLE_MARK) == ["api_key"]
+
+            # --- 包まれた鍵 → どちらの印も立たない ---
+            if cfg.is_protected(cfg.protect_secret("x")):     # DPAPI がある環境
+                cfg.save_config({"api_key": "AIzaSyREAL-0123456789"})
+                c = cfg.load_config()
+                assert cfg.PLAINTEXT_MARK not in c, "包まれた鍵に平文の印が立っている"
+                assert cfg.UNREADABLE_MARK not in c
+
+            # --- 印はファイルへ漏れない ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            c["roster"] = "鈴木"
+            cfg.save_config(c)
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert cfg.PLAINTEXT_MARK not in after, "印がファイルに漏れている"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_plaintext_mark_does_not_accumulate_across_round_trips():
+    """**印のリストが、読む・保存する・読むの往復で増えないこと。**
+
+    `setdefault(...).append(k)` は「印がファイルに書かれない」前提に立って
+    いる。もし何かの経路で `_plaintext` がファイルに書かれると、次の
+    読み込みで既存のリストに追記され、起動のたびに要素が増える。
+    前提に頼らず、往復そのものを縛る（2026-09-03 のレビューで指摘）。
+    """
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     "roster": "佐藤"}, ensure_ascii=False),
+                         encoding="utf-8")
+
+            # --- 読むだけを繰り返しても 1 件のまま ---
+            for _ in range(3):
+                c = cfg.load_config()
+                assert c.get(cfg.PLAINTEXT_MARK) == ["api_key"], \
+                    f"読み込みで印が増減した: {c.get(cfg.PLAINTEXT_MARK)}"
+
+            # --- 印の入った dict をそのまま保存 → ファイルに印は無い ---
+            c["roster"] = "鈴木"
+            cfg.save_config(c)
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            assert cfg.PLAINTEXT_MARK not in raw, "印がファイルに書かれた"
+            assert not [k for k in raw if str(k).startswith("_")], \
+                f"`_` 始まりの項目がファイルに漏れた: {sorted(raw)}"
+            assert raw.get("roster") == "鈴木"
+
+            # --- 読み直す → 印は無い（鍵が包まれた）か、あっても 1 件 ---
+            c2 = cfg.load_config()
+            marks = c2.get(cfg.PLAINTEXT_MARK)
+            assert marks is None or marks == ["api_key"], f"印が増えた: {marks}"
+            if cfg.is_protected(cfg.protect_secret("x")):     # DPAPI がある環境
+                assert marks is None, "保存で包まれたはずの鍵に平文の印が残っている"
+                assert cfg.is_protected(raw["api_key"]), "保存を通っても包まれていない"
+
+            # --- ファイルに古い印が紛れていても、拾わずに立て直す ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     cfg.PLAINTEXT_MARK: ["api_key", "api_key"],
+                                     cfg.UNREADABLE_MARK: ["api_key"]}),
+                         encoding="utf-8")
+            c3 = cfg.load_config()
+            assert c3.get(cfg.PLAINTEXT_MARK) == ["api_key"], \
+                f"ファイルの古い印に追記している: {c3.get(cfg.PLAINTEXT_MARK)}"
+            assert cfg.UNREADABLE_MARK not in c3, "ファイルの古い印を拾っている"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
 def test_public_documents_exist_and_say_the_truth():
     """**公開に必要な文書を、実態と揃えたまま保つ。**
 
