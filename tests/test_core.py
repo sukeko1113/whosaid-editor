@@ -3769,6 +3769,81 @@ def test_config_is_carried_over_from_the_old_name():
         assert (old / "config.json").exists()
 
 
+def test_config_migration_wraps_the_key_instead_of_copying_plaintext():
+    """**引き継ぎは複製ではなく、鍵を包んでから書く。**
+
+    旧版の設定は鍵が平文で入っている。ファイルごと複製すると新しい側にも
+    平文が入り、次に保存が走るまで残る（一号機で 11 日間そうだった。
+    2026-09-03）。包めない機械では平文を写さず、落として名前を残す
+    ——保存時と同じ約束を引き継ぎでも守る。旧フォルダは触らない。
+    """
+    import json
+    import os
+    import tempfile
+    from unittest import mock
+    import src.config as cfg
+
+    has_dpapi = cfg.is_protected(cfg.protect_secret("x"))
+
+    # --- 包める機械: 新しい側は包まれ、旧フォルダは平文のまま ---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text(
+            json.dumps({"api_key": "AIzaSyOLD-0123456789", "roster": "佐藤",
+                        "local_model": "large-v3"}, ensure_ascii=False),
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+            new_file = cfg.config_path()
+        raw = json.loads(new_file.read_text(encoding="utf-8"))
+        assert got.get("api_key") == "AIzaSyOLD-0123456789", "引き継げていない"
+        assert got.get("roster") == "佐藤" and got.get("local_model") == "large-v3"
+        if has_dpapi:
+            assert cfg.is_protected(raw["api_key"]), "新しい側に平文を写している"
+            assert cfg.PLAINTEXT_MARK not in got, "包んだのに平文の印が立っている"
+        assert cfg.MIGRATE_DROPPED not in raw, "落としていないのに落とした印がある"
+        # 旧フォルダは触らない（平文のまま）
+        old_raw = json.loads((old / "config.json").read_text(encoding="utf-8"))
+        assert old_raw["api_key"] == "AIzaSyOLD-0123456789", "旧フォルダを書き換えた"
+        note = (base / cfg.APP_NAME / "migrated-from.txt").read_text(encoding="utf-8")
+        assert "平文のまま" in note, "旧フォルダに平文が残ることを書いていない"
+        # 更新時刻は複製元のものではなく、いま書いた時刻
+        assert new_file.stat().st_mtime >= (old / "config.json").stat().st_mtime
+
+    # --- 包めない機械: 平文を写さず、落として名前を残す ---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text(
+            json.dumps({"api_key": "AIzaSyOLD-0123456789", "roster": "佐藤"}),
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}), \
+                mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+            got = cfg.load_config()
+            raw = json.loads(cfg.config_path().read_text(encoding="utf-8"))
+        assert "api_key" not in raw, "包めないのに平文を写した"
+        assert raw.get(cfg.MIGRATE_DROPPED) == ["api_key"], "落としたのに名前が無い"
+        assert got.get(cfg.MIGRATE_DROPPED) == ["api_key"], "画面に届く形になっていない"
+        assert got.get("roster") == "佐藤", "鍵が包めないからと名簿まで失った"
+        note = (base / cfg.APP_NAME / "migrated-from.txt").read_text(encoding="utf-8")
+        assert "入れ直して" in note, "落とした経緯を書いていない"
+
+    # --- 旧ファイルが壊れている: 引き継がない（起動は止めない）---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text("{not json", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+            new_file = cfg.config_path()
+        assert got == {}
+        assert not new_file.exists(), "壊れたファイルを写している"
+
+
 def test_config_migration_never_overwrites_the_new_one():
     """新しい側に設定があれば、旧名から上書きしない。"""
     import os

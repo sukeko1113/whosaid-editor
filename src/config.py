@@ -4,7 +4,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -17,6 +16,13 @@ APP_NAME = "WhosaidEditor"
 # Gemini の名を冠するのは事実と違い、他社の商標でもある。
 # **消さないこと**——消すと旧版からの利用者が API キーも名簿も失う。
 LEGACY_APP_NAMES = ("GeminiTranscriber",)
+
+# **引き継ぎのときに包めず、落とした鍵の名前。**設定ファイルに書く
+# （`_` 始まりではない＝次の起動でも読める）。画面はこれを見て
+# 「旧版の鍵は引き継げませんでした。入れ直してください」と知らせ、
+# 鍵が保存できたら消す。黙って落とすと「引き継いだのに鍵が無い」に
+# 見える——落としたことを、落とした側が言う。
+MIGRATE_DROPPED = "migrate_dropped"
 
 # アプリの版。installer.iss の MyAppVersion と揃えること(現状は手動同期。
 # Day 60 のインストーラ作業で一元化を検討)。Word の検証要約に併記される。
@@ -67,6 +73,19 @@ def _migrate_legacy(base: Path, dest: Path) -> None:
 
     **旧フォルダは消さない。**旧版に戻したい人が残っているかもしれないし、
     消す理由もない（数 KB）。引き継いだことは印を置いて残す。
+
+    **複製ではなく、読んで鍵を包んでから書く（2026-09-03）。**旧版の設定は
+    鍵が平文で入っている。ファイルごと複製すると、新しい側にも平文が
+    入り、次に保存が走るまでそのまま残る（一号機で 11 日間そうだった）。
+    包めない機械では平文を写さず、落として `MIGRATE_DROPPED` に名前を残す
+    ——保存時と同じ約束（平文では書かない）を引き継ぎでも守る。
+
+    以前は shutil.copy2 で複製していたため、**更新時刻まで旧ファイルの
+    ものになっていた。**更新時刻を根拠に「いつ書かれたか」を追うときに
+    惑わせる（2026-08-31 の調査で引っかかった）。いまは書いた時刻になる。
+
+    **旧フォルダの平文の鍵はそのまま残る。**ここでは触らない。消すかどうかは
+    人が決める（画面が知らせる）。
     """
     if (dest / "config.json").exists():
         return
@@ -75,12 +94,35 @@ def _migrate_legacy(base: Path, dest: Path) -> None:
         if not src.is_file():
             continue
         try:
-            shutil.copy2(src, dest / "config.json")
-            (dest / "migrated-from.txt").write_text(
-                f"{old} から設定を引き継ぎました。\n"
-                f"元: {src}\n"
-                "旧フォルダはそのまま残してあります。\n",
-                encoding="utf-8")
+            data = json.loads(src.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return          # 読めないものは引き継げない（起動は止めない）
+        if not isinstance(data, dict):
+            return
+        dropped: list[str] = []
+        for k in SECRET_KEYS:
+            v = data.get(k)
+            if not isinstance(v, str) or not v:
+                continue
+            wrapped = protect_secret(v)
+            if is_protected(wrapped):
+                data[k] = wrapped
+            else:
+                del data[k]
+                dropped.append(k)
+        if dropped:
+            data[MIGRATE_DROPPED] = dropped
+        try:
+            (dest / "config.json").write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            note = (f"{old} から設定を引き継ぎました。\n"
+                    f"元: {src}\n"
+                    "旧フォルダはそのまま残してあります"
+                    "（旧版の API キーは、そちらでは平文のままです）。\n")
+            if dropped:
+                note += ("API キーは、この機械では暗号化できないため"
+                         "引き継いでいません。入れ直してください。\n")
+            (dest / "migrated-from.txt").write_text(note, encoding="utf-8")
         except OSError:
             pass        # 引き継げなくても起動は止めない（設定が空になるだけ）
         return
