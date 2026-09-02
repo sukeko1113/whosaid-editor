@@ -255,8 +255,8 @@ def save_config(data: dict[str, Any]) -> list[str]:
     | 渡された状態 | すること |
     | --- | --- |
     | 平文がある | 包んで書く。包めなければ落として戻り値に載せる |
-    | **空文字** | **既存の値をそのまま残す。**渡すものが無いだけで、
-      消してよいという意味ではない |
+    | **空文字** | **既存の値を残す。**渡すものが無いだけで、
+      消してよいという意味ではない。既存が平文なら包んでから残す |
     | 項目が無い | 書かない（＝消す）。画面の「消す」は pop している |
 
     **空を「消してよい」と読んでいたのが穴だった。**DPAPI で解けない鍵は
@@ -275,7 +275,17 @@ def save_config(data: dict[str, Any]) -> list[str]:
             # 空＝渡すものが無い。**既存の値を残す**
             old = prev.get(k)
             if isinstance(old, str) and old:
-                out[k] = old
+                # **残すついでに包む。**既存が平文（旧版が書いたもの）なら、
+                # そのまま写すと「保存を通ったのに平文のまま」になる
+                # （2026-09-03 に一時フォルダで再現）。包まれた値や解けない
+                # 暗号文は protect_secret が素通しするので、そのまま残る。
+                # 包めなければ書かない——保存時と引き継ぎ時で約束を変えない。
+                wrapped = protect_secret(old)
+                if is_protected(wrapped):
+                    out[k] = wrapped
+                else:
+                    del out[k]
+                    dropped.append(k)
             else:
                 del out[k]
             continue

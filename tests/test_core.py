@@ -4699,6 +4699,68 @@ def test_plaintext_secret_is_marked_on_load_but_not_rewritten():
             os.environ["APPDATA"] = keep
 
 
+def test_empty_secret_wraps_a_plaintext_value_it_keeps():
+    """**「既存の値を残す」分岐でも、平文なら包んでから残す。**
+
+    8-31 の「空文字は既存の値を残す」規則は、既存の値をそのまま写していた。
+    既存が旧版の平文だと、**保存を通ったのに平文のまま残る**
+    （2026-09-03 に一時フォルダで再現。鍵欄を空にして保存したときだけ起きる）。
+    PRIVACY.md は「次に設定が保存された時点で暗号化された形に置き換わる」と
+    約束しているので、この分岐だけ例外にしない。
+
+    解けない暗号文はそのまま残す（8-31 の規則を壊さない）。
+    DPAPI が使えない機械では平文を写さず、落として戻り値に載せる。
+    """
+    import base64
+    import json
+    import os
+    import tempfile
+    from unittest import mock
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+            has_dpapi = cfg.is_protected(cfg.protect_secret("x"))
+
+            # --- 既存が平文 + 空文字で保存 → 包まれて残る ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            dropped = cfg.save_config({"api_key": "", "roster": "田中"})
+            after = json.loads(p.read_text(encoding="utf-8"))
+            if has_dpapi:
+                assert dropped == [], f"落とす理由が無い: {dropped}"
+                assert cfg.is_protected(after.get("api_key", "")), \
+                    "平文のまま残った（保存を通ったのに包まれていない）"
+                assert cfg.unprotect_secret(after["api_key"]) \
+                    == "AIzaSyPLAIN-0123456789", "包んだら中身が変わった"
+            assert after.get("roster") == "田中"
+
+            # --- 既存が解けない暗号文 + 空文字 → そのまま残す（8-31 の規則）---
+            bad = cfg._ENC_PREFIX + base64.b64encode(b"not-a-dpapi-blob").decode()
+            p.write_text(json.dumps({"api_key": bad}), encoding="utf-8")
+            assert cfg.save_config({"api_key": "", "roster": "田中"}) == []
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert after.get("api_key") == bad, "解けない鍵を触ってしまった"
+
+            # --- DPAPI が使えない機械: 平文を写さず、落として知らせる ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            with mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+                dropped = cfg.save_config({"api_key": "", "roster": "田中"})
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert dropped == ["api_key"], "落としたのに戻り値に無い（画面が黙る）"
+            assert "api_key" not in after, "包めないのに平文を書いた"
+            assert after.get("roster") == "田中", "鍵が包めないからと他まで失った"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
 def test_plaintext_mark_does_not_accumulate_across_round_trips():
     """**印のリストが、読む・保存する・読むの往復で増えないこと。**
 
