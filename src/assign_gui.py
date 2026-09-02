@@ -618,6 +618,40 @@ def plan_roster_text(proj: Project, text: str) -> RosterPlan:
                       affected_segments=affected)
 
 
+def cancel_pending_afters(widget: tk.Misc) -> int:
+    """**この窓が予約した after() を全部取り消す。**戻り値は取り消した数。
+
+    tkinter は after() のたびに Tcl 命令を登録し、窓を壊すときにその命令を
+    消す。しかし**タイマーそのものは残る**ので、発火時に「invalid command
+    name」の背景エラーになる。Tk はそれを画面に出さない（stderr だけ。凍結版
+    では誰にも届かない）。実機では割当画面を閉じるたびに、4 秒後（自動保存）に
+    1 回起きていた。検査では別の Tk が回っている間に発火し、「bgerror failed」
+    が毎回 6〜8 行出ていた（2026-09-03 に特定。「以前からある」を根拠に
+    無関係と判断しかけた）。
+
+    窓ごとに登録した命令名（`_tclCommands`）と、予約済みタイマーの script を
+    突き合わせて、**この窓のぶんだけ**取り消す。個別のタイマー ID を追う
+    やり方は取りこぼす（8-24 に 1 つだけ取り消して、残りを見落とした）。
+    """
+    names = set(getattr(widget, "_tclCommands", None) or ())
+    if not names:
+        return 0
+    cancelled = 0
+    try:
+        for tid in widget.tk.call("after", "info"):
+            try:
+                info = widget.tk.call("after", "info", tid)
+            except tk.TclError:
+                continue        # その間に発火した
+            script = str(info[0]) if isinstance(info, (tuple, list)) and info else str(info)
+            if script in names:
+                widget.tk.call("after", "cancel", tid)
+                cancelled += 1
+    except tk.TclError:
+        pass                    # インタプリタが既に無い
+    return cancelled
+
+
 class AssignWindow(tk.Toplevel):
     """話者割当エディタのウィンドウ"""
 
@@ -3495,19 +3529,18 @@ class AssignWindow(tk.Toplevel):
         self.update_status()
 
     def destroy(self) -> None:
-        """**閉じる前に、予約した処理を取り消す。**
+        """**閉じる前に、予約した処理を全部取り消す。**
 
         置きっぱなしにすると、窓が消えたあとに発火して Tk が
         「invalid command name」を投げる。検査が不安定になり、実機でも
         閉じるたびに背景でエラーが出る(2026-08-24)。
+
+        8-24 は候補スクロールのタイマーだけ取り消していたが、**自動保存の
+        `_autosave_tick`（4 秒ごと）が残っていた**（2026-09-03 に特定）。
+        個別に追うと取りこぼすので、この窓が予約したものを全部取り消す。
         """
-        after_id = getattr(self, "_cand_scroll_after", None)
-        if after_id is not None:
-            try:
-                self.after_cancel(after_id)
-            except Exception:
-                pass
-            self._cand_scroll_after = None
+        cancel_pending_afters(self)
+        self._cand_scroll_after = None
         super().destroy()
 
     def _on_close(self) -> None:

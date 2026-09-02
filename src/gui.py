@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .assign_gui import RosterTable, open_assign_window
+from .assign_gui import RosterTable, cancel_pending_afters, open_assign_window
 from .audio import audio_fingerprint
 from .config import (MIGRATE_DROPPED, PLAINTEXT_MARK, UNREADABLE_MARK,
                      config_dir, config_location_report, config_mtime,
@@ -1808,6 +1808,16 @@ class App(tk.Tk):
         self.var_status.set("エラー")
         self._append_log("=== エラー ===\n" + tb)
         messagebox.showerror("エラー", tb.splitlines()[-1] if tb.strip() else "不明なエラー")
+
+    def destroy(self) -> None:
+        """壊す前に、予約した after()（キュー処理・注意の遅延表示）を取り消す。
+
+        実機では本体を閉じればプロセスが終わるので害は無いが、検査では
+        本体を壊して別の Tk を回すたびに「invalid command name」の背景
+        エラーが出て、本物の失敗を紛れさせていた（2026-09-03）。
+        """
+        cancel_pending_afters(self)
+        super().destroy()
 
     def _on_close(self) -> None:
         if self._worker and self._worker.is_alive():

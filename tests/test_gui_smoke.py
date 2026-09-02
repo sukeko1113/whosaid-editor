@@ -3521,6 +3521,87 @@ def run_api_plaintext() -> int:
     return 0
 
 
+def run_no_stale_timers() -> int:
+    """**窓を壊したあとに、その窓の after() が残っていないこと。**
+
+    tkinter は窓を壊すときに命令だけ消し、タイマーは残す。残ったタイマーは
+    発火時に「invalid command name」の背景エラーになるが、Tk はそれを
+    画面に出さない（凍結版では誰にも届かない）。実機では割当画面を閉じる
+    たびに 4 秒後（自動保存）に 1 回起きていた。検査では別の Tk が回る間に
+    発火し、「bgerror failed」が毎回 6〜8 行出ていた（2026-09-03 に特定）。
+
+    残っている予約を、窓ごとの命令名で突き合わせて数える。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    def pending_scripts(widget) -> list[str]:
+        out = []
+        for tid in widget.tk.call("after", "info"):
+            try:
+                info = widget.tk.call("after", "info", tid)
+            except tk.TclError:
+                continue
+            out.append(str(info[0]) if isinstance(info, (tuple, list)) and info else str(info))
+        return out
+
+    print("\n[壊した窓の after() が残らない]")
+
+    # --- 割当画面（Toplevel）: 自動保存のタイマーが残っていた ---
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            proj = make_project(Path(d))
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            mine = set(getattr(win, "_tclCommands", None) or ())
+            before = [s for s in pending_scripts(root) if s in mine]
+            check("前提: 割当画面が after() を予約している（自動保存など）",
+                  len(before) >= 1)
+            win.destroy()
+            left = [s for s in pending_scripts(root) if s in mine]
+            check("壊したあと、割当画面の予約が残っていない", left == [])
+    finally:
+        root.destroy()
+
+    # --- 本体（Tk）: キュー処理のタイマーが残っていた ---
+    from src import gui as guimod
+    real_load, real_save, real_verify = (guimod.load_config, guimod.save_config,
+                                         guimod.verify_written)
+    guimod.load_config = lambda: {}
+    guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []
+    try:
+        app = guimod.App()
+        app.withdraw()
+        mine = set(getattr(app, "_tclCommands", None) or ())
+        before = [s for s in pending_scripts(app) if s in mine]
+        check("前提: 本体が after() を予約している（キュー処理）",
+              any("drain_queue" in s for s in before))
+        app.destroy()
+        try:
+            left = [s for s in pending_scripts(app) if s in mine]
+        except tk.TclError:
+            left = ["(after info を呼べない)"]
+        check("壊したあと、本体の予約が残っていない", left == [])
+    finally:
+        guimod.load_config, guimod.save_config, guimod.verify_written = (
+            real_load, real_save, real_verify)
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_save_failures() -> int:
     """**設定の保存が失敗しても、鍵を落としても、黙らない。**
 
@@ -3688,6 +3769,7 @@ if __name__ == "__main__":
     rc_api = run_api_unreadable()
     rc_save = run_save_failures()
     rc_plain = run_api_plaintext()
+    rc_timers = run_no_stale_timers()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_save or rc_plain or rc_cfg)
+             or rc_api or rc_save or rc_plain or rc_timers or rc_cfg)
