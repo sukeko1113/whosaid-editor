@@ -14,8 +14,9 @@ from tkinter import filedialog, messagebox, ttk
 from .assign_gui import RosterTable, open_assign_window
 from .audio import audio_fingerprint
 from .config import (MIGRATE_DROPPED, PLAINTEXT_MARK, UNREADABLE_MARK,
-                     config_dir, credits_text, key_protected_on_disk,
-                     load_config, save_config)
+                     config_dir, config_location_report, config_mtime,
+                     credits_text, key_protected_on_disk, load_config,
+                     save_config, verify_written)
 from typing import Optional
 
 from . import align
@@ -173,6 +174,7 @@ class App(tk.Tk):
         self._build_ui()
         self._populate_from_config()
         self._update_mode_state()
+        self._tell_config_location()
         self._tell_plaintext_at_startup()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
@@ -766,6 +768,20 @@ class App(tk.Tk):
             text=self.API_NOTE_LOCAL if local else self.API_NOTE_CLOUD,
             foreground="#666")
 
+    def _tell_config_location(self) -> None:
+        """設定の置き場と更新時刻を、起動時のログに 1 行残す。
+
+        書いたつもりの場所と実際の場所が食い違うことがある（環境変数の
+        差し替え・同期ソフト・仮想化。2026-09-03 に開発中の実例あり）。
+        標準でなければ、その回の設定が別の場所に読み書きされることを言う。
+        **更新時刻を出す**のは、保存したあとに本物のファイルが動いたかを
+        人が見て確かめられるようにするため。絶対パスは出さない。
+        """
+        try:
+            self._append_log(config_location_report())
+        except Exception as e:      # 診断で起動を止めない
+            self._append_log(f"※ 設定の置き場を調べられませんでした（{type(e).__name__}）。")
+
     def _tell_plaintext_at_startup(self) -> None:
         """平文の鍵・引き継げなかった鍵を、起動時のログに 1 行残す。
 
@@ -1324,10 +1340,9 @@ class App(tk.Tk):
         self._api_unreadable = False
         self._api_migrate_dropped = False
         # **平文の注記は、実物のファイルを読み直して下ろす。**保存処理が
-        # 例外を出さなかったことを根拠にすると、書き込みが別の場所へ行った
-        # 端末では届いていないのに注記が消える。注記が消えないこと自体を
-        # 「届いていない」の検出に使う（2026-09-03。一号機は 8-22 から
-        # 設定ファイルが書き換わっておらず、原因は未解明）。
+        # 例外を出さなかったことを根拠にすると、書いたつもりの場所と実際の
+        # 場所が食い違う環境では、反映されていないのに注記が消える。
+        # 注記が消えないこと自体を食い違いの検出に使う（2026-09-03）。
         if self._api_plaintext:
             if key_protected_on_disk():
                 self._api_plaintext = False
@@ -1718,6 +1733,7 @@ class App(tk.Tk):
         呼び出し側は、必要ならダイアログを足す（ログはここで出す）。
         **絶対パスは出さない**（既存方針）。例外の種類だけ。
         """
+        before = config_mtime()
         try:
             dropped = save_config(self.cfg)
         except OSError as e:
@@ -1727,6 +1743,13 @@ class App(tk.Tk):
             return None
         if "api_key" in dropped:
             self._append_log(self.API_DROPPED_LOG)
+        # **書いた直後に読み返す。**例外が出なかった＝書けた、ではない。
+        # 書いたつもりの場所と実際に書かれた場所は食い違うことがある
+        # （環境変数の差し替え・同期ソフト・仮想化。config.py の診断の節）。
+        for problem in verify_written(self.cfg, before):
+            self._append_log(
+                f"※ 設定を書いたはずですが、{problem}。設定が別の場所に"
+                "書かれているか、書き込みが届いていない可能性があります。")
         return dropped
 
     def _append_log(self, msg: str) -> None:

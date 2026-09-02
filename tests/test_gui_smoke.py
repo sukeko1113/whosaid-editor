@@ -2595,8 +2595,10 @@ def run_main_window() -> int:
 
     saved: dict = {}
     real_load, real_save = main_gui.load_config, main_gui.save_config
+    real_verify = main_gui.verify_written
     main_gui.load_config = lambda: {}
     main_gui.save_config = lambda d: (saved.update(d), [])[1]
+    main_gui.verify_written = lambda *a, **k: []   # 保存を偽っているので読み返しも偽る
 
     print("\n[メイン画面 / 処理経路]")
     try:
@@ -3241,6 +3243,7 @@ def run_main_window() -> int:
             app.destroy()
     finally:
         main_gui.load_config, main_gui.save_config = real_load, real_save
+        main_gui.verify_written = real_verify
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
     return 1 if failures else 0
@@ -3270,10 +3273,12 @@ def run_api_unreadable() -> int:
 
     real_load = guimod.load_config
     real_save = guimod.save_config
+    real_verify = guimod.verify_written
     real_warn = guimod.messagebox.showwarning
     shown: list[tuple] = []
     guimod.messagebox.showwarning = lambda *a, **k: shown.append(a)
     guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
 
     def build(unreadable: bool):
         cfg = {"api_key": "", UNREADABLE_MARK: ["api_key"]} if unreadable else {}
@@ -3366,6 +3371,7 @@ def run_api_unreadable() -> int:
     finally:
         guimod.load_config = real_load
         guimod.save_config = real_save
+        guimod.verify_written = real_verify
         guimod.messagebox.showwarning = real_warn
 
     if failures:
@@ -3380,12 +3386,13 @@ def run_api_plaintext() -> int:
 
     旧版の設定や引き継いだ設定には鍵が平文で入っている。読み込みは
     旧版互換で通るので、印が無ければ暗号文と同じ顔で出る（2026-09-03 に
-    一号機・二号機で確認）。黙って包み直さず、注記と起動時のログで知らせ、
-    取り直しを勧める。
+    旧版の設定を写した端末で確認）。黙って包み直さず、注記と起動時のログで
+    知らせ、取り直しを勧める。
 
     **注記を下ろす判定は、実物のファイルを読み直して行う。**保存処理が
-    例外を出さなかったことを根拠にすると、書き込みが別の場所へ行った端末で
-    届いていないのに注記が消える。注記が消えないこと自体が検出手段。
+    例外を出さなかったことを根拠にすると、書いたつもりの場所と実際の場所が
+    食い違う環境で、反映されていないのに注記が消える。注記が消えないこと
+    自体が検出手段。
     """
     failures: list[str] = []
 
@@ -3401,12 +3408,14 @@ def run_api_plaintext() -> int:
 
     real_load = guimod.load_config
     real_save = guimod.save_config
+    real_verify = guimod.verify_written
     real_on_disk = guimod.key_protected_on_disk
     real_info = guimod.messagebox.showinfo
     real_warn = guimod.messagebox.showwarning
     guimod.messagebox.showinfo = lambda *a, **k: None
     guimod.messagebox.showwarning = lambda *a, **k: None
     guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
 
     def build(cfg: dict):
         guimod.load_config = lambda: dict(cfg)
@@ -3500,6 +3509,7 @@ def run_api_plaintext() -> int:
     finally:
         guimod.load_config = real_load
         guimod.save_config = real_save
+        guimod.verify_written = real_verify
         guimod.key_protected_on_disk = real_on_disk
         guimod.messagebox.showinfo = real_info
         guimod.messagebox.showwarning = real_warn
@@ -3536,6 +3546,7 @@ def run_save_failures() -> int:
 
     real_load = guimod.load_config
     real_save = guimod.save_config
+    real_verify = guimod.verify_written
     real_err = guimod.messagebox.showerror
     real_info = guimod.messagebox.showinfo
     real_yes = guimod.messagebox.askyesno
@@ -3547,6 +3558,7 @@ def run_save_failures() -> int:
     guimod.messagebox.askyesno = lambda *a, **k: True
     guimod.load_config = lambda: {"api_key": "AIzaSyTEST-0123456789"}
     guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
 
     SECRET_PATH = r"C:\secret\place\config.json"
 
@@ -3625,12 +3637,35 @@ def run_save_failures() -> int:
         clear()
         app._remember_project("C:/x/w.speakers.json")
         check("正常なら黙る",
-              "保存できません" not in log() and "暗号化の仕組み" not in log())
+              "保存できません" not in log() and "暗号化の仕組み" not in log()
+              and "書いたはず" not in log())
+
+        # --- 読み返しで食い違いが見つかったら、ログに出す（単位 5）---
+        guimod.verify_written = lambda *a, **k: ["設定ファイルの更新時刻が動いていません"]
+        clear()
+        app._remember_project("C:/x/v.speakers.json")
+        check("読み返しの食い違いをログに出す", "更新時刻が動いていません" in log())
+        check("届いていない可能性を言う", "届いていない可能性" in log())
+        guimod.verify_written = lambda *a, **k: []
+
+        # --- 起動時に設定の置き場と更新時刻を 1 行出す（単位 5）---
+        app2 = guimod.App()
+        try:
+            app2.withdraw()
+            first = app2.txt_log.get("1.0", "end")
+            check("起動時に「設定の置き場」の行が出る", "設定の置き場" in first)
+            check("その行に更新時刻がある", "更新" in first)
+            import os as _os
+            check("その行に絶対パスが出ない",
+                  (_os.environ.get("APPDATA") or "\x00") not in first)
+        finally:
+            app2.destroy()
     finally:
         if app is not None:
             app.destroy()
         guimod.load_config = real_load
         guimod.save_config = real_save
+        guimod.verify_written = real_verify
         guimod.messagebox.showerror = real_err
         guimod.messagebox.showinfo = real_info
         guimod.messagebox.askyesno = real_yes

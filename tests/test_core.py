@@ -3773,8 +3773,8 @@ def test_config_migration_wraps_the_key_instead_of_copying_plaintext():
     """**引き継ぎは複製ではなく、鍵を包んでから書く。**
 
     旧版の設定は鍵が平文で入っている。ファイルごと複製すると新しい側にも
-    平文が入り、次に保存が走るまで残る（一号機で 11 日間そうだった。
-    2026-09-03）。包めない機械では平文を写さず、落として名前を残す
+    平文が入り、次に保存が走るまで残る（2026-09-03）。
+    包めない機械では平文を写さず、落として名前を残す
     ——保存時と同じ約束を引き継ぎでも守る。旧フォルダは触らない。
     """
     import json
@@ -4706,7 +4706,7 @@ def test_plaintext_secret_is_marked_on_load_but_not_rewritten():
     """**平文のまま置かれている鍵を、読み込み時に見分ける。**
 
     旧版（v2.0.x 以前）が書いた設定や、旧名フォルダから引き継いだ設定には
-    鍵が平文で入っている（2026-09-03 に一号機・二号機で確認）。読み込みは
+    鍵が平文で入っている（2026-09-03 に、旧版の設定を写した端末で確認）。読み込みは
     旧版互換でそのまま通すので、**画面は暗号文と同じ顔をしていた。**
 
     印を付けるだけで、**値は書き換えない。**印はファイルに書かない。
@@ -4834,6 +4834,77 @@ def test_empty_secret_wraps_a_plaintext_value_it_keeps():
             os.environ.pop("APPDATA", None)
         else:
             os.environ["APPDATA"] = keep
+
+
+def test_config_write_is_verified_by_reading_back():
+    """**書いた直後に読み返して確かめる。**例外が出なかった＝書けた、ではない。
+
+    書いたつもりの場所と実際に書かれた場所は食い違うことがある（環境変数の
+    差し替え・同期ソフト・仮想化。開発中に、同じパスを指しているつもりで人と
+    道具が別のファイルを見ていた例があった。2026-09-03）。
+    読み返しの一致と更新時刻の両方を見る。読み返しは、環境変数が
+    差し替わっていれば書き込みと同じ誤った場所を指して一致してしまうので、
+    環境変数に頼らない標準の場所の更新時刻も別に出す（config_location_report）。
+    絶対パスは出さない。
+    """
+    import os
+    import tempfile
+    import time
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+
+            # --- 正常: 書いて読み返すと問題なし ---
+            before = cfg.config_mtime()
+            assert before is None, "前提: まだ無い"
+            data = {"roster": "佐藤", "chunk_minutes": 7, "api_key": "AIzaSyX-0123456789",
+                    "_印": ["api_key"], "flags": [True, False]}
+            cfg.save_config(data)
+            assert cfg.verify_written(data, before) == []
+
+            # --- 更新時刻が動いていない（書いたはずなのに）---
+            stale_before = cfg.config_mtime() + 10          # 未来の時刻＝動いていない扱い
+            problems = cfg.verify_written(data, stale_before)
+            assert any("更新時刻が動いていません" in s for s in problems), problems
+            assert all(d not in s for s in problems), "絶対パスが出ている"
+
+            # --- 読み返した内容が一致しない ---
+            time.sleep(0.01)
+            before = cfg.config_mtime()
+            cfg.save_config(data)
+            other = dict(data); other["roster"] = "鈴木"
+            problems = cfg.verify_written(other, before)
+            assert any("一致しません" in s and "roster" in s for s in problems), problems
+
+            # --- ファイルが無い ---
+            p.unlink()
+            problems = cfg.verify_written(data, before)
+            assert any("ありません" in s for s in problems), problems
+
+            # --- 置き場の診断: 一時フォルダは標準ではない ---
+            p.write_text("{}", encoding="utf-8")
+            rep = cfg.config_location_report()
+            assert "標準ではありません" in rep, rep
+            assert "APPDATA" in rep
+            assert d not in rep and str(cfg.standard_config_path() or "") not in rep, \
+                "絶対パスが出ている"
+            assert not cfg.is_standard_location()
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+    # --- 標準の場所なら「標準」と出る（この機械の実物を読むだけ。書かない）---
+    if os.name == "nt" and keep:
+        rep = cfg.config_location_report()
+        assert rep.startswith("設定の置き場: 標準"), rep
+        assert "更新:" in rep
+        assert keep not in rep, "絶対パスが出ている"
 
 
 def test_plaintext_mark_does_not_accumulate_across_round_trips():

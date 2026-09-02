@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -76,7 +77,7 @@ def _migrate_legacy(base: Path, dest: Path) -> None:
 
     **複製ではなく、読んで鍵を包んでから書く（2026-09-03）。**旧版の設定は
     鍵が平文で入っている。ファイルごと複製すると、新しい側にも平文が
-    入り、次に保存が走るまでそのまま残る（一号機で 11 日間そうだった）。
+    入り、次に保存が走るまでそのまま残る。
     包めない機械では平文を写さず、落として `MIGRATE_DROPPED` に名前を残す
     ——保存時と同じ約束（平文では書かない）を引き継ぎでも守る。
 
@@ -208,12 +209,106 @@ def key_protected_on_disk(key: str = "api_key") -> bool:
     """**いま設定ファイルに書かれている鍵が、包まれた形か。**ファイルを読み直す。
 
     画面が「平文の鍵」の注記を下ろす判定に使う（2026-09-03）。保存処理が
-    例外を出さなかったことを根拠に下ろすと、**書き込みが別の場所へ行った
-    端末では、届いていないのに注記が消える。**注記が消えないこと自体を
-    「届いていない」の検出に使うので、実物のファイルで確かめる。
+    例外を出さなかったことを根拠に下ろすと、**書いたつもりの場所と実際に
+    書かれた場所が食い違う環境では、反映されていないのに注記が消える。**
+    （同期ソフト・仮想化・環境変数の差し替えで起きる。同じパスを指して
+    いるつもりで別のファイルを見ていた例が、開発中に実際にあった。）
+    注記が消えないこと自体を検出に使うので、実物のファイルで確かめる。
     """
     raw = _read_raw().get(key)
     return isinstance(raw, str) and is_protected(raw)
+
+
+# ======================================================================
+# 設定の置き場と書き込みの診断（2026-09-03）
+#
+# **書いたつもりの場所と、実際に書かれた場所は食い違うことがある。**
+# 環境変数 %APPDATA% の差し替え（測定用の窓で実際に起きた）、同期ソフト、
+# 仮想化。開発中には、同じパスを指しているつもりで、人と道具が別の
+# ファイルを見ていた例もあった（2026-09-03。気づいたのは人が更新時刻を
+# 打って比べたから）。起動時に「標準か否か」と更新時刻を出し、保存の
+# たびに読み返して一致を確かめる。読み返しは、環境変数が差し替わって
+# いれば書き込みと同じ誤った場所を指して一致してしまうので、環境変数に
+# 頼らない標準の場所の更新時刻を別に出す。
+#
+# **絶対パスは出さない**（既存方針）。「標準か否か」と時刻だけ。
+# ======================================================================
+
+def config_mtime() -> Optional[float]:
+    """いま使う設定ファイルの更新時刻。無ければ None。"""
+    try:
+        return config_path().stat().st_mtime
+    except OSError:
+        return None
+
+
+def standard_config_path() -> Optional[Path]:
+    """**環境変数に頼らない**標準の置き場。Windows 以外は None。"""
+    if sys.platform != "win32":
+        return None
+    return Path.home() / "AppData" / "Roaming" / APP_NAME / "config.json"
+
+
+def _stamp(ts: Optional[float]) -> str:
+    if ts is None:
+        return "無し"
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_standard_location() -> bool:
+    """いま使う設定ファイルが標準の場所か。Windows 以外は常に True。"""
+    std = standard_config_path()
+    if std is None:
+        return True
+    return (os.path.normcase(str(config_path().resolve()))
+            == os.path.normcase(str(std.resolve())))
+
+
+def config_location_report() -> str:
+    """起動時のログに出す 1 行。**絶対パスは出さない。**
+
+    標準なら更新時刻だけ。標準でなければ、その回の設定が別の場所に
+    読み書きされることと、標準の場所のファイルの更新時刻を出す。
+    「更新時刻が動いたか」を人が見て確かめられるようにする。
+    """
+    when = _stamp(config_mtime())
+    if is_standard_location():
+        return f"設定の置き場: 標準（設定ファイルの更新: {when}）"
+    std = standard_config_path()
+    try:
+        std_when = _stamp(std.stat().st_mtime) if std is not None else "無し"
+    except OSError:
+        std_when = "無し"
+    return ("※ 設定の置き場が標準ではありません（環境変数 APPDATA が"
+            "差し替わっています）。この回の設定は別の場所に読み書きされ、"
+            "標準の場所の設定は変わりません。"
+            f"いま使う設定の更新: {when} / 標準の場所の更新: {std_when}")
+
+
+def verify_written(data: dict[str, Any], before_mtime: Optional[float]) -> list[str]:
+    """**書いた直後に読み返して確かめる。**問題があれば、その文の並びを返す。
+
+    - 更新時刻が動いていない（書いたはずなのに）
+    - 読み返した内容が、書いたものと一致しない
+
+    秘密の項目は包んで書くので比べない（key_protected_on_disk が別に見る）。
+    `_` 始まりの印は書かないので比べない。**絶対パスは出さない。**
+    """
+    problems: list[str] = []
+    now = config_mtime()
+    if now is None:
+        problems.append("設定ファイルが、書いたはずの場所にありません")
+        return problems
+    if before_mtime is not None and now <= before_mtime:
+        problems.append("設定ファイルの更新時刻が動いていません")
+    raw = _read_raw()
+    for k, v in data.items():
+        if str(k).startswith("_") or k in SECRET_KEYS:
+            continue
+        if json.loads(json.dumps(v)) != raw.get(k):
+            problems.append(f"読み返した内容が、書いたものと一致しません（{k}）")
+            break
+    return problems
 
 
 # 包んで保存する項目。増やすときはここに足す。
@@ -225,7 +320,7 @@ UNREADABLE_MARK = "_unreadable"
 
 # **包まれずに置かれている鍵の印。**旧版（v2.0.x 以前）が書いた設定や、
 # 旧名フォルダから引き継いだ設定には、鍵が平文のまま入っている
-# （2026-09-03 に一号機・二号機の両方で確認）。読み込みは旧版互換で
+# （2026-09-03 に、旧版の設定を写した端末で確認）。読み込みは旧版互換で
 # そのまま通すので、**画面は暗号文と同じ顔で出ていた。**
 #
 # 印を付けるだけで、**値は書き換えない。**黙って包み直すと「いつから
@@ -264,8 +359,8 @@ def load_config() -> dict[str, Any]:
             data.setdefault(UNREADABLE_MARK, []).append(k)
         # **包まれていない鍵は、解けた鍵と区別する。**旧版互換で読める
         # のは変えないが、平文で置かれている事実は画面に届ける。
-        # 毎回の起動で実物のファイルを見て立てるので、保存が届いて
-        # いない端末では印が消えない——それ自体が「届いていない」の検出。
+        # 毎回の起動で実物のファイルを見て立てる。書いた先と読む先が
+        # 食い違う環境では印が消えない——それ自体が食い違いの検出。
         elif plain and not is_protected(raw):
             data.setdefault(PLAINTEXT_MARK, []).append(k)
         data[k] = plain
