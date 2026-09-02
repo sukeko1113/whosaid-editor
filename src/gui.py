@@ -773,10 +773,7 @@ class App(tk.Tk):
             parent=self)
         # 設定からも消しておく。残しておくと毎回ここへ来る
         self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
 
     # ------------------------------------------------------------------
     # モデルの表示名（内部名 small / large-v3 との対応）
@@ -851,10 +848,7 @@ class App(tk.Tk):
             self._model_by_engine[engine] = value
             self.cfg["model"] = self._model_by_engine.get(ENGINE_CLOUD, "")
             self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
-            try:
-                save_config(self.cfg)
-            except OSError:
-                pass        # 書けなくても選択自体は効いている
+            self._save_cfg()        # 書けなくても選択自体は効いている（ログには出る）
         self._update_gpu_hint()
 
     def _update_gpu_hint(self) -> None:
@@ -961,10 +955,7 @@ class App(tk.Tk):
         if not path:
             return
         self.cfg[self.LAST_PROJECT_KEY] = str(path)
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
 
     def _open_saved_project(self) -> None:
         """既存の <音声名>.speakers.json を開いて割当作業を再開する。"""
@@ -1065,10 +1056,7 @@ class App(tk.Tk):
         want = self._ask_fetch(model)
         # **聞いたことは、答えに関わらず記録する。**毎回出ては邪魔になる。
         self.cfg[self.ASKED_KEY] = True
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
         if want:
             self._start_model_fetch(model)
         else:
@@ -1171,10 +1159,7 @@ class App(tk.Tk):
             if self.var_engine.get() == ENGINE_LOCAL:
                 self.var_model.set(model)
             self.cfg["local_model"] = model
-            try:
-                save_config(self.cfg)
-            except OSError:
-                pass
+            self._save_cfg()
             self._update_gpu_hint()
 
     def _on_fetch_failed(self, msg: str) -> None:
@@ -1248,7 +1233,14 @@ class App(tk.Tk):
         # **包めたかを確かめてから知らせる。**以前は無条件に「暗号化して
         # あります」と出しており、DPAPI が失敗して平文で書かれた場合でも
         # 同じ文言が出ていた(2026-08-29)。いまは包めなければ書かれない。
-        dropped = save_config(self.cfg)
+        dropped = self._save_cfg()
+        if dropped is None:
+            messagebox.showerror(
+                "API キー",
+                "API キーを保存できませんでした。\n\n"
+                "設定ファイルを書けませんでした（詳しくはログ欄）。\n"
+                "入力欄の鍵は今回の実行には使えます。")
+            return
         if "api_key" in dropped:
             messagebox.showerror(
                 "API キー",
@@ -1285,10 +1277,12 @@ class App(tk.Tk):
                 "入力欄も空にします。よろしいですか。"):
             return
         self.cfg.pop("api_key", None)
-        try:
-            save_config(self.cfg)
-        except OSError as e:
-            messagebox.showerror("API キー", f"消せませんでした: {e}")
+        if self._save_cfg() is None:
+            # **絶対パスを出さない。**以前は例外をそのまま出しており、
+            # 設定ファイルの場所が丸ごと見えていた。種類はログ欄にある。
+            messagebox.showerror(
+                "API キー",
+                "消せませんでした。設定ファイルを書けません（詳しくはログ欄）。")
             return
         self.var_api.set("")
         # 消したのだから、読めない鍵はもう無い
@@ -1302,10 +1296,7 @@ class App(tk.Tk):
         self.cfg[self.KEEP_API_KEY] = keep
         if not keep and self.cfg.get("api_key"):
             self.cfg.pop("api_key", None)
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
         if not keep:
             self._append_log(
                 "API キーはこのパソコンに保存しません"
@@ -1494,21 +1485,13 @@ class App(tk.Tk):
             self.OUTPUT_KEY: out_dir,
             self.USE_INPUT_DIR_KEY: bool(self.var_use_input_dir.get()),
         })
-        _dropped = save_config(self.cfg)
-
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
-        # **ここでも黙らない。**開始ボタンの経路からも鍵を書いているので、
-        # 保存できなかったことを伝えないと「保存したつもり」が残る。
-        if "api_key" in _dropped:
-            self._append_log(
-                "※ API キーはこのパソコンに保存できませんでした"
-                "（Windows の暗号化の仕組みが使えないため）。"
-                "平文では保存しません。今回の実行には使えます。"
-                "この機械では保存はできないので、"
-                "「API キーをこのパソコンに保存する」のチェックを外し、"
-                "起動のたびに入力する形で使ってください。")
+        # **ログを空にしてから書く。**逆だと、保存できなかった知らせを
+        # 直後の消去が消す（「保存したつもり」が残る）。開始ボタンの
+        # 経路からも鍵を書いているので、ここでも黙らない。
+        self._save_cfg()
 
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -1630,6 +1613,39 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(100, self._drain_queue)
+
+    API_DROPPED_LOG = (
+        "※ API キーはこのパソコンに保存できませんでした"
+        "（Windows の暗号化の仕組みが使えないため）。"
+        "平文では保存しません。今回の実行には使えます。"
+        "この機械では保存はできないので、"
+        "「API キーをこのパソコンに保存する」のチェックを外し、"
+        "起動のたびに入力する形で使ってください。")
+
+    def _save_cfg(self) -> Optional[list[str]]:
+        """設定を書く**唯一の入口**。書けなくても、鍵を落としても、黙らない。
+
+        9 か所にあった save_config の直呼びを寄せた（2026-09-03）。7 か所が
+        `except OSError: pass` で書き込みの失敗を握りつぶし、鍵を落とした
+        戻り値を見るのは 2 か所だけだった。旧版の平文の鍵を読み込んだ機械で
+        DPAPI が使えないと、**出力先を変えただけで鍵が黙って消えた。**
+        また書き込みが失敗しても画面には何も出なかった（凍結版は stderr が
+        どこにも届かない）。
+
+        戻り値: 落とした項目名の並び。**書けなかったときは None。**
+        呼び出し側は、必要ならダイアログを足す（ログはここで出す）。
+        **絶対パスは出さない**（既存方針）。例外の種類だけ。
+        """
+        try:
+            dropped = save_config(self.cfg)
+        except OSError as e:
+            self._append_log(
+                f"※ 設定を保存できませんでした（{type(e).__name__}）。"
+                "名簿・出力先・モデルの変更が、次の起動に残らないかもしれません。")
+            return None
+        if "api_key" in dropped:
+            self._append_log(self.API_DROPPED_LOG)
+        return dropped
 
     def _append_log(self, msg: str) -> None:
         self.txt_log.configure(state="normal")

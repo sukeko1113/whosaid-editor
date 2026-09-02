@@ -3375,6 +3375,138 @@ def run_api_unreadable() -> int:
     return 0
 
 
+def run_save_failures() -> int:
+    """**設定の保存が失敗しても、鍵を落としても、黙らない。**
+
+    保存の入口は 9 か所あった。7 か所が `except OSError: pass` で書き込みの
+    失敗を握りつぶし、鍵を落とした戻り値を見るのは 2 か所だけだった
+    （2026-09-03）。旧版の平文の鍵を読み込んだ機械で DPAPI が使えないと、
+    **出力先を変えただけで鍵が黙って消えた。**いまは `_save_cfg` 1 つに
+    寄せ、どの入口からでもログに出る。
+
+    絶対パスは出さない（既存方針）。例外の文字列には設定ファイルの場所が
+    丸ごと入るので、種類だけを出す。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[設定の保存が失敗しても、鍵を落としても、黙らない]")
+    from src import gui as guimod
+    from src.segments import ENGINE_LOCAL
+
+    real_load = guimod.load_config
+    real_save = guimod.save_config
+    real_err = guimod.messagebox.showerror
+    real_info = guimod.messagebox.showinfo
+    real_yes = guimod.messagebox.askyesno
+    real_warn = guimod.messagebox.showwarning
+    errs: list[tuple] = []
+    guimod.messagebox.showerror = lambda *a, **k: errs.append(a)
+    guimod.messagebox.showinfo = lambda *a, **k: None
+    guimod.messagebox.showwarning = lambda *a, **k: None
+    guimod.messagebox.askyesno = lambda *a, **k: True
+    guimod.load_config = lambda: {"api_key": "AIzaSyTEST-0123456789"}
+    guimod.save_config = lambda cfg: []
+
+    SECRET_PATH = r"C:\secret\place\config.json"
+
+    def raise_perm(cfg):
+        raise PermissionError(13, "Access is denied", SECRET_PATH)
+
+    app = None
+    try:
+        app = guimod.App()
+        app.withdraw()
+
+        def log() -> str:
+            return app.txt_log.get("1.0", "end")
+
+        def clear() -> None:
+            app.txt_log.configure(state="normal")
+            app.txt_log.delete("1.0", "end")
+            app.txt_log.configure(state="disabled")
+
+        # --- 書けない: 例外を外に出さず、ログに出す。パスは出さない ---
+        guimod.save_config = raise_perm
+        clear()
+        quiet = True
+        try:
+            app._remember_project("C:/x/y.speakers.json")
+            app._on_keep_api_toggled()
+        except Exception:
+            quiet = False
+        check("書けなくても例外が外に出ない", quiet)
+        check("書けなかったことがログに出る", "設定を保存できませんでした" in log())
+        check("例外の種類は出る", "PermissionError" in log())
+        check("ログに設定ファイルの場所が出ない", "secret" not in log())
+
+        # 「消す」は失敗をダイアログでも伝える。パスは出さない
+        errs.clear()
+        app.var_api.set("AIzaSyTEST-0123456789")
+        app._delete_api_key()
+        check("消せなかったらダイアログが出る", len(errs) == 1)
+        check("そのダイアログに場所が出ない",
+              bool(errs) and "secret" not in errs[-1][1])
+
+        # 「保存」も同様
+        errs.clear()
+        app.var_keep_api.set(True)
+        app._save_api_key()
+        check("保存できなかったらダイアログが出る", len(errs) == 1)
+        check("そのダイアログに場所が出ない",
+              bool(errs) and "secret" not in errs[-1][1])
+
+        # --- 鍵を落とした: 鍵と無関係な入口からでも知らせる ---
+        guimod.save_config = lambda cfg: ["api_key"]
+        clear()
+        app._remember_project("C:/x/z.speakers.json")
+        check("無関係な保存で鍵を落としたら、ログで知らせる",
+              "暗号化の仕組みが使えない" in log())
+        check("チェックを外す道を案内する", "チェックを外し" in log())
+
+        # --- 開始の経路: ログを空にした**あと**に書くので、消えない ---
+        clear()
+        app.var_engine.set(ENGINE_LOCAL)
+        app._update_engine_state()
+        app.var_diarize_local.set(False)       # 出席者を聞くダイアログを避ける
+        app.var_input.set(__file__)
+        app.var_keep_api.set(True)
+        real_thread = guimod.threading.Thread
+        guimod.threading.Thread = lambda *a, **k: real_thread(target=lambda: None)
+        try:
+            app._start()
+        finally:
+            guimod.threading.Thread = real_thread
+        check("開始でログを空にしたあとにも、落とした知らせが残る",
+              "暗号化の仕組みが使えない" in log())
+
+        # --- 正常: 何も言わない ---
+        guimod.save_config = lambda cfg: []
+        clear()
+        app._remember_project("C:/x/w.speakers.json")
+        check("正常なら黙る",
+              "保存できません" not in log() and "暗号化の仕組み" not in log())
+    finally:
+        if app is not None:
+            app.destroy()
+        guimod.load_config = real_load
+        guimod.save_config = real_save
+        guimod.messagebox.showerror = real_err
+        guimod.messagebox.showinfo = real_info
+        guimod.messagebox.askyesno = real_yes
+        guimod.messagebox.showwarning = real_warn
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
@@ -3383,6 +3515,7 @@ if __name__ == "__main__":
     rc_multi = run_multi_select()
     rc_main = run_main_window()
     rc_api = run_api_unreadable()
+    rc_save = run_save_failures()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_cfg)
+             or rc_api or rc_save or rc_cfg)
