@@ -2595,8 +2595,10 @@ def run_main_window() -> int:
 
     saved: dict = {}
     real_load, real_save = main_gui.load_config, main_gui.save_config
+    real_verify = main_gui.verify_written
     main_gui.load_config = lambda: {}
     main_gui.save_config = lambda d: (saved.update(d), [])[1]
+    main_gui.verify_written = lambda *a, **k: []   # 保存を偽っているので読み返しも偽る
 
     print("\n[メイン画面 / 処理経路]")
     try:
@@ -3241,6 +3243,7 @@ def run_main_window() -> int:
             app.destroy()
     finally:
         main_gui.load_config, main_gui.save_config = real_load, real_save
+        main_gui.verify_written = real_verify
 
     print(f"\n{'FAILED: ' + ', '.join(failures) if failures else 'ALL PASSED'}")
     return 1 if failures else 0
@@ -3270,10 +3273,12 @@ def run_api_unreadable() -> int:
 
     real_load = guimod.load_config
     real_save = guimod.save_config
+    real_verify = guimod.verify_written
     real_warn = guimod.messagebox.showwarning
     shown: list[tuple] = []
     guimod.messagebox.showwarning = lambda *a, **k: shown.append(a)
     guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
 
     def build(unreadable: bool):
         cfg = {"api_key": "", UNREADABLE_MARK: ["api_key"]} if unreadable else {}
@@ -3366,6 +3371,385 @@ def run_api_unreadable() -> int:
     finally:
         guimod.load_config = real_load
         guimod.save_config = real_save
+        guimod.verify_written = real_verify
+        guimod.messagebox.showwarning = real_warn
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
+def run_api_plaintext() -> int:
+    """**暗号化されずに保存されていた鍵の知らせ方。**
+
+    旧版の設定や引き継いだ設定には鍵が平文で入っている。読み込みは
+    旧版互換で通るので、印が無ければ暗号文と同じ顔で出る（2026-09-03 に
+    旧版の設定を写した端末で確認）。黙って包み直さず、注記と起動時のログで
+    知らせ、取り直しを勧める。
+
+    **注記を下ろす判定は、実物のファイルを読み直して行う。**保存処理が
+    例外を出さなかったことを根拠にすると、書いたつもりの場所と実際の場所が
+    食い違う環境で、反映されていないのに注記が消える。注記が消えないこと
+    自体が検出手段。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[暗号化されずに保存されていた API キーの知らせ方]")
+    from src import gui as guimod
+    from src.config import MIGRATE_DROPPED, PLAINTEXT_MARK
+    from src.segments import ENGINE_CLOUD, ENGINE_LOCAL
+
+    real_load = guimod.load_config
+    real_save = guimod.save_config
+    real_verify = guimod.verify_written
+    real_on_disk = guimod.key_protected_on_disk
+    real_info = guimod.messagebox.showinfo
+    real_warn = guimod.messagebox.showwarning
+    guimod.messagebox.showinfo = lambda *a, **k: None
+    guimod.messagebox.showwarning = lambda *a, **k: None
+    guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
+
+    def build(cfg: dict):
+        guimod.load_config = lambda: dict(cfg)
+        app = guimod.App()
+        app.withdraw()
+        return app
+
+    def note(app) -> str:
+        return app.lbl_api_note.cget("text")
+
+    def red(app) -> bool:
+        return str(app.lbl_api_note.cget("foreground")) == "#a00"
+
+    try:
+        # --- 平文の鍵がある ---------------------------------------
+        app = build({"api_key": "AIzaSyPLAIN-0123456789",
+                     PLAINTEXT_MARK: ["api_key"]})
+        try:
+            check("鍵は欄に入る（旧版互換で読める）", bool(app.var_api.get()))
+            check("注記が「暗号化されずに保存されていました」になる",
+                  "暗号化されずに保存されていました" in note(app))
+            check("注記が取り直しを勧める", "取り直す" in note(app))
+            check("注記に「保存を押すと暗号化」がある", "暗号化されます" in note(app))
+            check("注記が赤い", red(app))
+            log = app.txt_log.get("1.0", "end")
+            check("起動時のログにも出る", "暗号化されずに置かれていました" in log)
+            check("ログも取り直しを勧める", "取り直す" in log)
+            # ローカル/クラウドを行き来しても注記は残る
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            check("クラウドへ切り替えても注記は残る", "暗号化されずに" in note(app))
+            app.var_engine.set(ENGINE_LOCAL)
+            app._update_engine_state()
+            check("ローカルへ戻しても注記は残る", "暗号化されずに" in note(app))
+
+            # --- 保存: ファイルで包まれていなければ、注記は下りない ---
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            app.var_keep_api.set(True)
+            guimod.key_protected_on_disk = lambda key="api_key": False
+            app._save_api_key()
+            check("ファイルで包まれていなければ注記は消えない",
+                  "暗号化されずに" in note(app))
+            log = app.txt_log.get("1.0", "end")
+            check("届いていない可能性をログに出す", "届いていない" in log)
+
+            # --- 保存: ファイルで包まれていれば、注記が下りる ---
+            guimod.key_protected_on_disk = lambda key="api_key": True
+            app._save_api_key()
+            check("ファイルで包まれていれば注記が消える",
+                  "暗号化されずに" not in note(app))
+            check("通常の注記（灰色）に戻る", not red(app))
+        finally:
+            app.destroy()
+
+        # --- 引き継ぎで落とした鍵 ----------------------------------
+        app = build({MIGRATE_DROPPED: ["api_key"]})
+        try:
+            check("引き継げなかった鍵: 欄は空", not app.var_api.get())
+            check("注記が「引き継いでいません」になる", "引き継いでいません" in note(app))
+            check("チェックを外す道を案内する", "チェックを外せば" in note(app))
+            check("注記が赤い", red(app))
+            log = app.txt_log.get("1.0", "end")
+            check("起動時のログにも出る", "引き継いでいません" in log)
+            # 入れ直して保存 → 印が下り、ファイルにも残らない
+            app.var_engine.set(ENGINE_CLOUD)
+            app._update_engine_state()
+            app.var_keep_api.set(True)
+            app.var_api.set("AIzaSyNEW-0123456789")
+            guimod.key_protected_on_disk = lambda key="api_key": True
+            app._save_api_key()
+            check("入れ直したら注記が消える", "引き継いでいません" not in note(app))
+            check("印を設定から外して保存する", MIGRATE_DROPPED not in app.cfg)
+        finally:
+            app.destroy()
+
+        # --- 鍵が無い / 包まれた鍵: 注記は出ない ---------------------
+        app = build({})
+        try:
+            check("鍵が無ければ注記は出ない",
+                  "暗号化されずに" not in note(app) and "引き継いで" not in note(app))
+            check("鍵が無ければ起動時のログにも出ない",
+                  "暗号化されずに" not in app.txt_log.get("1.0", "end"))
+        finally:
+            app.destroy()
+        app = build({"api_key": "AIzaSyOK-0123456789"})     # 印なし＝包まれていた
+        try:
+            check("包まれた鍵なら注記は出ない", "暗号化されずに" not in note(app))
+        finally:
+            app.destroy()
+    finally:
+        guimod.load_config = real_load
+        guimod.save_config = real_save
+        guimod.verify_written = real_verify
+        guimod.key_protected_on_disk = real_on_disk
+        guimod.messagebox.showinfo = real_info
+        guimod.messagebox.showwarning = real_warn
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
+def run_no_stale_timers() -> int:
+    """**窓を壊したあとに、その窓の after() が残っていないこと。**
+
+    tkinter は窓を壊すときに命令だけ消し、タイマーは残す。残ったタイマーは
+    発火時に「invalid command name」の背景エラーになるが、Tk はそれを
+    画面に出さない（凍結版では誰にも届かない）。実機では割当画面を閉じる
+    たびに 4 秒後（自動保存）に 1 回起きていた。検査では別の Tk が回る間に
+    発火し、「bgerror failed」が毎回 6〜8 行出ていた（2026-09-03 に特定）。
+
+    残っている予約を、窓ごとの命令名で突き合わせて数える。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    def pending_scripts(widget) -> list[str]:
+        out = []
+        for tid in widget.tk.call("after", "info"):
+            try:
+                info = widget.tk.call("after", "info", tid)
+            except tk.TclError:
+                continue
+            out.append(str(info[0]) if isinstance(info, (tuple, list)) and info else str(info))
+        return out
+
+    print("\n[壊した窓の after() が残らない]")
+
+    # --- 割当画面（Toplevel）: 自動保存のタイマーが残っていた ---
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            proj = make_project(Path(d))
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            mine = set(getattr(win, "_tclCommands", None) or ())
+            before = [s for s in pending_scripts(root) if s in mine]
+            check("前提: 割当画面が after() を予約している（自動保存など）",
+                  len(before) >= 1)
+            win.destroy()
+            left = [s for s in pending_scripts(root) if s in mine]
+            check("壊したあと、割当画面の予約が残っていない", left == [])
+    finally:
+        root.destroy()
+
+    # --- 本体（Tk）: キュー処理のタイマーが残っていた ---
+    from src import gui as guimod
+    real_load, real_save, real_verify = (guimod.load_config, guimod.save_config,
+                                         guimod.verify_written)
+    guimod.load_config = lambda: {}
+    guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []
+    try:
+        app = guimod.App()
+        app.withdraw()
+        mine = set(getattr(app, "_tclCommands", None) or ())
+        before = [s for s in pending_scripts(app) if s in mine]
+        check("前提: 本体が after() を予約している（キュー処理）",
+              any("drain_queue" in s for s in before))
+        app.destroy()
+        try:
+            left = [s for s in pending_scripts(app) if s in mine]
+        except tk.TclError:
+            left = ["(after info を呼べない)"]
+        check("壊したあと、本体の予約が残っていない", left == [])
+    finally:
+        guimod.load_config, guimod.save_config, guimod.verify_written = (
+            real_load, real_save, real_verify)
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
+def run_save_failures() -> int:
+    """**設定の保存が失敗しても、鍵を落としても、黙らない。**
+
+    保存の入口は 9 か所あった。7 か所が `except OSError: pass` で書き込みの
+    失敗を握りつぶし、鍵を落とした戻り値を見るのは 2 か所だけだった
+    （2026-09-03）。旧版の平文の鍵を読み込んだ機械で DPAPI が使えないと、
+    **出力先を変えただけで鍵が黙って消えた。**いまは `_save_cfg` 1 つに
+    寄せ、どの入口からでもログに出る。
+
+    絶対パスは出さない（既存方針）。例外の文字列には設定ファイルの場所が
+    丸ごと入るので、種類だけを出す。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[設定の保存が失敗しても、鍵を落としても、黙らない]")
+    from src import gui as guimod
+    from src.segments import ENGINE_LOCAL
+
+    real_load = guimod.load_config
+    real_save = guimod.save_config
+    real_verify = guimod.verify_written
+    real_err = guimod.messagebox.showerror
+    real_info = guimod.messagebox.showinfo
+    real_yes = guimod.messagebox.askyesno
+    real_warn = guimod.messagebox.showwarning
+    errs: list[tuple] = []
+    guimod.messagebox.showerror = lambda *a, **k: errs.append(a)
+    guimod.messagebox.showinfo = lambda *a, **k: None
+    guimod.messagebox.showwarning = lambda *a, **k: None
+    guimod.messagebox.askyesno = lambda *a, **k: True
+    guimod.load_config = lambda: {"api_key": "AIzaSyTEST-0123456789"}
+    guimod.save_config = lambda cfg: []
+    guimod.verify_written = lambda *a, **k: []     # 保存を偽っているので読み返しも偽る
+
+    SECRET_PATH = r"C:\secret\place\config.json"
+
+    def raise_perm(cfg):
+        raise PermissionError(13, "Access is denied", SECRET_PATH)
+
+    app = None
+    try:
+        app = guimod.App()
+        app.withdraw()
+
+        def log() -> str:
+            return app.txt_log.get("1.0", "end")
+
+        def clear() -> None:
+            app.txt_log.configure(state="normal")
+            app.txt_log.delete("1.0", "end")
+            app.txt_log.configure(state="disabled")
+
+        # --- 書けない: 例外を外に出さず、ログに出す。パスは出さない ---
+        guimod.save_config = raise_perm
+        clear()
+        quiet = True
+        try:
+            app._remember_project("C:/x/y.speakers.json")
+            app._on_keep_api_toggled()
+        except Exception:
+            quiet = False
+        check("書けなくても例外が外に出ない", quiet)
+        check("書けなかったことがログに出る", "設定を保存できませんでした" in log())
+        check("例外の種類は出る", "PermissionError" in log())
+        check("ログに設定ファイルの場所が出ない", "secret" not in log())
+
+        # 「消す」は失敗をダイアログでも伝える。パスは出さない
+        errs.clear()
+        app.var_api.set("AIzaSyTEST-0123456789")
+        app._delete_api_key()
+        check("消せなかったらダイアログが出る", len(errs) == 1)
+        check("そのダイアログに場所が出ない",
+              bool(errs) and "secret" not in errs[-1][1])
+
+        # 「保存」も同様
+        errs.clear()
+        app.var_keep_api.set(True)
+        app._save_api_key()
+        check("保存できなかったらダイアログが出る", len(errs) == 1)
+        check("そのダイアログに場所が出ない",
+              bool(errs) and "secret" not in errs[-1][1])
+
+        # --- 鍵を落とした: 鍵と無関係な入口からでも知らせる ---
+        guimod.save_config = lambda cfg: ["api_key"]
+        clear()
+        app._remember_project("C:/x/z.speakers.json")
+        check("無関係な保存で鍵を落としたら、ログで知らせる",
+              "暗号化の仕組みが使えない" in log())
+        check("チェックを外す道を案内する", "チェックを外し" in log())
+
+        # --- 開始の経路: ログを空にした**あと**に書くので、消えない ---
+        clear()
+        app.var_engine.set(ENGINE_LOCAL)
+        app._update_engine_state()
+        app.var_diarize_local.set(False)       # 出席者を聞くダイアログを避ける
+        app.var_input.set(__file__)
+        app.var_keep_api.set(True)
+        real_thread = guimod.threading.Thread
+        guimod.threading.Thread = lambda *a, **k: real_thread(target=lambda: None)
+        try:
+            app._start()
+        finally:
+            guimod.threading.Thread = real_thread
+        check("開始でログを空にしたあとにも、落とした知らせが残る",
+              "暗号化の仕組みが使えない" in log())
+
+        # --- 正常: 何も言わない ---
+        guimod.save_config = lambda cfg: []
+        clear()
+        app._remember_project("C:/x/w.speakers.json")
+        check("正常なら黙る",
+              "保存できません" not in log() and "暗号化の仕組み" not in log()
+              and "書いたはず" not in log())
+
+        # --- 読み返しで食い違いが見つかったら、ログに出す（単位 5）---
+        guimod.verify_written = lambda *a, **k: ["設定ファイルの更新時刻が動いていません"]
+        clear()
+        app._remember_project("C:/x/v.speakers.json")
+        check("読み返しの食い違いをログに出す", "更新時刻が動いていません" in log())
+        check("届いていない可能性を言う", "届いていない可能性" in log())
+        guimod.verify_written = lambda *a, **k: []
+
+        # --- 起動時に設定の置き場と更新時刻を 1 行出す（単位 5）---
+        app2 = guimod.App()
+        try:
+            app2.withdraw()
+            first = app2.txt_log.get("1.0", "end")
+            check("起動時に「設定の置き場」の行が出る", "設定の置き場" in first)
+            check("その行に更新時刻がある", "更新" in first)
+            import os as _os
+            check("その行に絶対パスが出ない",
+                  (_os.environ.get("APPDATA") or "\x00") not in first)
+        finally:
+            app2.destroy()
+    finally:
+        if app is not None:
+            app.destroy()
+        guimod.load_config = real_load
+        guimod.save_config = real_save
+        guimod.verify_written = real_verify
+        guimod.messagebox.showerror = real_err
+        guimod.messagebox.showinfo = real_info
+        guimod.messagebox.askyesno = real_yes
         guimod.messagebox.showwarning = real_warn
 
     if failures:
@@ -3383,6 +3767,9 @@ if __name__ == "__main__":
     rc_multi = run_multi_select()
     rc_main = run_main_window()
     rc_api = run_api_unreadable()
+    rc_save = run_save_failures()
+    rc_plain = run_api_plaintext()
+    rc_timers = run_no_stale_timers()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_cfg)
+             or rc_api or rc_save or rc_plain or rc_timers or rc_cfg)

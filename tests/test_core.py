@@ -3769,6 +3769,81 @@ def test_config_is_carried_over_from_the_old_name():
         assert (old / "config.json").exists()
 
 
+def test_config_migration_wraps_the_key_instead_of_copying_plaintext():
+    """**引き継ぎは複製ではなく、鍵を包んでから書く。**
+
+    旧版の設定は鍵が平文で入っている。ファイルごと複製すると新しい側にも
+    平文が入り、次に保存が走るまで残る（2026-09-03）。
+    包めない機械では平文を写さず、落として名前を残す
+    ——保存時と同じ約束を引き継ぎでも守る。旧フォルダは触らない。
+    """
+    import json
+    import os
+    import tempfile
+    from unittest import mock
+    import src.config as cfg
+
+    has_dpapi = cfg.is_protected(cfg.protect_secret("x"))
+
+    # --- 包める機械: 新しい側は包まれ、旧フォルダは平文のまま ---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text(
+            json.dumps({"api_key": "AIzaSyOLD-0123456789", "roster": "佐藤",
+                        "local_model": "large-v3"}, ensure_ascii=False),
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+            new_file = cfg.config_path()
+        raw = json.loads(new_file.read_text(encoding="utf-8"))
+        assert got.get("api_key") == "AIzaSyOLD-0123456789", "引き継げていない"
+        assert got.get("roster") == "佐藤" and got.get("local_model") == "large-v3"
+        if has_dpapi:
+            assert cfg.is_protected(raw["api_key"]), "新しい側に平文を写している"
+            assert cfg.PLAINTEXT_MARK not in got, "包んだのに平文の印が立っている"
+        assert cfg.MIGRATE_DROPPED not in raw, "落としていないのに落とした印がある"
+        # 旧フォルダは触らない（平文のまま）
+        old_raw = json.loads((old / "config.json").read_text(encoding="utf-8"))
+        assert old_raw["api_key"] == "AIzaSyOLD-0123456789", "旧フォルダを書き換えた"
+        note = (base / cfg.APP_NAME / "migrated-from.txt").read_text(encoding="utf-8")
+        assert "平文のまま" in note, "旧フォルダに平文が残ることを書いていない"
+        # 更新時刻は複製元のものではなく、いま書いた時刻
+        assert new_file.stat().st_mtime >= (old / "config.json").stat().st_mtime
+
+    # --- 包めない機械: 平文を写さず、落として名前を残す ---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text(
+            json.dumps({"api_key": "AIzaSyOLD-0123456789", "roster": "佐藤"}),
+            encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}), \
+                mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+            got = cfg.load_config()
+            raw = json.loads(cfg.config_path().read_text(encoding="utf-8"))
+        assert "api_key" not in raw, "包めないのに平文を写した"
+        assert raw.get(cfg.MIGRATE_DROPPED) == ["api_key"], "落としたのに名前が無い"
+        assert got.get(cfg.MIGRATE_DROPPED) == ["api_key"], "画面に届く形になっていない"
+        assert got.get("roster") == "佐藤", "鍵が包めないからと名簿まで失った"
+        note = (base / cfg.APP_NAME / "migrated-from.txt").read_text(encoding="utf-8")
+        assert "入れ直して" in note, "落とした経緯を書いていない"
+
+    # --- 旧ファイルが壊れている: 引き継がない（起動は止めない）---
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        old = base / cfg.LEGACY_APP_NAMES[0]
+        old.mkdir()
+        (old / "config.json").write_text("{not json", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"APPDATA": str(base)}):
+            got = cfg.load_config()
+            new_file = cfg.config_path()
+        assert got == {}
+        assert not new_file.exists(), "壊れたファイルを写している"
+
+
 def test_config_migration_never_overwrites_the_new_one():
     """新しい側に設定があれば、旧名から上書きしない。"""
     import os
@@ -4625,6 +4700,273 @@ def test_empty_secret_does_not_mean_delete():
             os.environ.pop("APPDATA", None)
         else:
             os.environ["APPDATA"] = keep
+
+
+def test_plaintext_secret_is_marked_on_load_but_not_rewritten():
+    """**平文のまま置かれている鍵を、読み込み時に見分ける。**
+
+    旧版（v2.0.x 以前）が書いた設定や、旧名フォルダから引き継いだ設定には
+    鍵が平文で入っている（2026-09-03 に、旧版の設定を写した端末で確認）。読み込みは
+    旧版互換でそのまま通すので、**画面は暗号文と同じ顔をしていた。**
+
+    印を付けるだけで、**値は書き換えない。**印はファイルに書かない。
+    「解けなかった」「元から空」「平文」は三つとも別の状態。
+    """
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+
+            # --- 平文の鍵 → 印が立ち、値はそのまま読める ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     "roster": "佐藤"}, ensure_ascii=False),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            assert c["api_key"] == "AIzaSyPLAIN-0123456789", "旧版互換で読めること"
+            assert c.get(cfg.PLAINTEXT_MARK) == ["api_key"], "平文の印が無い"
+            assert cfg.UNREADABLE_MARK not in c, "平文を「解けない」と混同している"
+            # **読んだだけでは書き換えない**（黙って包み直さない）
+            assert json.loads(p.read_text(encoding="utf-8"))["api_key"] \
+                == "AIzaSyPLAIN-0123456789", "読み込みがファイルを書き換えた"
+
+            # --- 元から空 / 無い → 印は立たない ---
+            p.write_text(json.dumps({"api_key": "", "roster": "佐藤"}),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "空に平文の印が立っている"
+            p.write_text(json.dumps({"roster": "佐藤"}), encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "無いのに平文の印が立っている"
+
+            # --- 解けない暗号文 → 平文の印ではなく、解けない印 ---
+            import base64
+            bad = cfg._ENC_PREFIX + base64.b64encode(b"not-a-dpapi-blob").decode()
+            p.write_text(json.dumps({"api_key": bad}), encoding="utf-8")
+            c = cfg.load_config()
+            assert cfg.PLAINTEXT_MARK not in c, "解けない鍵に平文の印が立っている"
+            assert c.get(cfg.UNREADABLE_MARK) == ["api_key"]
+
+            # --- 包まれた鍵 → どちらの印も立たない ---
+            if cfg.is_protected(cfg.protect_secret("x")):     # DPAPI がある環境
+                cfg.save_config({"api_key": "AIzaSyREAL-0123456789"})
+                c = cfg.load_config()
+                assert cfg.PLAINTEXT_MARK not in c, "包まれた鍵に平文の印が立っている"
+                assert cfg.UNREADABLE_MARK not in c
+
+            # --- 印はファイルへ漏れない ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            c = cfg.load_config()
+            c["roster"] = "鈴木"
+            cfg.save_config(c)
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert cfg.PLAINTEXT_MARK not in after, "印がファイルに漏れている"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_empty_secret_wraps_a_plaintext_value_it_keeps():
+    """**「既存の値を残す」分岐でも、平文なら包んでから残す。**
+
+    8-31 の「空文字は既存の値を残す」規則は、既存の値をそのまま写していた。
+    既存が旧版の平文だと、**保存を通ったのに平文のまま残る**
+    （2026-09-03 に一時フォルダで再現。鍵欄を空にして保存したときだけ起きる）。
+    PRIVACY.md は「次に設定が保存された時点で暗号化された形に置き換わる」と
+    約束しているので、この分岐だけ例外にしない。
+
+    解けない暗号文はそのまま残す（8-31 の規則を壊さない）。
+    DPAPI が使えない機械では平文を写さず、落として戻り値に載せる。
+    """
+    import base64
+    import json
+    import os
+    import tempfile
+    from unittest import mock
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+            has_dpapi = cfg.is_protected(cfg.protect_secret("x"))
+
+            # --- 既存が平文 + 空文字で保存 → 包まれて残る ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            dropped = cfg.save_config({"api_key": "", "roster": "田中"})
+            after = json.loads(p.read_text(encoding="utf-8"))
+            if has_dpapi:
+                assert dropped == [], f"落とす理由が無い: {dropped}"
+                assert cfg.is_protected(after.get("api_key", "")), \
+                    "平文のまま残った（保存を通ったのに包まれていない）"
+                assert cfg.unprotect_secret(after["api_key"]) \
+                    == "AIzaSyPLAIN-0123456789", "包んだら中身が変わった"
+            assert after.get("roster") == "田中"
+
+            # --- 既存が解けない暗号文 + 空文字 → そのまま残す（8-31 の規則）---
+            bad = cfg._ENC_PREFIX + base64.b64encode(b"not-a-dpapi-blob").decode()
+            p.write_text(json.dumps({"api_key": bad}), encoding="utf-8")
+            assert cfg.save_config({"api_key": "", "roster": "田中"}) == []
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert after.get("api_key") == bad, "解けない鍵を触ってしまった"
+
+            # --- DPAPI が使えない機械: 平文を写さず、落として知らせる ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789"}),
+                         encoding="utf-8")
+            with mock.patch.object(cfg, "_dpapi", lambda *a, **k: None):
+                dropped = cfg.save_config({"api_key": "", "roster": "田中"})
+            after = json.loads(p.read_text(encoding="utf-8"))
+            assert dropped == ["api_key"], "落としたのに戻り値に無い（画面が黙る）"
+            assert "api_key" not in after, "包めないのに平文を書いた"
+            assert after.get("roster") == "田中", "鍵が包めないからと他まで失った"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_config_write_is_verified_by_reading_back():
+    """**書いた直後に読み返して確かめる。**例外が出なかった＝書けた、ではない。
+
+    書いたつもりの場所と実際に書かれた場所は食い違うことがある（環境変数の
+    差し替え・同期ソフト・仮想化。開発中に、同じパスを指しているつもりで人と
+    道具が別のファイルを見ていた例があった。2026-09-03）。
+    読み返しの一致と更新時刻の両方を見る。読み返しは、環境変数が
+    差し替わっていれば書き込みと同じ誤った場所を指して一致してしまうので、
+    環境変数に頼らない標準の場所の更新時刻も別に出す（config_location_report）。
+    絶対パスは出さない。
+    """
+    import os
+    import tempfile
+    import time
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+
+            # --- 正常: 書いて読み返すと問題なし ---
+            before = cfg.config_mtime()
+            assert before is None, "前提: まだ無い"
+            data = {"roster": "佐藤", "chunk_minutes": 7, "api_key": "AIzaSyX-0123456789",
+                    "_印": ["api_key"], "flags": [True, False]}
+            cfg.save_config(data)
+            assert cfg.verify_written(data, before) == []
+
+            # --- 更新時刻が動いていない（書いたはずなのに）---
+            stale_before = cfg.config_mtime() + 10          # 未来の時刻＝動いていない扱い
+            problems = cfg.verify_written(data, stale_before)
+            assert any("更新時刻が動いていません" in s for s in problems), problems
+            assert all(d not in s for s in problems), "絶対パスが出ている"
+
+            # --- 読み返した内容が一致しない ---
+            time.sleep(0.01)
+            before = cfg.config_mtime()
+            cfg.save_config(data)
+            other = dict(data); other["roster"] = "鈴木"
+            problems = cfg.verify_written(other, before)
+            assert any("一致しません" in s and "roster" in s for s in problems), problems
+
+            # --- ファイルが無い ---
+            p.unlink()
+            problems = cfg.verify_written(data, before)
+            assert any("ありません" in s for s in problems), problems
+
+            # --- 置き場の診断: 一時フォルダは標準ではない ---
+            p.write_text("{}", encoding="utf-8")
+            rep = cfg.config_location_report()
+            assert "標準ではありません" in rep, rep
+            assert "APPDATA" in rep
+            assert d not in rep and str(cfg.standard_config_path() or "") not in rep, \
+                "絶対パスが出ている"
+            assert not cfg.is_standard_location()
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+    # --- 標準の場所なら「標準」と出る（この機械の実物を読むだけ。書かない）---
+    if os.name == "nt" and keep:
+        rep = cfg.config_location_report()
+        assert rep.startswith("設定の置き場: 標準"), rep
+        assert "更新:" in rep
+        assert keep not in rep, "絶対パスが出ている"
+
+
+def test_plaintext_mark_does_not_accumulate_across_round_trips():
+    """**印のリストが、読む・保存する・読むの往復で増えないこと。**
+
+    `setdefault(...).append(k)` は「印がファイルに書かれない」前提に立って
+    いる。もし何かの経路で `_plaintext` がファイルに書かれると、次の
+    読み込みで既存のリストに追記され、起動のたびに要素が増える。
+    前提に頼らず、往復そのものを縛る（2026-09-03 のレビューで指摘）。
+    """
+    import json
+    import os
+    import tempfile
+    from src import config as cfg
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            p = cfg.config_path()
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     "roster": "佐藤"}, ensure_ascii=False),
+                         encoding="utf-8")
+
+            # --- 読むだけを繰り返しても 1 件のまま ---
+            for _ in range(3):
+                c = cfg.load_config()
+                assert c.get(cfg.PLAINTEXT_MARK) == ["api_key"], \
+                    f"読み込みで印が増減した: {c.get(cfg.PLAINTEXT_MARK)}"
+
+            # --- 印の入った dict をそのまま保存 → ファイルに印は無い ---
+            c["roster"] = "鈴木"
+            cfg.save_config(c)
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            assert cfg.PLAINTEXT_MARK not in raw, "印がファイルに書かれた"
+            assert not [k for k in raw if str(k).startswith("_")], \
+                f"`_` 始まりの項目がファイルに漏れた: {sorted(raw)}"
+            assert raw.get("roster") == "鈴木"
+
+            # --- 読み直す → 印は無い（鍵が包まれた）か、あっても 1 件 ---
+            c2 = cfg.load_config()
+            marks = c2.get(cfg.PLAINTEXT_MARK)
+            assert marks is None or marks == ["api_key"], f"印が増えた: {marks}"
+            if cfg.is_protected(cfg.protect_secret("x")):     # DPAPI がある環境
+                assert marks is None, "保存で包まれたはずの鍵に平文の印が残っている"
+                assert cfg.is_protected(raw["api_key"]), "保存を通っても包まれていない"
+
+            # --- ファイルに古い印が紛れていても、拾わずに立て直す ---
+            p.write_text(json.dumps({"api_key": "AIzaSyPLAIN-0123456789",
+                                     cfg.PLAINTEXT_MARK: ["api_key", "api_key"],
+                                     cfg.UNREADABLE_MARK: ["api_key"]}),
+                         encoding="utf-8")
+            c3 = cfg.load_config()
+            assert c3.get(cfg.PLAINTEXT_MARK) == ["api_key"], \
+                f"ファイルの古い印に追記している: {c3.get(cfg.PLAINTEXT_MARK)}"
+            assert cfg.UNREADABLE_MARK not in c3, "ファイルの古い印を拾っている"
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
 
 def test_public_documents_exist_and_say_the_truth():
     """**公開に必要な文書を、実態と揃えたまま保つ。**

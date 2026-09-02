@@ -672,7 +672,7 @@ whosaid-editor/
   "source_sha256": "",     // 元音声の SHA-256。第三者が検算するための値
   // 処理経路の記録。Word の検証要約に「クラウド/ローカル」として出る
   "engine": { "mode": "local", "model": "small", "compute_type": "int8",
-              "app_version": "2.2.0", "at": "2026-08-14T…Z" },
+              "app_version": "2.2.1", "at": "2026-08-14T…Z" },
   "doc_revision": 0,       // Word を出力するたびに +1(書面に「版」として併記)
   "edit_log": [],          // 追記型の編集履歴(編集履歴の実装で記録される)
   "speakers": [ { "id": "sp01", "name": "佐藤", "note": "理事長", "order": 0 } ],
@@ -789,7 +789,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 
 4. **(任意) アイコンを置く**: `resources\icon.ico`。
 
-5. **`build.bat` をダブルクリック** → `Output\WhosaidEditorSetup-2.2.0.exe`。
+5. **`build.bat` をダブルクリック** → `Output\WhosaidEditorSetup-2.2.1.exe`。
 
 > Inno Setup を入れずにビルドした場合は、`dist\WhosaidEditor\` をフォルダごと
 > コピーすれば動きます(ポータブル運用)。
@@ -800,7 +800,7 @@ ID は保たれるので、確定済みの区間が別人に化けることは�
 テスト(`tests/`)も同じジョブで実行されます。
 
 - **PR / push**: `Actions` タブから `WhosaidEditor-Installer` artifact をダウンロード可能
-- **タグ push** (`git tag v2.2.0 && git push --tags`): 自動で Release を作成し `.exe` を添付
+- **タグ push** (`git tag v2.2.1 && git push --tags`): 自動で Release を作成し `.exe` を添付
 
 ---
 

@@ -11,10 +11,12 @@ import traceback
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .assign_gui import RosterTable, open_assign_window
+from .assign_gui import RosterTable, cancel_pending_afters, open_assign_window
 from .audio import audio_fingerprint
-from .config import (UNREADABLE_MARK, credits_text, load_config,
-                     save_config)
+from .config import (MIGRATE_DROPPED, PLAINTEXT_MARK, UNREADABLE_MARK,
+                     config_dir, config_location_report, config_mtime,
+                     credits_text, key_protected_on_disk, load_config,
+                     save_config, verify_written)
 from typing import Optional
 
 from . import align
@@ -172,6 +174,8 @@ class App(tk.Tk):
         self._build_ui()
         self._populate_from_config()
         self._update_mode_state()
+        self._tell_config_location()
+        self._tell_plaintext_at_startup()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._drain_queue)
 
@@ -518,6 +522,20 @@ class App(tk.Tk):
         self._api_unreadable = "api_key" in (
             self.cfg.get(UNREADABLE_MARK) or [])
         self._api_unreadable_told = False
+        # **暗号化されずに置かれている鍵**（旧版の設定・引き継いだ設定）。
+        # 読み込みは旧版互換で通るので、印が無ければ暗号文と同じ顔で出る。
+        # 黙って包み直さず、知らせて取り直しを勧める（2026-09-03）。
+        self._api_plaintext = "api_key" in (
+            self.cfg.get(PLAINTEXT_MARK) or [])
+        # 引き継ぎのときに包めず、落とした鍵（config._migrate_legacy）
+        self._api_migrate_dropped = "api_key" in (
+            self.cfg.get(MIGRATE_DROPPED) or [])
+        # 旧名フォルダから引き継いだなら、そちらにも平文の鍵が残っている。
+        # 触らない（消すかどうかは人が決める）が、残っていることは言う。
+        try:
+            self._legacy_folder_left = (config_dir() / "migrated-from.txt").is_file()
+        except OSError:
+            self._legacy_folder_left = False
         # 経路ごとにモデルを覚える。旧来の "model" はクラウドのモデル。
         if model := self.cfg.get("model"):
             if model in MODELS:
@@ -710,17 +728,78 @@ class App(tk.Tk):
         "別のパソコンで保存されたものかもしれません。"
         "入力し直すと上書きされます。")
 
+    # **暗号化されずに保存されていた鍵。**「保存を押せば元通り」とは書かない。
+    # 平文でディスクに置かれていた期間があり、複製もされうる（設定を別の
+    # PC へコピーした、バックアップに入った、同期フォルダにあった）。
+    # 包み直しても「安全になった」ことにはならないので、取り直しを勧める。
+    API_NOTE_PLAINTEXT = (
+        "※ この鍵は暗号化されずに保存されていました（旧版の設定）。"
+        "「保存」を押すと暗号化されますが、平文で置かれていた期間が"
+        "あるので、念のため取り直すことをお勧めします。")
+    API_NOTE_PLAINTEXT_LEGACY = "旧版のフォルダにも、平文のまま残っています。"
+    API_NOTE_MIGRATE_DROPPED = (
+        "※ 旧版の API キーは、この機械では暗号化できないため"
+        "引き継いでいません。入力し直してください"
+        "（「保存する」のチェックを外せば、起動のたびに入力する形で使えます）。")
+
     def _update_api_note(self, local: bool) -> None:
-        """API キー欄の注記。**読めない鍵があるなら、それを最優先で言う。**"""
+        """API キー欄の注記。**鍵に問題があるなら、それを最優先で言う。**
+
+        優先順: 読めない > 引き継げなかった > 平文のまま > 通常。
+        読めない鍵と平文の鍵は同時には立たない（config.load_config）。
+        """
         if getattr(self, "lbl_api_note", None) is None:
             return
         if getattr(self, "_api_unreadable", False):
             self.lbl_api_note.configure(text=self.API_NOTE_UNREADABLE,
                                         foreground="#a00")
             return
+        if getattr(self, "_api_migrate_dropped", False):
+            self.lbl_api_note.configure(text=self.API_NOTE_MIGRATE_DROPPED,
+                                        foreground="#a00")
+            return
+        if getattr(self, "_api_plaintext", False):
+            text = self.API_NOTE_PLAINTEXT
+            if getattr(self, "_legacy_folder_left", False):
+                text += self.API_NOTE_PLAINTEXT_LEGACY
+            self.lbl_api_note.configure(text=text, foreground="#a00")
+            return
         self.lbl_api_note.configure(
             text=self.API_NOTE_LOCAL if local else self.API_NOTE_CLOUD,
             foreground="#666")
+
+    def _tell_config_location(self) -> None:
+        """設定の置き場と更新時刻を、起動時のログに 1 行残す。
+
+        書いたつもりの場所と実際の場所が食い違うことがある（環境変数の
+        差し替え・同期ソフト・仮想化。2026-09-03 に開発中の実例あり）。
+        標準でなければ、その回の設定が別の場所に読み書きされることを言う。
+        **更新時刻を出す**のは、保存したあとに本物のファイルが動いたかを
+        人が見て確かめられるようにするため。絶対パスは出さない。
+        """
+        try:
+            self._append_log(config_location_report())
+        except Exception as e:      # 診断で起動を止めない
+            self._append_log(f"※ 設定の置き場を調べられませんでした（{type(e).__name__}）。")
+
+    def _tell_plaintext_at_startup(self) -> None:
+        """平文の鍵・引き継げなかった鍵を、起動時のログに 1 行残す。
+
+        注記は欄の下に常時出るが、ローカル経路では欄が灰色なので
+        目に入りにくい。ログにも書いておく。ダイアログは出さない
+        （ローカルしか使わない人に毎回出さない、の既存判断に合わせる）。
+        """
+        if getattr(self, "_api_migrate_dropped", False):
+            self._append_log(
+                "※ 旧版の API キーは、この機械では暗号化できないため"
+                "引き継いでいません。クラウド経路を使うなら入力し直してください。")
+        elif getattr(self, "_api_plaintext", False):
+            msg = ("※ 保存されている API キーは、暗号化されずに置かれていました"
+                   "（旧版の設定）。詳細設定の「保存」を押すと暗号化されます。"
+                   "念のため鍵を取り直すことをお勧めします。")
+            if getattr(self, "_legacy_folder_left", False):
+                msg += "旧版のフォルダにも平文のまま残っています。"
+            self._append_log(msg)
 
     def _tell_api_unreadable(self) -> None:
         """クラウド経路を選んだときだけ、1 回だけ知らせる。
@@ -773,10 +852,7 @@ class App(tk.Tk):
             parent=self)
         # 設定からも消しておく。残しておくと毎回ここへ来る
         self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
 
     # ------------------------------------------------------------------
     # モデルの表示名（内部名 small / large-v3 との対応）
@@ -851,10 +927,7 @@ class App(tk.Tk):
             self._model_by_engine[engine] = value
             self.cfg["model"] = self._model_by_engine.get(ENGINE_CLOUD, "")
             self.cfg["local_model"] = self._model_by_engine.get(ENGINE_LOCAL, "")
-            try:
-                save_config(self.cfg)
-            except OSError:
-                pass        # 書けなくても選択自体は効いている
+            self._save_cfg()        # 書けなくても選択自体は効いている（ログには出る）
         self._update_gpu_hint()
 
     def _update_gpu_hint(self) -> None:
@@ -961,10 +1034,7 @@ class App(tk.Tk):
         if not path:
             return
         self.cfg[self.LAST_PROJECT_KEY] = str(path)
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
 
     def _open_saved_project(self) -> None:
         """既存の <音声名>.speakers.json を開いて割当作業を再開する。"""
@@ -1065,10 +1135,7 @@ class App(tk.Tk):
         want = self._ask_fetch(model)
         # **聞いたことは、答えに関わらず記録する。**毎回出ては邪魔になる。
         self.cfg[self.ASKED_KEY] = True
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
         if want:
             self._start_model_fetch(model)
         else:
@@ -1171,10 +1238,7 @@ class App(tk.Tk):
             if self.var_engine.get() == ENGINE_LOCAL:
                 self.var_model.set(model)
             self.cfg["local_model"] = model
-            try:
-                save_config(self.cfg)
-            except OSError:
-                pass
+            self._save_cfg()
             self._update_gpu_hint()
 
     def _on_fetch_failed(self, msg: str) -> None:
@@ -1245,10 +1309,19 @@ class App(tk.Tk):
                 "保存するには、先にチェックを入れてください。")
             return
         self.cfg["api_key"] = api
+        # 入れ直すのだから「引き継げなかった」印は要らない（ファイルにも残さない）
+        self.cfg.pop(MIGRATE_DROPPED, None)
         # **包めたかを確かめてから知らせる。**以前は無条件に「暗号化して
         # あります」と出しており、DPAPI が失敗して平文で書かれた場合でも
         # 同じ文言が出ていた(2026-08-29)。いまは包めなければ書かれない。
-        dropped = save_config(self.cfg)
+        dropped = self._save_cfg()
+        if dropped is None:
+            messagebox.showerror(
+                "API キー",
+                "API キーを保存できませんでした。\n\n"
+                "設定ファイルを書けませんでした（詳しくはログ欄）。\n"
+                "入力欄の鍵は今回の実行には使えます。")
+            return
         if "api_key" in dropped:
             messagebox.showerror(
                 "API キー",
@@ -1257,11 +1330,27 @@ class App(tk.Tk):
                 "このパソコンには保存していません。\n"
                 "**平文では保存しません。**\n\n"
                 "入力欄の鍵は今回の実行には使えます。"
-                "次に起動したときは入れ直してください。")
+                "次に起動したときは入れ直してください。\n\n"
+                "この機械では、何度入れ直しても保存はできません。"
+                "「API キーをこのパソコンに保存する」のチェックを外すと、"
+                "起動のたびに入力する形で、そのまま使えます。")
             return
         # **上書きできたので、読めない状態は解消した。**印を残すと
         # 赤い注記が出たままになる。
         self._api_unreadable = False
+        self._api_migrate_dropped = False
+        # **平文の注記は、実物のファイルを読み直して下ろす。**保存処理が
+        # 例外を出さなかったことを根拠にすると、書いたつもりの場所と実際の
+        # 場所が食い違う環境では、反映されていないのに注記が消える。
+        # 注記が消えないこと自体を食い違いの検出に使う（2026-09-03）。
+        if self._api_plaintext:
+            if key_protected_on_disk():
+                self._api_plaintext = False
+            else:
+                self._append_log(
+                    "※ 保存したはずの鍵が、設定ファイルでは暗号化された形に"
+                    "なっていません。設定が別の場所に書かれているか、"
+                    "書き込みが届いていない可能性があります。")
         self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo(
             "API キー",
@@ -1282,14 +1371,19 @@ class App(tk.Tk):
                 "入力欄も空にします。よろしいですか。"):
             return
         self.cfg.pop("api_key", None)
-        try:
-            save_config(self.cfg)
-        except OSError as e:
-            messagebox.showerror("API キー", f"消せませんでした: {e}")
+        self.cfg.pop(MIGRATE_DROPPED, None)
+        if self._save_cfg() is None:
+            # **絶対パスを出さない。**以前は例外をそのまま出しており、
+            # 設定ファイルの場所が丸ごと見えていた。種類はログ欄にある。
+            messagebox.showerror(
+                "API キー",
+                "消せませんでした。設定ファイルを書けません（詳しくはログ欄）。")
             return
         self.var_api.set("")
-        # 消したのだから、読めない鍵はもう無い
+        # 消したのだから、読めない鍵も平文の鍵ももう無い
         self._api_unreadable = False
+        self._api_migrate_dropped = False
+        self._api_plaintext = False
         self._update_api_note(self.var_engine.get() == ENGINE_LOCAL)
         messagebox.showinfo("API キー", "API キーを消しました。")
 
@@ -1299,10 +1393,7 @@ class App(tk.Tk):
         self.cfg[self.KEEP_API_KEY] = keep
         if not keep and self.cfg.get("api_key"):
             self.cfg.pop("api_key", None)
-        try:
-            save_config(self.cfg)
-        except OSError:
-            pass
+        self._save_cfg()
         if not keep:
             self._append_log(
                 "API キーはこのパソコンに保存しません"
@@ -1491,18 +1582,13 @@ class App(tk.Tk):
             self.OUTPUT_KEY: out_dir,
             self.USE_INPUT_DIR_KEY: bool(self.var_use_input_dir.get()),
         })
-        _dropped = save_config(self.cfg)
-
         self.txt_log.configure(state="normal")
         self.txt_log.delete("1.0", "end")
         self.txt_log.configure(state="disabled")
-        # **ここでも黙らない。**開始ボタンの経路からも鍵を書いているので、
-        # 保存できなかったことを伝えないと「保存したつもり」が残る。
-        if "api_key" in _dropped:
-            self._append_log(
-                "※ API キーはこのパソコンに保存できませんでした"
-                "（Windows の暗号化の仕組みが使えないため）。"
-                "平文では保存しません。今回の実行には使えます。")
+        # **ログを空にしてから書く。**逆だと、保存できなかった知らせを
+        # 直後の消去が消す（「保存したつもり」が残る）。開始ボタンの
+        # 経路からも鍵を書いているので、ここでも黙らない。
+        self._save_cfg()
 
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
@@ -1625,6 +1711,47 @@ class App(tk.Tk):
             pass
         self.after(100, self._drain_queue)
 
+    API_DROPPED_LOG = (
+        "※ API キーはこのパソコンに保存できませんでした"
+        "（Windows の暗号化の仕組みが使えないため）。"
+        "平文では保存しません。今回の実行には使えます。"
+        "この機械では保存はできないので、"
+        "「API キーをこのパソコンに保存する」のチェックを外し、"
+        "起動のたびに入力する形で使ってください。")
+
+    def _save_cfg(self) -> Optional[list[str]]:
+        """設定を書く**唯一の入口**。書けなくても、鍵を落としても、黙らない。
+
+        9 か所にあった save_config の直呼びを寄せた（2026-09-03）。7 か所が
+        `except OSError: pass` で書き込みの失敗を握りつぶし、鍵を落とした
+        戻り値を見るのは 2 か所だけだった。旧版の平文の鍵を読み込んだ機械で
+        DPAPI が使えないと、**出力先を変えただけで鍵が黙って消えた。**
+        また書き込みが失敗しても画面には何も出なかった（凍結版は stderr が
+        どこにも届かない）。
+
+        戻り値: 落とした項目名の並び。**書けなかったときは None。**
+        呼び出し側は、必要ならダイアログを足す（ログはここで出す）。
+        **絶対パスは出さない**（既存方針）。例外の種類だけ。
+        """
+        before = config_mtime()
+        try:
+            dropped = save_config(self.cfg)
+        except OSError as e:
+            self._append_log(
+                f"※ 設定を保存できませんでした（{type(e).__name__}）。"
+                "名簿・出力先・モデルの変更が、次の起動に残らないかもしれません。")
+            return None
+        if "api_key" in dropped:
+            self._append_log(self.API_DROPPED_LOG)
+        # **書いた直後に読み返す。**例外が出なかった＝書けた、ではない。
+        # 書いたつもりの場所と実際に書かれた場所は食い違うことがある
+        # （環境変数の差し替え・同期ソフト・仮想化。config.py の診断の節）。
+        for problem in verify_written(self.cfg, before):
+            self._append_log(
+                f"※ 設定を書いたはずですが、{problem}。設定が別の場所に"
+                "書かれているか、書き込みが届いていない可能性があります。")
+        return dropped
+
     def _append_log(self, msg: str) -> None:
         self.txt_log.configure(state="normal")
         self.txt_log.insert("end", msg + "\n")
@@ -1681,6 +1808,16 @@ class App(tk.Tk):
         self.var_status.set("エラー")
         self._append_log("=== エラー ===\n" + tb)
         messagebox.showerror("エラー", tb.splitlines()[-1] if tb.strip() else "不明なエラー")
+
+    def destroy(self) -> None:
+        """壊す前に、予約した after()（キュー処理・注意の遅延表示）を取り消す。
+
+        実機では本体を閉じればプロセスが終わるので害は無いが、検査では
+        本体を壊して別の Tk を回すたびに「invalid command name」の背景
+        エラーが出て、本物の失敗を紛れさせていた（2026-09-03）。
+        """
+        cancel_pending_afters(self)
+        super().destroy()
 
     def _on_close(self) -> None:
         if self._worker and self._worker.is_alive():
