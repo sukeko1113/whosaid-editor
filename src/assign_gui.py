@@ -1814,6 +1814,26 @@ class AssignWindow(tk.Toplevel):
         if self.var_autoplay.get():
             self.play_current()
 
+    def goto_key(self, key: tuple[float, float]) -> Optional[int]:
+        """区間の鍵（segment_key）で指した区間へ飛ぶ。飛べたら区間番号。
+
+        語句をまとめて直す画面（ReplaceWordsDialog）が、ヒットの行を選んだ
+        ときに呼ぶ。**番号ではなく鍵で指す**——番号は分割・結合で振り直る。
+        絞り込みで隠れていれば「すべて表示」に戻してから飛ぶ（jump_to_time
+        と同じ）。飛んだあと再生するかは「移動したら自動再生」に従う（goto）。
+        """
+        want = (round(float(key[0]), 3), round(float(key[1]), 3))
+        seg = next((s for s in self.proj.segments if segment_key(s) == want), None)
+        if seg is None:
+            return None
+        if seg.index not in self._visible_indexes():
+            self.var_filter.set(FILTER_ALL)
+            self.var_listen_order.set(False)
+            self.reload_tree()
+            self._set_action("絞り込みを「すべて表示」に戻して飛びました。")
+        self.goto(seg.index)
+        return seg.index
+
     def jump_to_time(self) -> None:
         """入力された時刻に一番近い区間へ飛ぶ。
 
@@ -4518,6 +4538,8 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.var_before = tk.StringVar()
         self.var_after = tk.StringVar()
         self.var_status = tk.StringVar(value="直す前の語句を入れて［探す］。")
+        # 「n / N」。行を選ぶたびに更新する（設計書 §2.2）
+        self.var_pos = tk.StringVar(value="")
         self._build()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -4564,6 +4586,11 @@ class ReplaceWordsDialog(tk.Toplevel):
         # クリックでも Space でも切り替えられるように(片方だけだと迷う)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", lambda e: (self._toggle_selected(), "break"))
+        # **行を選ぶと本体がその区間に飛ぶ**（設計書 §2.2）。ここで音声を
+        # 聴けるのが、Word の検索置換には無いこの画面の値打ち。↓↑ は
+        # Treeview がそのまま動かし、Enter は次の行へ
+        self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+        self.tree.bind("<Return>", lambda e: (self._move_row(1), "break"))
 
         ttk.Label(self, textvariable=self.var_status, foreground="#666",
                   wraplength=720)\
@@ -4575,6 +4602,11 @@ class ReplaceWordsDialog(tk.Toplevel):
             .pack(side="left")
         ttk.Button(btns, text="全部に×", command=lambda: self._mark_all(False))\
             .pack(side="left", padx=6)
+        self.btn_listen = ttk.Button(btns, text="▶ 聴く", command=self.listen,
+                                     state="disabled")
+        self.btn_listen.pack(side="left", padx=(12, 0))
+        ttk.Label(btns, textvariable=self.var_pos, foreground="#666")\
+            .pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="やめる", command=self._close).pack(side="right")
         self.btn_ok = ttk.Button(btns, text="直す", command=self._ok,
                                  state="disabled")
@@ -4597,6 +4629,59 @@ class ReplaceWordsDialog(tk.Toplevel):
         if not self.hits:
             self.var_status.set(f"「{term}」は本文にありません。")
         self._refresh_ok()
+        self._update_pos()
+        if self.hits:
+            # 最初のヒットを選ぶ → 本体がその区間へ飛ぶ（自動再生の設定に従う）
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+            self.tree.focus_set()
+
+    # ------------------------------------------------------------------
+    # 行の選択 → 本体をその区間へ（設計書 §2.2）
+    # ------------------------------------------------------------------
+    def _selected_row(self) -> Optional[int]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            i = int(sel[0])
+        except ValueError:
+            return None
+        return i if 0 <= i < len(self.hits) else None
+
+    def _update_pos(self) -> None:
+        i = self._selected_row()
+        n = len(self.hits)
+        self.var_pos.set(f"{(i + 1) if i is not None else 0} / {n}")
+        self.btn_listen.configure(state="normal" if i is not None else "disabled")
+
+    def _on_row_selected(self, event=None) -> None:
+        """選んだ行の区間へ本体を飛ばす。○×の付け替えは本文を変えない。"""
+        self._update_pos()
+        i = self._selected_row()
+        if i is None:
+            return
+        self.win.goto_key(self.hits[i].key)
+
+    def _move_row(self, delta: int) -> None:
+        """Enter で次の行へ（↓↑ は Treeview に任せる）。"""
+        if not self.hits:
+            return
+        i = self._selected_row()
+        j = 0 if i is None else max(0, min(i + delta, len(self.hits) - 1))
+        self.tree.selection_set(str(j))
+        self.tree.focus(str(j))
+        self.tree.see(str(j))
+
+    def listen(self) -> None:
+        """選んでいる行の区間を鳴らす。自動再生が切れていても、押せば鳴る。"""
+        i = self._selected_row()
+        if i is None:
+            return
+        if self.win.goto_key(self.hits[i].key) is None:
+            self.var_status.set("その区間が見つかりません（本文が変わった可能性があります）。")
+            return
+        self.win.play_current(explicit=True)
 
     def _line(self, hit) -> str:
         return ("…" if hit.head else "") + hit.before \

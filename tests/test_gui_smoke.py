@@ -1758,6 +1758,10 @@ def run() -> int:
         ap.segments[0].text = "防災士の資格も取ってらっしゃって"
         ap.segments[1].text = "県は資格のことですからと言うだけで"
         ap.segments[0].reviewed = ap.segments[1].reviewed = False
+        # 本文を直接書き換えたので、本文欄も合わせておく。合わせないと、
+        # 探した直後の「1 件目へ飛ぶ」が古い本文欄の中身を書き戻してしまう
+        # （_commit_text は本文欄と区間が食い違えば古いほうを正とする）
+        awin.show_current()
         _dlg = ReplaceWordsDialog(awin)
         try:
             _dlg.update()
@@ -3521,6 +3525,140 @@ def run_api_plaintext() -> int:
     return 0
 
 
+def run_replace_dialog_navigation() -> int:
+    """**語句をまとめて直す画面で、行を選ぶと本体がその区間へ飛ぶ。**
+
+    人名が本当にそう発音されているかを耳で確かめてから○×を決める
+    （設計書 §2.2）。Word の検索置換には無い、この画面の値打ち。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[語句をまとめて直す画面から、区間へ飛ぶ]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            proj = make_project(Path(d))
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)        # 検査では音を鳴らさない
+            win.update()
+            played: list[int] = []
+            win.play_current = lambda *a, **k: played.append(win.current)
+            texts_before = [s.text for s in proj.segments]
+
+            dlg = ReplaceWordsDialog(win)
+            try:
+                dlg.update()
+                dlg.var_before.set("番目の発言")
+                dlg.search()
+                dlg.update()
+                n = len(dlg.hits)
+                check("前提: 全区間にヒットする", n == len(proj.segments) and n >= 3)
+                check("探した直後は 1 件目が選ばれ、本体もそこへ飛ぶ",
+                      dlg._selected_row() == 0 and win.current == dlg.hits[0].index)
+                check("位置表示が「1 / N」", dlg.var_pos.get() == f"1 / {n}")
+                check("「聴く」が押せる", str(dlg.btn_listen.cget("state")) == "normal")
+                check("自動再生が切れていれば飛んでも鳴らない", played == [])
+
+                # 2 行目を選ぶ → 本体が 2 件目の区間へ
+                dlg.tree.selection_set("1")
+                dlg.tree.focus("1")
+                dlg.update()
+                check("行を選ぶと本体がその区間を選ぶ", win.current == dlg.hits[1].index)
+                check("本体の一覧の選択も動く",
+                      win.tree.selection() == (f"s{dlg.hits[1].index}",))
+                check("位置表示が「2 / N」", dlg.var_pos.get() == f"2 / {n}")
+
+                # Enter で次の行へ
+                dlg._move_row(1)
+                dlg.update()
+                check("Enter で次の行へ進む", dlg._selected_row() == 2
+                      and win.current == dlg.hits[2].index)
+                dlg._move_row(100)
+                dlg.update()
+                check("最後より先へは進まない", dlg._selected_row() == n - 1)
+
+                # 「聴く」は自動再生が切れていても鳴らす
+                dlg.listen()
+                check("「聴く」でその区間を再生する", played == [dlg.hits[n - 1].index])
+
+                # ○×を付け替えても本文は変わらない（適用するまで変えない）
+                dlg._toggle(0)
+                dlg._mark_all(False)
+                dlg._mark_all(True)
+                check("○×を付け替えても本文は変わらない",
+                      [s.text for s in proj.segments] == texts_before)
+
+                # ヒット 0 件
+                dlg.var_before.set("ここには無い語句")
+                dlg.search()
+                dlg.update()
+                check("0 件なら位置表示は「0 / 0」", dlg.var_pos.get() == "0 / 0")
+                check("0 件なら「聴く」は押せない",
+                      str(dlg.btn_listen.cget("state")) == "disabled")
+                check("0 件の知らせ", "本文にありません" in dlg.var_status.get())
+            finally:
+                try:
+                    dlg.destroy()
+                except tk.TclError:
+                    pass
+
+            # --- 適用したあとに飛んでも、直した本文が古い本文欄で戻されない ---
+            # 「この N 箇所を直す」は本文欄を経由せずに区間の本文を変える。
+            # _commit_text は本文欄を正とするので、適用後に本文欄が読み直されて
+            # いなければ、次に飛んだ瞬間に古い中身で上書きされる（レビューの指摘）。
+            # 実物の経路（replace_words）は画面を閉じてから適用し、show_current で
+            # 本文欄を読み直す。その経路を通して確かめる
+            import src.assign_gui as agmod
+            real_dialog = agmod.ReplaceWordsDialog
+            target_idx = 1
+            hit_key = proj.find_text("番目の発言")[target_idx].key
+
+            class _FakeDialog(tk.Toplevel):
+                """開いた直後に「2 件目だけ○」で閉じる。
+
+                __init__ の中で destroy すると wait_window が「bad window
+                path」で落ちるので、イベントループに入ってから閉じる。
+                """
+                def __init__(self, master):
+                    super().__init__(master)
+                    self.result = ("番目の発言", "番目のはつげん",
+                                   [(hit_key, 0)])
+                    self.after(0, self.destroy)
+
+            agmod.ReplaceWordsDialog = _FakeDialog
+            try:
+                win.goto(target_idx)                      # 直す区間を本文欄に出しておく
+                win.replace_words()
+            finally:
+                agmod.ReplaceWordsDialog = real_dialog
+            fixed = proj.segments[target_idx].text
+            check("適用で本文が直る", "番目のはつげん" in fixed)
+            check("適用後に本文欄が区間から読み直されている",
+                  win.txt_body.get("1.0", "end").strip() == fixed
+                  and getattr(win, "_body_index", None) == win.current)
+            # 別の区間へ飛んで戻る → 直した本文が残る（古い本文欄で戻されない）
+            win.goto(0)
+            win.goto(target_idx)
+            check("適用後に飛んでも、直した本文が古い本文欄で戻されない",
+                  proj.segments[target_idx].text == fixed)
+            win.destroy()
+    finally:
+        root.destroy()
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_no_stale_timers() -> int:
     """**窓を壊したあとに、その窓の after() が残っていないこと。**
 
@@ -3770,6 +3908,7 @@ if __name__ == "__main__":
     rc_save = run_save_failures()
     rc_plain = run_api_plaintext()
     rc_timers = run_no_stale_timers()
+    rc_nav = run_replace_dialog_navigation()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_save or rc_plain or rc_timers or rc_cfg)
+             or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_cfg)
