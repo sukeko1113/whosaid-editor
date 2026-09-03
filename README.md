@@ -662,6 +662,7 @@ whosaid-editor/
 │  ├─ lang.py        ... 言語ごとに変わる設定の器       ★v2.1
 │  ├─ asr_fetch.py   ... 転写モデルの取得(large-v3)     ★v2.1
 │  ├─ cuda_fetch.py  ... GPU 用の部品の取得(cuBLAS)     ★v2.1
+│  ├─ dictionary.py  ... 聞き違いの辞書(検索語の蓄え。自動適用はしない) ★v2.3
 │  └─ config.py      ... 設定の永続化
 ├─ tests/            ... ユニット/結合/GUI スモークテスト ★v2.0
 ├─ tools/            ... 測定・保守用スクリプト(製品には入りません)

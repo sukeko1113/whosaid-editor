@@ -3413,6 +3413,117 @@ def test_restore_texts_does_not_touch_segments_split_or_merged_after_the_replace
     assert merged.text == text_before
 
 
+def test_dictionary_persists_entries_and_never_applies_anything():
+    """**辞書はデータの置き場であって、適用エンジンではない**（設計書 §3.2）。
+
+    追加・無効化・削除・永続化。二重登録しない。空でも壊れていても落ちない。
+    壊れたファイルは上書きしない（人名の蓄えを黙って消さない）。
+    音声ごとの無効化は辞書ファイル側に指紋で持つ（作業ファイルのスキーマは変えない）。
+    """
+    import os
+    import tempfile
+    from src import dictionary as dm
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            # --- 無ければ空。落ちない ---
+            dic = dm.Dictionary.load()
+            assert dic.entries == [] and dic.load_error == ""
+            assert dic.active_entries("fp-1") == []
+            assert dic.path == dm.dictionary_path()
+            assert not dm.dictionary_path().exists(), "読んだだけで作らない"
+
+            # --- 追加・二重登録しない・検証 ---
+            e1 = dic.add("吉田", "吉沢", origin=dm.ORIGIN_REPLACE, note="理事長")
+            e2 = dic.add("吉田", "吉沢")                    # 同じ語・同じ条件
+            assert e1 is e2 and len(dic.entries) == 1, "二重登録した"
+            e3 = dic.add("吉田", "吉沢", ignore_case=True)  # 条件が違えば別項目
+            assert e3 is not e1 and len(dic.entries) == 2
+            assert e3.options == {"ignore_case": True} and e1.options == {}
+            for bad in (("", "吉沢"), ("吉田", "吉田"), ("  ", "x")):
+                try:
+                    dic.add(*bad)
+                    assert False, f"通ってしまった: {bad}"
+                except ValueError:
+                    pass
+            assert e1.id and e1.id != e3.id and e1.added_at and e1.origin == "replace_history"
+
+            # --- 永続化（往復で同じ）---
+            dic.set_enabled(e3.id, False)
+            dic.set_disabled_for("fp-A", True)
+            dic.record_outcome(e1.id, applied=3, rejected=1)
+            dic.save()
+            back = dm.Dictionary.load()
+            assert [(e.wrong, e.correct, e.enabled, e.note, e.ignore_case, e.applied, e.rejected)
+                    for e in back.entries] == [
+                ("吉田", "吉沢", True, "理事長", False, 3, 1),
+                ("吉田", "吉沢", False, "", True, 0, 0)]
+            assert back.find(e1.id) is not None and back.find(e1.id).precision == 0.75
+            assert back.find(e3.id).precision is None
+            assert back.is_disabled_for("fp-A") and not back.is_disabled_for("fp-B")
+
+            # --- 無効化した項目・切った音声では候補にならない ---
+            assert [e.id for e in back.active_entries("fp-B")] == [e1.id]
+            assert back.active_entries("fp-A") == []
+            back.set_disabled_for("fp-A", False)
+            assert [e.id for e in back.active_entries("fp-A")] == [e1.id]
+
+            # --- 削除 ---
+            assert back.remove(e3.id) and not back.remove(e3.id)
+            back.save()
+            assert len(dm.Dictionary.load().entries) == 1
+
+            # --- 壊れたファイル: 落ちず、空で、上書きしない ---
+            # **拒否は戻り値ではなく例外。**戻り値は呼び出し側が見なければ
+            # 黙って消える（設定の保存で 7 か所が握りつぶしていた形）。
+            # 例外は握りつぶすコードを書かない限り画面まで上がる
+            dm.dictionary_path().write_text("{not json", encoding="utf-8")
+            broken = dm.Dictionary.load()
+            assert broken.entries == [] and broken.load_error and not broken.can_save
+            broken.add("吉田", "吉沢")            # 足したつもり
+            try:
+                broken.save()
+                assert False, "壊れたファイルを上書きした"
+            except dm.DictionaryUnwritable:
+                pass
+            assert dm.dictionary_path().read_text(encoding="utf-8") == "{not json",                 "拒んだのに書いた"
+
+            # --- 1 件だけ壊れていても、他は読む。ただし保存は拒む ---
+            # 壊れていた項目は保存すると消える。消えて構わないと人が決めたとき
+            # だけ force=True で上書きする（黙って消えるのと、消すと決めて消すのは違う）
+            dm.dictionary_path().write_text(json.dumps({
+                "version": 1,
+                "entries": [{"wrong": "田中", "correct": "田仲"}, {"wrong": "", "correct": "x"},
+                            "garbage"],
+            }), encoding="utf-8")
+            part = dm.Dictionary.load()
+            assert [e.wrong for e in part.entries] == ["田中"] and part.load_error == ""
+            assert part.skipped == 2 and not part.can_save
+            try:
+                part.save()
+                assert False, "読めなかった項目があるのに上書きした"
+            except dm.DictionaryUnwritable:
+                pass
+            part.save(force=True)                  # 消すと決めて消す
+            again = dm.Dictionary.load()
+            assert [e.wrong for e in again.entries] == ["田中"] and again.skipped == 0
+            assert again.can_save
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_dictionary_module_does_not_log_its_contents():
+    """**辞書には人名が入る。**このモジュールはログを書かない（設計書 §3.5）。"""
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent / "src" / "dictionary.py").read_text(encoding="utf-8")
+    assert "logging" not in src and "print(" not in src, "辞書の中身がログに出る経路がある"
+
+
 def _for_leave() -> Project:
     """途中退席の形。32:17 に本人が「中座します」と言って帰る。"""
     proj = Project(audio_path="a.m4a", duration=4000.0)
