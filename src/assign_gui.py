@@ -42,6 +42,8 @@ from .inspection import (
     target_segment,
 )
 from .player import SegmentPlayer
+from .dictionary import (Dictionary, ORIGIN_REPLACE, SaveResult,
+                         entries_with_candidates, hits_for)
 from .segments import (
     INSERT_STYLE_INLINE,
     INSERT_STYLE_LINE,
@@ -746,6 +748,7 @@ class AssignWindow(tk.Toplevel):
         self.refresh_all()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(4000, self._autosave_tick)
+        self._tell_dictionary_candidates()
 
         if not self.proj.speakers:
             self.after(300, self._first_run_hint)
@@ -2550,18 +2553,34 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, targets = dlg.result
+        self.apply_replacement(before, after, targets,
+                               options=getattr(dlg, "options", {}))
+
+    def apply_replacement(self, before: str, after: str, targets: list, *,
+                          options: Optional[dict] = None, origin: str = "",
+                          rejected: Optional[int] = None) -> int:
+        """語句の置換を本文に当てる。**○×画面（手入力でも辞書からでも）はここを通す。**
+
+        直す前の本文を区間の鍵で控え（1 段の取り消し。§2.5）、一覧と本文欄を
+        読み直す。辞書から来たときは origin と×の件数を記録に載せる（§6 の 2）。
+        戻り値は直した箇所数。
+        """
         # **直す前の本文を、区間の鍵で控える**（設計書 §2.5）。番号は分割・
         # 結合で振り直るので鍵で持つ。適用の直前に取り、適用後の本文と組にする
         wanted = {(round(float(k[0]), 3), round(float(k[1]), 3)) for k, _ in targets}
         held = [(segment_key(s), s.text or "", bool(s.text_edited))
                 for s in self.proj.segments if segment_key(s) in wanted]
         # 探したときと同じ一致の条件で直す（§2.3。ずれると別の箇所が直る）
-        n = self.proj.replace_text(before, after, targets,
-                                   **getattr(dlg, "options", {}))
+        kwargs: dict = dict(options or {})
+        if origin:                       # 手入力の置換には載せない（記録を増やさない）
+            kwargs["origin"] = origin
+        if rejected is not None:
+            kwargs["rejected"] = int(rejected)
+        n = self.proj.replace_text(before, after, targets, **kwargs)
         if not n:
             self._set_action("直すところがありませんでした"
                              "(本文が変わっていた可能性があります)。")
-            return
+            return 0
         now = {segment_key(s): (s.text or "") for s in self.proj.segments}
         self._text_undo = {
             "before": before, "after": after,
@@ -2580,6 +2599,24 @@ class AssignWindow(tk.Toplevel):
             "編集の履歴には 1 件として残ります。"
             "「聴いて確定」の印は付いていません。"
             "［直した語句を戻す］で元に戻せます（次に直すまで）。")
+        return n
+
+    def _tell_dictionary_candidates(self) -> None:
+        """開いたときに「辞書の N 項目に候補があります」と知らせる（§3.2）。
+
+        **N は項目で数える。**同じ箇所が複数の項目に当たるので、箇所で数えると
+        二重になる。辞書が無ければ何も言わない。辞書の中身はログに出さない。
+        """
+        try:
+            dic = Dictionary.load()
+            n = len(entries_with_candidates(
+                self.proj, dic, str(self.proj.audio_fingerprint or "")))
+        except Exception:
+            return                          # 辞書が読めなくても割当は始められる
+        if n:
+            self._set_action(
+                f"辞書の {n} 項目に候補があります"
+                "（下部の「語句をまとめて直す...」→「辞書から探す」）。")
 
     def undo_replace_words(self) -> None:
         """直前の「語句をまとめて直す」を丸ごと元に戻す（1 段だけ）。
@@ -4601,7 +4638,14 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.var_whole = tk.BooleanVar(value=False)
         self.var_nocase = tk.BooleanVar(value=False)
         self.options: dict[str, bool] = {}
+        # 辞書（設計書 §3）。**項目を開いた時点で探す。**先にまとめて探さない
+        # ——先の項目で○にした分は直って消え、×にした分が次の項目に回る
+        self.dic = Dictionary.load()
+        self._fp = str(self.win.proj.audio_fingerprint or "")
+        self._dict_entry = None             # いま開いている辞書の項目（無ければ手入力）
+        self.var_dict = tk.StringVar(value="")
         self._build()
+        self._refresh_dict_row()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Escape>", lambda e: self._close())
@@ -4647,6 +4691,18 @@ class ReplaceWordsDialog(tk.Toplevel):
                        "切り替えると探し直しになり、付けた × はすべて ○ に戻ります。")\
             .pack(side="left", padx=(10, 0))
 
+        # 辞書の行（§3）。「辞書から探す」で最初の項目を開き、「次の項目へ」で
+        # 残っている項目へ進む。**自動適用はしない**——○×は人が付ける
+        drow = ttk.Frame(self)
+        drow.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 8))
+        self.btn_dict = ttk.Button(drow, text="辞書から探す", command=self.open_dictionary)
+        self.btn_dict.pack(side="left")
+        self.btn_dict_next = ttk.Button(drow, text="次の項目へ", command=self.next_entry,
+                                        state="disabled")
+        self.btn_dict_next.pack(side="left", padx=(6, 0))
+        ttk.Label(drow, textvariable=self.var_dict, foreground="#666", wraplength=560,
+                  justify="left").pack(side="left", padx=(10, 0))
+
         cols = ("mark", "at", "text")
         self.tree = ttk.Treeview(self, columns=cols, show="headings",
                                  height=12, selectmode="browse")
@@ -4691,6 +4747,7 @@ class ReplaceWordsDialog(tk.Toplevel):
 
     # ------------------------------------------------------------------
     def search(self) -> None:
+        self._leave_entry_if_edited()     # 語句を人が変えたら、辞書の項目ではなくなる
         term = self.var_before.get().strip()
         self.tree.delete(*self.tree.get_children())
         self.hits, self.marks = [], []
@@ -4724,9 +4781,14 @@ class ReplaceWordsDialog(tk.Toplevel):
     # 行の選択 → 本体をその区間へ（設計書 §2.2）
     # ------------------------------------------------------------------
     def _on_option_changed(self) -> None:
-        """条件を切り替えたら、語句が入っていれば探し直す。"""
+        """条件を切り替えたら、語句が入っていれば探し直す。
+
+        辞書の項目を開いているときに条件や語句を人が変えたら、それは
+        もう辞書の項目ではない（手入力に戻る）。集計を誤った項目に付けない
+        """
         if not self._confirm_option_change():
             return          # チェックは元に戻した。○×も探した結果もそのまま
+        self._leave_entry_if_edited()
         if self.var_before.get().strip():
             self.search()
 
@@ -4753,6 +4815,16 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.var_whole.set(bool(self.options.get("whole_word")))
         self.var_nocase.set(bool(self.options.get("ignore_case")))
         return False
+
+    def _leave_entry_if_edited(self) -> None:
+        e = self._dict_entry
+        if e is None:
+            return
+        if (self.var_before.get().strip(), self.var_after.get().strip(),
+                bool(self.var_whole.get()), bool(self.var_nocase.get())) != (
+                e.wrong, e.correct, bool(e.whole_word), bool(e.ignore_case)):
+            self._dict_entry = None
+            self._refresh_dict_row()
 
     def _selected_row(self) -> Optional[int]:
         sel = self.tree.selection()
@@ -4855,8 +4927,119 @@ class ReplaceWordsDialog(tk.Toplevel):
                 f"「{before}」を {len(chosen)} 箇所で消します。よろしいですか。",
                 parent=self):
             return
+        if self._dict_entry is not None:
+            # **辞書の項目からの適用。**画面は閉じず、記録して次の項目へ。
+            # ×の件数も残す（適用 ÷（適用 ＋ 却下）が精度。§6 の 2）
+            self._apply_dictionary_entry(before, after, chosen)
+            return
         self.result = (before, after, chosen)
         self._close()
+
+    # ------------------------------------------------------------------
+    # 辞書（設計書 §3）。項目を開いた時点で探し、一度に 1 項目ずつ回す
+    # ------------------------------------------------------------------
+    def _refresh_dict_row(self) -> None:
+        """辞書の行の文言とボタンの状態。"""
+        if self.dic.load_error:
+            self.var_dict.set("※ 辞書ファイルが読めません。項目の追加や集計は保存されません。")
+            self.btn_dict.state(["disabled"])
+            self.btn_dict_next.state(["disabled"])
+            return
+        if not self.dic.entries:
+            self.var_dict.set("辞書は空です。置換のあとに登録できます。")
+            self.btn_dict.state(["disabled"])
+            self.btn_dict_next.state(["disabled"])
+            return
+        n = len(entries_with_candidates(self.win.proj, self.dic, self._fp))
+        if self._dict_entry is None:
+            self.var_dict.set(f"辞書の {n} 項目に候補があります。" if n
+                              else "辞書の項目は、いまの本文には出てきません。")
+            self.btn_dict.state(["!disabled"] if n else ["disabled"])
+            self.btn_dict_next.state(["disabled"])
+            return
+        e = self._dict_entry
+        note = f"（{e.note}）" if e.note else ""
+        self.var_dict.set(f"辞書の項目: 「{e.wrong}」→「{e.correct}」{note}"
+                          f"　残り {n} 項目に候補")
+        self.btn_dict.state(["disabled"])
+        self.btn_dict_next.state(["!disabled"])
+
+    def open_dictionary(self) -> None:
+        """辞書の最初の項目（いま本文に出るもの）を開く。"""
+        self._dict_entry = None
+        self.next_entry()
+
+    def next_entry(self) -> None:
+        """次の項目へ。**進む先がいま 0 件なら飛ばす**（取り直してから選ぶ）。
+
+        先の項目で全部○にして直すと、同じ誤変換の次の項目は空になる。
+        空の項目を開かせない——entries_with_candidates はいま出る項目だけを返す。
+        """
+        remaining = entries_with_candidates(self.win.proj, self.dic, self._fp)
+        cur = self._dict_entry
+        nxt = None
+        if cur is not None:
+            ids = [e.id for e in remaining]
+            if cur.id in ids:
+                after_cur = remaining[ids.index(cur.id) + 1:]
+                nxt = after_cur[0] if after_cur else None
+            else:
+                # いまの項目はもう出ない（全部直した）。並びで次に来るものへ
+                nxt = next((e for e in remaining if e.wrong >= cur.wrong and e.id != cur.id),
+                           remaining[0] if remaining else None)
+        else:
+            nxt = remaining[0] if remaining else None
+        if nxt is None:
+            self._dict_entry = None
+            self._refresh_dict_row()
+            self.var_status.set("辞書の候補はもうありません。")
+            return
+        self._open_entry(nxt)
+
+    def _open_entry(self, entry) -> None:
+        """項目を開く＝その語で**いま**探す。○×は人が付ける（自動適用しない）。"""
+        self._dict_entry = entry
+        self.var_before.set(entry.wrong)
+        self.var_after.set(entry.correct)
+        self.var_whole.set(bool(entry.whole_word))
+        self.var_nocase.set(bool(entry.ignore_case))
+        self.search()                         # hits_for と同じ条件（entry.options）
+        self._refresh_dict_row()
+
+    def _apply_dictionary_entry(self, before: str, after: str, chosen: list) -> None:
+        """辞書の項目を当てる。記録に origin と×の件数を載せ、辞書の集計を保存し、次へ。"""
+        e = self._dict_entry
+        rejected = sum(1 for m in self.marks if not m)
+        n = self.win.apply_replacement(before, after, chosen, options=dict(e.options),
+                                       origin="dictionary", rejected=rejected)
+        if n:
+            self.dic.record_outcome(e.id, applied=n, rejected=rejected)
+            self._save_dictionary()
+        self.next_entry()
+
+    def _save_dictionary(self, *, allow_force: bool = False) -> bool:
+        """辞書を保存し、**拒否は必ず人に見せる**（SaveResult を捨てない）。
+
+        allow_force は単位 5（管理画面）用。読めなかった項目を消して保存するかを
+        人に聞き、はいなら force=True。ここ（置換の流れ）では聞かない——
+        置換の途中で「消しますか」を出すと、本文の判断と混ざる。
+        """
+        r: SaveResult = self.dic.save()
+        if r.ok:
+            return True
+        if allow_force and self.dic.skipped and not self.dic.load_error:
+            if messagebox.askyesno(
+                    "辞書を保存できません",
+                    f"{r.reason}\n\n読めなかった {self.dic.skipped} 件を消して保存しますか。",
+                    parent=self):
+                r = self.dic.save(force=True)
+                if r.ok:
+                    return True
+        messagebox.showerror(
+            "辞書を保存できません",
+            f"{r.reason}\n\n本文の置換は済んでいます。辞書の集計と登録だけが保存されていません。",
+            parent=self)
+        return False
 
     def _close(self) -> None:
         self.grab_release()

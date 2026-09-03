@@ -3834,6 +3834,154 @@ def run_replace_dialog_options() -> int:
     return 0
 
 
+def run_replace_dialog_dictionary() -> int:
+    """**辞書から探す: 一度に 1 項目ずつ、開いた時点で探し、○×は人が付ける**（§3）。
+
+    自動適用しない。適用すると記録に origin と×の件数が載り、辞書の集計が
+    保存され、次の項目へ進む。進む先が 0 件なら飛ばす。保存の拒否はダイアログ。
+    辞書ファイルは一時フォルダ（%APPDATA% を差し替える。実物には触らない）。
+    """
+    import os
+    from src import dictionary as dm
+    from src import assign_gui as agmod        # 画面のダイアログを差し替える
+
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[語句をまとめて直す画面の、辞書から探す]")
+    keep = os.environ.get("APPDATA")
+    root = tk.Tk()
+    root.withdraw()
+    errs: list[tuple] = []
+    real_err = agmod.messagebox.showerror
+    agmod.messagebox.showerror = lambda *a, **k: errs.append(a)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            proj = make_project(Path(d))
+            proj.segments[0].text = "田中と田中と田中が来た"
+            proj.segments[1].text = "資格のことですから"
+            proj.audio_fingerprint = "fp-test"
+            proj.save()
+            dic = dm.Dictionary.load()
+            e1 = dic.add("田中", "田仲", note="総務の田仲さん")
+            e2 = dic.add("田中", "田那可", note="営業の田那可さん")
+            e3 = dic.add("資格", "私学")
+            e_none = dic.add("存在しない語", "x")
+            assert dic.save().ok
+
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            win.show_current()
+            check("開いたときに「辞書の N 項目に候補」と知らせる（N は項目で数える）",
+                  "辞書の 3 項目に候補" in win.var_action.get()
+                  if hasattr(win, "var_action") else True)
+
+            dlg = ReplaceWordsDialog(win)
+            try:
+                dlg.update()
+                check("辞書の行に候補の項目数が出る", "3 項目" in dlg.var_dict.get())
+                check("「辞書から探す」が押せる", not dlg.btn_dict.instate(["disabled"]))
+                check("開く前は「次の項目へ」は押せない", dlg.btn_dict_next.instate(["disabled"]))
+
+                dlg.open_dictionary()
+                dlg.update()
+                check("最初の項目（田中→田仲）が開く",
+                      dlg._dict_entry is not None and dlg._dict_entry.id == e1.id and dlg.var_before.get() == "田中"
+                      and dlg.var_after.get() == "田仲")
+                check("開いた時点で探している（3 件）", len(dlg.hits) == 3)
+                check("メモが見える", "総務の田仲さん" in dlg.var_dict.get())
+                texts = [s.text for s in proj.segments]
+                check("開いただけでは本文が変わらない（自動適用しない）",
+                      [s.text for s in proj.segments] == texts)
+
+                # 2 件目だけ○（1・3 件目は×）→ 適用
+                dlg._mark_all(False)
+                dlg._toggle(1)
+                dlg._ok()
+                dlg.update()
+                check("○の分だけ直る", proj.segments[0].text == "田中と田仲と田中が来た")
+                rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+                check("記録に origin=dictionary と×の件数", rec.get("origin") == "dictionary"
+                      and rec.get("rejected") == 2 and rec.get("count") == 1)
+                saved = dm.Dictionary.load()
+                check("辞書の集計が保存される（適用 1・却下 2）",
+                      saved.find(e1.id).applied == 1 and saved.find(e1.id).rejected == 2)
+                check("画面は閉じずに次の項目へ進む", dlg.winfo_exists() and dlg._dict_entry is not None and dlg._dict_entry.id == e2.id)
+                check("次の項目は残っている田中だけ（2 件）", len(dlg.hits) == 2)
+                check("直した箇所は次の項目に出ない",
+                      all("田仲" not in h.term for h in dlg.hits))
+
+                # 全部○で適用 → 田中は尽きる → 次は資格へ（空の項目は飛ばす）
+                dlg._mark_all(True)
+                dlg._ok()
+                dlg.update()
+                check("残りが全部直る", proj.segments[0].text == "田那可と田仲と田那可が来た")
+                check("0 件になった項目は飛ばして、次の項目（資格）へ",
+                      dlg._dict_entry is not None and dlg._dict_entry.id == e3.id)
+
+                # 「次の項目へ」で飛ばす（適用しない）→ もう無い
+                dlg.next_entry()
+                dlg.update()
+                check("最後の項目の次は「もうありません」",
+                      dlg._dict_entry is None and "もうありません" in dlg.var_status.get())
+                check("本文に無い項目は一度も開かれない", True)   # e_none は候補に無い（上で数が 3）
+
+                # 語句を人が変えたら、辞書の項目ではなくなる（集計を誤って付けない）
+                dlg.open_dictionary()
+                dlg.update()
+                check("再度開ける（資格の項目）", dlg._dict_entry is not None and dlg._dict_entry.id == e3.id)
+                dlg.var_before.set("資格の")
+                dlg.search()
+                check("語句を変えたら手入力扱いに戻る", dlg._dict_entry is None)
+
+                # 保存の拒否はダイアログで知らせる（置換は済む）
+                dlg.open_dictionary()
+                dlg.update()
+                dlg.dic.load_error = "JSONDecodeError"      # 読めなかったことにする
+                # 手元の辞書に、直したあとの本文に当たる項目を足しておく。
+                # 拒否のあとに「次の項目へ」が**手元の辞書で**続くことを見る
+                # （ファイルから読み直すと壊れていて空になり、流れが止まる）
+                e_after = dlg.dic.add("私学", "私学校")
+                errs.clear()
+                dlg._mark_all(True)
+                dlg._ok()
+                dlg.update()
+                check("拒否されても本文の置換は済む", proj.segments[1].text == "私学のことですから")
+                check("保存の拒否をダイアログで知らせる", len(errs) == 1 and "保存できません" in errs[0][0])
+                check("ダイアログに理由と「置換は済んでいる」がある",
+                      bool(errs) and "読めなかった" in errs[0][1] and "置換は済んでいます" in errs[0][1])
+                check("拒否のあとも、次の項目へは手元の辞書で続く（読み直して空にならない）",
+                      dlg._dict_entry is not None and dlg._dict_entry.id == e_after.id
+                      and len(dlg.hits) == 1)
+                check("ファイルは壊れたまま上書きされていない",
+                      dm.Dictionary.load().find(e_after.id) is None)
+            finally:
+                try:
+                    dlg.destroy()
+                except tk.TclError:
+                    pass
+            win.destroy()
+    finally:
+        agmod.messagebox.showerror = real_err
+        root.destroy()
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_no_stale_timers() -> int:
     """**窓を壊したあとに、その窓の after() が残っていないこと。**
 
@@ -4085,7 +4233,8 @@ if __name__ == "__main__":
     rc_timers = run_no_stale_timers()
     rc_nav = run_replace_dialog_navigation()
     rc_opts = run_replace_dialog_options()
+    rc_dict = run_replace_dialog_dictionary()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
              or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
-             or rc_cfg)
+             or rc_dict or rc_cfg)

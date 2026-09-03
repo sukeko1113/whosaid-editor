@@ -3600,6 +3600,24 @@ def test_dictionary_search_is_done_when_the_entry_is_opened_not_upfront():
     assert dm.entries_with_candidates(proj, dic) == []
 
 
+def test_replace_text_records_origin_and_rejected_for_dictionary_use():
+    """**辞書から来た置換は、その旨と×の件数を記録に残す**（§6 の 2）。
+
+    適用 ÷（適用 ＋ 却下）が辞書の精度。一次の記録は作業ファイルの edit_log。
+    手入力の置換には載せない（記録を増やさない）。
+    """
+    proj = _for_replace()
+    hits = proj.find_text("資格")
+    n = proj.replace_text("資格", "私学", [hits[1].target], origin="dictionary", rejected=1)
+    assert n == 1
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert rec["origin"] == "dictionary" and rec["rejected"] == 1 and rec["count"] == 1
+    proj = _for_replace()
+    proj.replace_text("資格", "私学", [h.target for h in proj.find_text("資格")])
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert "origin" not in rec and "rejected" not in rec
+
+
 def test_dictionary_module_does_not_log_its_contents():
     """**辞書には人名が入る。**このモジュールはログを書かない（設計書 §3.5）。"""
     from pathlib import Path as _P
