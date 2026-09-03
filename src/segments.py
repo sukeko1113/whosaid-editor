@@ -1308,6 +1308,44 @@ class Project:
                   targets=touched, count=done, segments=len(touched), **extra)
         return done
 
+    def restore_texts(
+        self, items: Sequence[tuple[tuple[float, float], str, bool, str]]
+    ) -> tuple[int, int]:
+        """語句の置換（replace_text）を丸ごと元に戻す。**戻したことも記録に残す。**
+
+        items の 1 件は (区間の鍵, 直す前の本文, 直す前の text_edited, 直した後の本文)。
+        **番号ではなく鍵で指す**——番号は分割・結合で振り直る。
+
+        **適用後に手で直された区間は戻さない。**直した後の本文と今の本文が
+        違えば、人がその後に触っている。その上から古い本文を被せると、
+        人の手直しが消える。戻さずに数えて返す（画面が知らせる）。
+
+        戻り値: (戻した区間数, 手直しされていて戻さなかった区間数)。
+        記録は 1 件（`replace_text_undo`）。「直して、戻した」も人の判断の履歴
+        なので、直した記録を消すのではなく、戻した記録を足す（編集履歴設計書 §1.4）。
+        """
+        keys: list[list[float]] = []
+        skipped = 0
+        by_key = {(round(float(k[0]), 3), round(float(k[1]), 3)): (old, edited, new)
+                  for k, old, edited, new in items}
+        for seg in self.segments:
+            want = by_key.get(segment_key(seg))
+            if want is None:
+                continue
+            old, edited, new = want
+            if (seg.text or "") == old:
+                continue                # もう戻っている（2 回目）
+            if (seg.text or "") != new:
+                skipped += 1            # その後に手で直されている
+                continue
+            seg.text = old
+            seg.text_edited = bool(edited)
+            keys.append(self._key(seg))
+        if keys:
+            self._log("replace_text_undo", targets=keys, count=len(keys),
+                      skipped=skipped)
+        return len(keys), skipped
+
     def edit_time(self, index: int, start: float, end: float,
                   reviewed: bool, _log: bool = True) -> bool:
         """区間の時刻を人が直す／確かめる。変わったときだけ記録。
@@ -1884,6 +1922,7 @@ LOG_LABELS = {
     "clear_speakers": "名簿から外れた割当",
     "edit_text": "本文",
     "replace_text_bulk": "語句(まとめて)",
+    "replace_text_undo": "語句の取り消し",
     "replace_speaker_bulk": "話者の置き換え",
     "carry_speakers": "前の転写から写した割当",
     "edit_time": "時刻",

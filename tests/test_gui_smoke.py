@@ -3648,7 +3648,31 @@ def run_replace_dialog_navigation() -> int:
             win.goto(target_idx)
             check("適用後に飛んでも、直した本文が古い本文欄で戻されない",
                   proj.segments[target_idx].text == fixed)
+
+            # --- 置換の取り消し（単位 4・設計書 §2.5）---
+            check("適用後は［直した語句を戻す］が押せる",
+                  not win.btn_undo_words.instate(["disabled"]))
+            win.undo_replace_words()
+            check("戻すと本文が置換前に戻る",
+                  proj.segments[target_idx].text == texts_before[target_idx])
+            check("戻したあとは押せない（1 段だけ）",
+                  win.btn_undo_words.instate(["disabled"]))
+            check("戻したことが履歴に 1 件残る",
+                  len([r for r in proj.edit_log if r.get("op") == "replace_text_undo"]) == 1)
+            check("本文欄も戻った本文になる",
+                  win.txt_body.get("1.0", "end").strip() == texts_before[target_idx])
+            n_log = len(proj.edit_log)
+            win.undo_replace_words()          # 2 回目は何もしない
+            check("2 回目は何も起きず、履歴も増えない", len(proj.edit_log) == n_log)
             win.destroy()
+
+            # 初期状態: 押せない
+            win2 = AssignWindow(root, proj)
+            try:
+                check("開いた直後は［直した語句を戻す］が押せない",
+                      win2.btn_undo_words.instate(["disabled"]))
+            finally:
+                win2.destroy()
     finally:
         root.destroy()
 

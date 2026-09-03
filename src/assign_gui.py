@@ -672,6 +672,9 @@ class AssignWindow(tk.Toplevel):
         # 直前の「まとめて適用」を丸ごと戻すための控え(時刻専用。話者の
         # _undo とは別系統 — あちらは時刻を持たない)
         self._time_undo: Optional[dict] = None
+        # 直前の「語句をまとめて直す」を丸ごと戻すための控え（本文専用。
+        # 本文の変更には Ctrl+Z も[元に戻す]も効かない。設計書 §2.5）
+        self._text_undo: Optional[dict] = None
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -1154,6 +1157,12 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="語句をまとめて直す...",
                    command=self.replace_words).pack(side="left", padx=(0, 6))
+        # 本文の変更には Ctrl+Z も[元に戻す]も効かないので、置換だけ 1 段戻せる
+        # 手段を隣に置く（設計書 §2.5）
+        self.btn_undo_words = ttk.Button(bottom, text="直した語句を戻す",
+                                         command=self.undo_replace_words,
+                                         state="disabled")
+        self.btn_undo_words.pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="話者をまとめて置き換える...",
                    command=self.replace_speaker).pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
@@ -2541,6 +2550,11 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, targets = dlg.result
+        # **直す前の本文を、区間の鍵で控える**（設計書 §2.5）。番号は分割・
+        # 結合で振り直るので鍵で持つ。適用の直前に取り、適用後の本文と組にする
+        wanted = {(round(float(k[0]), 3), round(float(k[1]), 3)) for k, _ in targets}
+        held = [(segment_key(s), s.text or "", bool(s.text_edited))
+                for s in self.proj.segments if segment_key(s) in wanted]
         # 探したときと同じ一致の条件で直す（§2.3。ずれると別の箇所が直る）
         n = self.proj.replace_text(before, after, targets,
                                    **getattr(dlg, "options", {}))
@@ -2548,15 +2562,54 @@ class AssignWindow(tk.Toplevel):
             self._set_action("直すところがありませんでした"
                              "(本文が変わっていた可能性があります)。")
             return
+        now = {segment_key(s): (s.text or "") for s in self.proj.segments}
+        self._text_undo = {
+            "before": before, "after": after,
+            "items": [(key, old, edited, now[key])
+                      for key, old, edited in held
+                      if key in now and now[key] != old],
+        }
         self._dirty = True
         self.suggester.refresh()
         self.reload_tree()
         self.show_current()
         self.update_status()
+        self._sync_text_undo_button()
         self._set_action(
             f"「{before}」を「{after}」に {n} 箇所直しました。"
             "編集の履歴には 1 件として残ります。"
-            "「聴いて確定」の印は付いていません。")
+            "「聴いて確定」の印は付いていません。"
+            "［直した語句を戻す］で元に戻せます（次に直すまで）。")
+
+    def undo_replace_words(self) -> None:
+        """直前の「語句をまとめて直す」を丸ごと元に戻す（1 段だけ）。
+
+        **適用後に手で直した区間は戻さない**（restore_texts）。戻さなかった
+        ことは知らせる。戻したことも履歴に残る（記録を消さず、足す）。
+        """
+        snap = self._text_undo
+        if not snap:
+            self._set_action("戻せる置換がありません。")
+            return
+        self._commit_text()
+        restored, skipped = self.proj.restore_texts(snap["items"])
+        self._text_undo = None
+        self._sync_text_undo_button()
+        if restored:
+            self._dirty = True
+            self.suggester.refresh()
+            self.reload_tree()
+            self.show_current()
+            self.update_status()
+        msg = (f"「{snap['before']}」→「{snap['after']}」の置換を"
+               f" {restored} 区間で元に戻しました。")
+        if skipped:
+            msg += (f" 置換のあとに手で直した {skipped} 区間は、"
+                    "手直しを消さないよう戻していません。")
+        self._set_action(msg)
+
+    def _sync_text_undo_button(self) -> None:
+        self.btn_undo_words.state(["!disabled"] if self._text_undo else ["disabled"])
 
     def replace_speaker(self) -> None:
         """途中退席した人の発言を、まとめて別の人に付け替える。
@@ -4590,7 +4643,8 @@ class ReplaceWordsDialog(tk.Toplevel):
             command=self._on_option_changed)
         self.chk_nocase.pack(side="left", padx=(10, 0))
         ttk.Label(opts, foreground="#888",
-                  text="※ 完全一致は英語向けです。日本語には語境界が無いので効きません。")\
+                  text="※ 完全一致は英語向けです（日本語には語境界が無いので効きません）。"
+                       "切り替えると探し直し、○×は付け直しになります。")\
             .pack(side="left", padx=(10, 0))
 
         cols = ("mark", "at", "text")
