@@ -27,20 +27,25 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .config import config_dir
+from .segments import Project, TextHit
 
 DICTIONARY_NAME = "dictionary.json"
 FORMAT_VERSION = 1
 
 
-class DictionaryUnwritable(RuntimeError):
-    """辞書ファイルを上書きできない（読めなかった／一部が読めなかった）。
+@dataclass(frozen=True)
+class SaveResult:
+    """save() の結果。**拒否は戻り値で返す**（呼び出し側が必ず受け取る形）。
 
-    **戻り値ではなく例外にしてある。**戻り値は呼び出し側が見なければ黙って
-    消える（設定の保存で 9 か所中 7 か所が `except OSError: pass` だった件と
-    同じ形）。例外は、握りつぶすコードを書かない限り画面まで上がる。
-    呼び出し側（画面）はこれを捕まえて、**足したはずの項目が保存されていない**
-    ことを人に伝えること。
+    ok が False なら書いていない。reason に理由（人に見せる文）。画面は
+    これをダイアログに出し、足したはずの項目が保存されていないことを伝える。
+    見ずに捨てると、足した項目が黙って消える。
     """
+
+    ok: bool
+    reason: str = ""
+    path: Optional[Path] = None
+
 
 ORIGIN_MANUAL = "manual"                # 手入力
 ORIGIN_REPLACE = "replace_history"      # 置換から登録
@@ -133,36 +138,41 @@ class Dictionary:
 
     @property
     def can_save(self) -> bool:
-        """そのまま保存してよいか。False なら save() は例外を投げる。"""
+        """そのまま保存してよいか。False なら save() は拒否（ok=False）を返す。"""
         return not self.load_error and self.skipped == 0
 
-    def save(self, *, force: bool = False) -> Path:
-        """書く。**読めなかったものがあれば拒む**（DictionaryUnwritable）。
+    def save(self, *, force: bool = False) -> SaveResult:
+        """書く。**読めなかったものがあれば拒み、その理由を返す。**
 
         壊れていた項目は、保存すると消える。壊れていたのだから消えて構わない、
-        と人が決めたときだけ `force=True` で上書きする。黙って消えるのと、
-        消すと決めて消すのは違う。
+        と人が決めたときだけ `force=True` で上書きする（**意図して消す**。
+        黙って消えるのとは違う）。呼び出し側は戻り値を必ず見ること。
         """
         if not force and self.load_error:
-            raise DictionaryUnwritable(
-                "辞書ファイルが読めなかったので上書きしません（蓄えたものが消えます）。")
+            return SaveResult(False, "辞書ファイルが読めなかったので上書きしません"
+                                     "（蓄えたものが消えます）。")
         if not force and self.skipped:
-            raise DictionaryUnwritable(
-                f"辞書ファイルの {self.skipped} 件が読めなかったので上書きしません"
-                "（保存するとその分が消えます）。")
+            return SaveResult(False, f"辞書ファイルの {self.skipped} 件が読めなかったので"
+                                     "上書きしません（保存するとその分が消えます）。")
         if self.path is None:
             self.path = dictionary_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         data: dict[str, Any] = {
             "version": FORMAT_VERSION,
             "entries": [asdict(e) for e in self.entries],
             "disabled_for": sorted(self.disabled_for),
         }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                       encoding="utf-8")
-        tmp.replace(self.path)
-        return self.path
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as e:
+            # 絶対パスは出さない。種類だけ
+            return SaveResult(False, f"辞書ファイルを書けませんでした（{type(e).__name__}）。")
+        if force:
+            self.load_error, self.skipped = "", 0     # 消すと決めて消した
+        return SaveResult(True, "", self.path)
 
     # ------------------------------------------------------------------
     # 項目
@@ -231,6 +241,33 @@ class Dictionary:
         if self.is_disabled_for(fingerprint):
             return []
         return [e for e in self.entries if e.enabled]
+
+
+def entries_with_candidates(proj: Project, dic: Dictionary,
+                            fingerprint: str = "") -> list[Entry]:
+    """**いま**本文に出る項目だけを並べる（「N 項目に候補があります」の N）。
+
+    数えるのは項目であって箇所ではない。同じ箇所が複数の項目に当たる
+    （「田中」→「田仲」と「田中」→「田那可」）ので、箇所で数えると二重になる。
+    本文は一切変えない。並びは同じ誤変換が隣り合うように（安定な並べ替え）。
+    """
+    if dic.is_disabled_for(fingerprint):
+        return []
+    active = dic.active_entries(fingerprint)
+    return [e for e in sorted(active, key=lambda x: x.wrong)
+            if proj.find_text(e.wrong, **e.options)]
+
+
+def hits_for(proj: Project, entry: Entry) -> list[TextHit]:
+    """**項目を開いた時点で**探す（設計書 §3.2、§6 の 2）。
+
+    先に全項目をまとめて探さない。「田中」→「田仲」を適用したあとに
+    「田中」→「田那可」を開いたとき、**残っている田中だけ**が出るように——
+    まとめて探すと、もう直した箇所が候補に残る。○にした分は直って消え、
+    ×にした分が次の項目に回る。本文は変えない。直すときは同じ
+    `entry.options` を渡すこと（§2.3）。
+    """
+    return list(proj.find_text(entry.wrong, **entry.options))
 
 
 def _entry_from_dict(d: dict[str, Any]) -> Entry:
