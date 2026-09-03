@@ -4750,6 +4750,8 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.btn_dict_next = ttk.Button(drow, text="次の項目へ", command=self.next_entry,
                                         state="disabled")
         self.btn_dict_next.pack(side="left", padx=(6, 0))
+        ttk.Button(drow, text="辞書を管理...", command=self.manage_dictionary)\
+            .pack(side="left", padx=(6, 0))
         ttk.Label(drow, textvariable=self.var_dict, foreground="#666", wraplength=560,
                   justify="left").pack(side="left", padx=(10, 0))
 
@@ -5070,26 +5072,22 @@ class ReplaceWordsDialog(tk.Toplevel):
     def _save_dictionary(self, *, allow_force: bool = False) -> bool:
         """辞書を保存し、**拒否は必ず人に見せる**（SaveResult を捨てない）。
 
-        allow_force は単位 5（管理画面）用。読めなかった項目を消して保存するかを
-        人に聞き、はいなら force=True。ここ（置換の流れ）では聞かない——
-        置換の途中で「消しますか」を出すと、本文の判断と混ざる。
+        ここ（置換の流れ）では force を聞かない——置換の途中で「消しますか」を
+        出すと、本文の判断と混ざる。管理画面（DictionaryDialog）は allow_force。
         """
-        r: SaveResult = self.dic.save()
-        if r.ok:
-            return True
-        if allow_force and self.dic.skipped and not self.dic.load_error:
-            if messagebox.askyesno(
-                    "辞書を保存できません",
-                    f"{r.reason}\n\n読めなかった {self.dic.skipped} 件を消して保存しますか。",
-                    parent=self):
-                r = self.dic.save(force=True)
-                if r.ok:
-                    return True
-        messagebox.showerror(
-            "辞書を保存できません",
-            f"{r.reason}\n\n本文の置換は済んでいます。辞書の集計と登録だけが保存されていません。",
-            parent=self)
-        return False
+        return save_dictionary_with_prompt(
+            self, self.dic, allow_force=allow_force,
+            tail="本文の置換は済んでいます。辞書の集計と登録だけが保存されていません。")
+
+    def manage_dictionary(self) -> None:
+        """辞書の管理画面を開く。閉じたら手元の辞書の状態を画面に反映する。"""
+        dlg = DictionaryDialog(self, self.dic, self._fp)
+        self.wait_window(dlg)
+        # 開いていた項目が消えた／無効になったなら、手入力の扱いに戻す
+        e = self._dict_entry
+        if e is not None and (self.dic.find(e.id) is None or not e.enabled):
+            self._dict_entry = None
+        self._refresh_dict_row()
 
     def _close(self) -> None:
         self.grab_release()
@@ -5290,6 +5288,218 @@ def _open_path(path: Path | str) -> None:
             subprocess.run(["xdg-open", str(path)])
     except Exception:
         pass
+
+
+def save_dictionary_with_prompt(parent: tk.Misc, dic: Dictionary, *,
+                                allow_force: bool = False, tail: str = "") -> bool:
+    """辞書を保存し、**拒否は必ず人に見せる**（SaveResult を捨てない）。
+
+    - 読めなかった項目がある（skipped）: allow_force なら「消して保存しますか」を
+      聞き、はいなら force=True で上書きする（**意図して消す**）。いいえなら書かない
+    - ファイル自体が読めない（load_error）: 消して保存するかは聞かない。何が
+      入っていたか分からないものを上書きさせない。人が手で直す
+    - それ以外の失敗（書けない）: 理由を出す
+    tail は「本文の置換は済んでいます…」のような、状況の補足。
+    """
+    r: SaveResult = dic.save()
+    if r.ok:
+        return True
+    if allow_force and dic.skipped and not dic.load_error:
+        if messagebox.askyesno(
+                "辞書を保存できません",
+                f"{r.reason}\n\n読めなかった {dic.skipped} 件を消して保存しますか。\n"
+                "（消すと決めて消します。元には戻せません）",
+                parent=parent, default="no"):
+            r = dic.save(force=True)
+            if r.ok:
+                return True
+    messagebox.showerror("辞書を保存できません",
+                         f"{r.reason}" + (f"\n\n{tail}" if tail else ""), parent=parent)
+    return False
+
+
+class DictionaryDialog(tk.Toplevel):
+    """辞書の管理画面（設計書 §3、単位 5）。
+
+    一覧に**条件（完全一致・大文字小文字）も出す**——同じ誤変換に別の正しい語が
+    並ぶことがあり、条件が無いと同じ行に見えるものが二つ並ぶ。
+    項目の有効／無効、削除、メモ、手入力の追加、この音声で辞書を使わない、
+    そして「読めなかった項目を消して保存する」の経路（force）はここだけ。
+    **辞書の中身をログに出さない。**
+    """
+
+    COND = {(False, False): "部分一致", (True, False): "完全一致",
+            (False, True): "大小同一視", (True, True): "完全一致・大小同一視"}
+
+    def __init__(self, master: tk.Misc, dic: Dictionary, fingerprint: str = "") -> None:
+        super().__init__(master)
+        self.dic = dic
+        self._fp = fingerprint or ""
+        self.saved = False
+        self.title("辞書を管理")
+        self.transient(master)
+        self.var_status = tk.StringVar()
+        self.var_disabled_here = tk.BooleanVar(value=dic.is_disabled_for(self._fp))
+        self.var_wrong = tk.StringVar()
+        self.var_correct = tk.StringVar()
+        self.var_note = tk.StringVar()
+        self.var_whole = tk.BooleanVar(value=False)
+        self.var_nocase = tk.BooleanVar(value=False)
+        self._build()
+        self.refresh()
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.bind("<Escape>", lambda e: self._close())
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        ttk.Label(self, textvariable=self.var_status, foreground="#a00", wraplength=760,
+                  justify="left").grid(row=0, column=0, columnspan=2, sticky="w",
+                                       padx=12, pady=(12, 4))
+        cols = ("on", "wrong", "correct", "cond", "note", "origin", "score")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=12,
+                                 selectmode="browse")
+        for key, label, width, anchor in (
+                ("on", "有効", 44, "center"), ("wrong", "誤変換", 120, "w"),
+                ("correct", "正しい語", 120, "w"), ("cond", "条件", 130, "w"),
+                ("note", "メモ", 180, "w"), ("origin", "由来", 70, "center"),
+                ("score", "適用/却下", 90, "center")):
+            self.tree.heading(key, text=label)
+            self.tree.column(key, width=width, anchor=anchor)
+        self.tree.grid(row=1, column=0, sticky="nsew", padx=(12, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(row=1, column=1, sticky="ns", padx=(0, 12))
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.bind("<Button-1>", self._on_click)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # 選んだ項目のメモ
+        row = ttk.Frame(self)
+        row.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(6, 0))
+        ttk.Label(row, text="メモ（同名別人の区別など）:").pack(side="left")
+        self.ent_note = ttk.Entry(row, textvariable=self.var_note, width=40)
+        self.ent_note.pack(side="left", padx=(4, 6))
+        ttk.Button(row, text="メモを保存", command=self.apply_note).pack(side="left")
+        ttk.Button(row, text="削除", command=self.delete_selected).pack(side="left", padx=(12, 0))
+        ttk.Button(row, text="有効／無効", command=self.toggle_selected).pack(side="left", padx=(6, 0))
+
+        # 手入力の追加
+        add = ttk.LabelFrame(self, text="項目を足す")
+        add.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(8, 0))
+        ttk.Label(add, text="誤変換:").grid(row=0, column=0, padx=(8, 2), pady=4)
+        ttk.Entry(add, textvariable=self.var_wrong, width=16).grid(row=0, column=1, pady=4)
+        ttk.Label(add, text="→ 正しい語:").grid(row=0, column=2, padx=(8, 2))
+        ttk.Entry(add, textvariable=self.var_correct, width=16).grid(row=0, column=3)
+        ttk.Checkbutton(add, text="完全一致", variable=self.var_whole).grid(row=0, column=4, padx=(10, 0))
+        ttk.Checkbutton(add, text="大文字小文字を区別しない", variable=self.var_nocase)\
+            .grid(row=0, column=5, padx=(6, 0))
+        ttk.Button(add, text="足す", command=self.add_entry).grid(row=0, column=6, padx=(10, 8))
+
+        ttk.Checkbutton(self, text="この音声では辞書を使わない（他の音声には影響しません）",
+                        variable=self.var_disabled_here, command=self._on_disabled_here)\
+            .grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 0))
+
+        btns = ttk.Frame(self)
+        btns.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
+        ttk.Button(btns, text="閉じる", command=self._close).pack(side="right")
+        ttk.Button(btns, text="保存", command=self.save).pack(side="right", padx=6)
+
+    # ------------------------------------------------------------------
+    def refresh(self) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for e in self.dic.entries:
+            score = f"{e.applied}/{e.rejected}"
+            if e.precision is not None:
+                score += f" ({e.precision:.0%})"
+            self.tree.insert("", "end", iid=e.id, values=(
+                "○" if e.enabled else "×", e.wrong, e.correct,
+                self.COND[(bool(e.whole_word), bool(e.ignore_case))],
+                e.note, "置換" if e.origin == ORIGIN_REPLACE else "手入力", score))
+        if self.dic.load_error:
+            self.var_status.set("※ 辞書ファイルが読めません。ここで保存しても上書きしません。"
+                                "ファイルを手で直すか、退避してから作り直してください。")
+        elif self.dic.skipped:
+            self.var_status.set(f"※ 辞書ファイルの {self.dic.skipped} 件が読めませんでした。"
+                                "保存のときに、消して保存するかを聞きます。")
+        else:
+            self.var_status.set("")
+
+    def _selected(self):
+        sel = self.tree.selection()
+        return self.dic.find(sel[0]) if sel else None
+
+    def _on_select(self, event=None) -> None:
+        e = self._selected()
+        self.var_note.set(e.note if e else "")
+
+    def _on_click(self, event) -> None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        row = self.tree.identify_row(event.y)
+        if row and self.tree.identify_column(event.x) == "#1":
+            self.toggle(row)
+
+    def toggle(self, entry_id: str) -> None:
+        e = self.dic.find(entry_id)
+        if e is None:
+            return
+        self.dic.set_enabled(entry_id, not e.enabled)
+        self.refresh()
+        self.tree.selection_set(entry_id)
+
+    def toggle_selected(self) -> None:
+        e = self._selected()
+        if e is not None:
+            self.toggle(e.id)
+
+    def apply_note(self) -> None:
+        e = self._selected()
+        if e is None:
+            return
+        e.note = self.var_note.get().strip()
+        self.refresh()
+        self.tree.selection_set(e.id)
+
+    def delete_selected(self) -> None:
+        e = self._selected()
+        if e is None:
+            return
+        if not messagebox.askyesno(
+                "項目を消す", f"「{e.wrong}」→「{e.correct}」を辞書から消します。よろしいですか。",
+                parent=self, default="no"):
+            return
+        self.dic.remove(e.id)
+        self.refresh()
+
+    def add_entry(self) -> None:
+        try:
+            e = self.dic.add(self.var_wrong.get(), self.var_correct.get(),
+                             ignore_case=bool(self.var_nocase.get()),
+                             whole_word=bool(self.var_whole.get()))
+        except ValueError as err:
+            messagebox.showwarning("足せません", str(err), parent=self)
+            return
+        self.var_wrong.set("")
+        self.var_correct.set("")
+        self.refresh()
+        self.tree.selection_set(e.id)
+        self.tree.see(e.id)
+
+    def _on_disabled_here(self) -> None:
+        self.dic.set_disabled_for(self._fp, bool(self.var_disabled_here.get()))
+
+    def save(self) -> bool:
+        # **ここだけが force の入口。**読めなかった項目を消して保存するかを聞く
+        ok = save_dictionary_with_prompt(self, self.dic, allow_force=True)
+        if ok:
+            self.saved = True
+            self.refresh()
+        return ok
+
+    def _close(self) -> None:
+        self.grab_release()
+        self.destroy()
 
 
 def open_assign_window(master: Optional[tk.Misc], project: Project) -> AssignWindow:
