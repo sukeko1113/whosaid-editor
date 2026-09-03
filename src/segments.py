@@ -738,6 +738,32 @@ def merge_same_speaker(
 CONTEXT_CHARS = 22
 
 
+def text_positions(text: str, term: str, *, ignore_case: bool = False,
+                   whole_word: bool = False) -> list[tuple[int, str]]:
+    """本文の中で `term` が出る位置と、そこにある綴りを左から全部並べる。
+
+    **探すとき（find_text）と直すとき（replace_text）は必ずこれを通す。**
+    オプションが片方にしか効かないと、「探して○を付けた箇所」と「直した箇所」が
+    ずれる（設計書 §2.3）。
+
+    - ignore_case: 英大文字小文字を区別しない。返す綴りは**本文にあるほう**
+      （「Um」を探して「um」が当たったら "um"）。一覧にそのまま出す
+    - whole_word: 完全一致。**語句の前後が半角英数字でない**ことを条件にする
+      （`um` が `summary` に当たらないため）。日本語には語境界が無いので、
+      日本語の語句ではこの条件は効かない（部分一致と同じ結果になる）
+
+    重ならず、左から順に取る（`str.find` を進めるのと同じ数え方）。
+    """
+    if not term or not text:
+        return []
+    import re
+    pat = re.escape(term)
+    if whole_word:
+        pat = r"(?<![A-Za-z0-9])" + pat + r"(?![A-Za-z0-9])"
+    flags = re.IGNORECASE if ignore_case else 0
+    return [(m.start(), m.group(0)) for m in re.finditer(pat, text, flags)]
+
+
 @dataclass(frozen=True)
 class TextHit:
     """本文に語句が出てくる 1 箇所。**判定は出さない。**
@@ -1194,12 +1220,17 @@ class Project:
                   before=before, after=new_text)
         return True
 
-    def find_text(self, term: str) -> list[TextHit]:
+    def find_text(self, term: str, *, ignore_case: bool = False,
+                  whole_word: bool = False) -> list[TextHit]:
         """本文に `term` が出てくる箇所を、前後の文脈つきで全部並べる。
 
         **1 回の出現につき 1 件返す。**同じ区間に 2 回出ることがある
         (実データ「同層会ですね同層会が」)。区間単位にまとめると、片方だけ
         直したい場合に手が出せない。
+
+        オプションの意味は `text_positions` を見よ。**`replace_text` に同じ
+        オプションを渡すこと**——ここで数えた「何番目」は、同じ条件で
+        数え直したときにだけ同じ箇所を指す。
         """
         term = term or ""
         if not term:
@@ -1207,23 +1238,21 @@ class Project:
         out: list[TextHit] = []
         for seg in self.segments:
             text = seg.text or ""
-            pos = text.find(term)
-            nth = 0
-            while pos >= 0:
+            for nth, (pos, found) in enumerate(text_positions(
+                    text, term, ignore_case=ignore_case, whole_word=whole_word)):
                 lo = max(0, pos - CONTEXT_CHARS)
-                hi = min(len(text), pos + len(term) + CONTEXT_CHARS)
+                hi = min(len(text), pos + len(found) + CONTEXT_CHARS)
                 out.append(TextHit(
                     key=segment_key(seg), nth=nth, at=float(seg.start),
                     index=seg.index,
-                    before=text[lo:pos], term=term,
-                    after=text[pos + len(term):hi],
+                    before=text[lo:pos], term=found,
+                    after=text[pos + len(found):hi],
                     head=lo > 0, tail=hi < len(text)))
-                nth += 1
-                pos = text.find(term, pos + len(term))
         return out
 
     def replace_text(self, before: str, after: str,
-                     targets: Sequence[tuple[tuple[float, float], int]]) -> int:
+                     targets: Sequence[tuple[tuple[float, float], int]], *,
+                     ignore_case: bool = False, whole_word: bool = False) -> int:
         """選ばれた箇所だけ語句を置き換える。直した箇所数を返す。
 
         **一括で置き換えない。**「資格」は 10 回出るが 1 回は本物なので、
@@ -1236,6 +1265,10 @@ class Project:
         **`reviewed` の ✓ は立てない。**人が音声を聴いて確かめたわけでは
         ないため(CLAUDE.md)。`text_edited` は立てる——人が直した本文なので、
         再実行で機械の出力に戻されては困る。
+
+        オプションは `find_text` に渡したものと**同じ**にすること。位置の
+        列挙は両方とも `text_positions` で行うので、同じ条件なら同じ箇所を指す。
+        使ったオプションは記録に載せる（何を根拠に当てたかが後から分かる）。
         """
         before = before or ""
         if not before or before == after:
@@ -1250,15 +1283,13 @@ class Project:
             want = by_key.get(segment_key(seg))
             if not want:
                 continue
-            text, out, pos, nth = seg.text or "", [], 0, 0
-            at = text.find(before)
-            while at >= 0:
+            text, out, pos = seg.text or "", [], 0
+            for nth, (at, found) in enumerate(text_positions(
+                    text, before, ignore_case=ignore_case, whole_word=whole_word)):
                 out.append(text[pos:at])
-                out.append(after if nth in want else before)
+                out.append(after if nth in want else found)
                 done += nth in want
-                pos = at + len(before)
-                nth += 1
-                at = text.find(before, pos)
+                pos = at + len(found)
             out.append(text[pos:])
             new_text = "".join(out)
             if new_text == seg.text:
@@ -1268,8 +1299,13 @@ class Project:
             touched.append(self._key(seg))
         if not done:
             return 0
+        extra: dict[str, Any] = {}
+        if ignore_case:
+            extra["ignore_case"] = True
+        if whole_word:
+            extra["whole_word"] = True
         self._log("replace_text_bulk", before=before, after=after,
-                  targets=touched, count=done, segments=len(touched))
+                  targets=touched, count=done, segments=len(touched), **extra)
         return done
 
     def edit_time(self, index: int, start: float, end: float,

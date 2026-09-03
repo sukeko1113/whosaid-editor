@@ -3201,6 +3201,132 @@ def test_replace_text_does_nothing_without_a_target():
     assert not [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
 
 
+def _for_match() -> Project:
+    """一致条件の検査用。英語のフィラーと、日本語の同一区間 2 回出現。"""
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [
+        Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                text="Um, the summary was, um, brief. UM okay"),
+        Segment(index=1, start=10.0, end=20.0, cluster="g:B",
+                text="同層会ですね同層会があのー"),
+    ]
+    return proj
+
+
+def test_whole_word_does_not_match_inside_another_word():
+    """**完全一致で `um` が `summary` に当たらない。**
+
+    `count_terms()` の部分一致が `um` を `summary` に数えた件と同根
+    （設計書 §2.3）。完全一致の定義は「語句の前後が半角英数字でない」。
+    日本語には語境界が無いので、日本語では部分一致と同じ結果になる。
+    """
+    proj = _for_match()
+    partial = proj.find_text("um")
+    assert [h.before + "【" + h.term + "】" for h in partial] == \
+        ["Um, the s【um】", "Um, the summary was, 【um】"], partial
+    whole = proj.find_text("um", whole_word=True)
+    assert [(h.before, h.term) for h in whole] == [("Um, the summary was, ", "um")], whole
+    # 日本語: 完全一致でも部分一致と同じ
+    assert len(proj.find_text("同層会", whole_word=True)) == 2
+    assert len(proj.find_text("同層会")) == 2
+
+
+def test_ignore_case_matches_both_spellings_and_reports_the_real_one():
+    """**区別しないとき `Um` と `um` と `UM` に当たり、一覧の綴りは本文のもの。**"""
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in hits] == ["Um", "um", "UM"], hits
+    assert [h.nth for h in hits] == [0, 1, 2]
+    # 部分一致 + 区別しない → summary の中も当たる
+    hits = proj.find_text("um", ignore_case=True)
+    assert [h.term for h in hits] == ["Um", "um", "um", "UM"], hits
+
+
+def test_find_and_replace_agree_when_given_the_same_options():
+    """**探すときと直すときで同じ照合を使う。**片方にしか効かないとずれる。
+
+    「区別しない・完全一致」で 3 件出し、真ん中（"um"）だけ直す。
+    同じオプションで直せば、その 1 件だけが変わる。
+    """
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    n = proj.replace_text("um", "[filler]", [hits[1].target],
+                          ignore_case=True, whole_word=True)
+    assert n == 1
+    assert proj.segments[0].text == "Um, the summary was, [filler], brief. UM okay"
+    # **直したあとの指定は古い。**「何番目」は直す前の本文で数えたもので、
+    # 直すと番号がずれる。古い指定は当たらない（0 件）ので、探し直してから直す。
+    # 画面は全部を 1 回で適用するのでこの形にはならないが、規則として縛る
+    assert proj.replace_text("um", "[filler]", [hits[2].target],
+                             ignore_case=True, whole_word=True) == 0
+    again = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in again] == ["Um", "UM"]
+    # 綴りが違う箇所を直すと、本文の綴りではなく置換語になる
+    n = proj.replace_text("um", "[filler]", [again[1].target],
+                          ignore_case=True, whole_word=True)
+    assert n == 1
+    assert proj.segments[0].text == "Um, the summary was, [filler], brief. [filler] okay"
+    # オプションを付けずに直すと "UM" には当たらない（数え方が違うので指せない）
+    proj2 = _for_match()
+    hits2 = proj2.find_text("um", ignore_case=True, whole_word=True)
+    assert proj2.replace_text("um", "[filler]", [hits2[2].target]) == 0, \
+        "オプション無しで UM が直ってしまった（照合がずれている）"
+
+
+def test_replace_text_fixes_three_hits_in_one_segment_even_if_after_contains_before():
+    """**同じ区間に 3 件以上ヒットして全部○でも、3 件とも正しく直る。**
+
+    1 件目を直すと残りの番号が繰り上がる、という形の事故を防ぐ。実装は
+    直す前の本文で位置を 1 回だけ列挙し、切り貼りで新しい本文を作る
+    （直しながら数え直さない）ので、置換後が検索語を含んでも（「田中」→
+    「田中村」）、大文字小文字を無視しても、番号はずれない。
+    その構造を、レビューで指摘された形のまま縛る（2026-09-03）。
+    """
+    # 日本語: 置換後が検索語を含む
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="田中と田中と田中が来た")]
+    hits = proj.find_text("田中")
+    assert [h.nth for h in hits] == [0, 1, 2]
+    assert proj.replace_text("田中", "田中村", [h.target for h in hits]) == 3
+    assert proj.segments[0].text == "田中村と田中村と田中村が来た"
+    # 直したあとに探せば、置換後の中の「田中」が 3 件見える（無限に増えない）
+    assert len(proj.find_text("田中")) == 3
+
+    # 一部だけ（1 件目と 3 件目）: 真ん中は元の綴りのまま
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="田中と田中と田中が来た")]
+    hits = proj.find_text("田中")
+    assert proj.replace_text("田中", "田中村", [hits[0].target, hits[2].target]) == 2
+    assert proj.segments[0].text == "田中村と田中と田中村が来た"
+
+    # 英語: 大文字小文字を無視 + 完全一致 + 置換後が検索語を含む（um → umm）
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="Um, um, UM, summary")]
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in hits] == ["Um", "um", "UM"]
+    assert proj.replace_text("um", "umm", [h.target for h in hits],
+                             ignore_case=True, whole_word=True) == 3
+    assert proj.segments[0].text == "umm, umm, umm, summary"
+
+
+def test_replace_text_records_the_options_it_used():
+    """**何を根拠に当てたかを記録に残す。**既定のときは載せない（記録を増やさない）。"""
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    proj.replace_text("um", "[filler]", [h.target for h in hits],
+                      ignore_case=True, whole_word=True)
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert rec.get("ignore_case") is True and rec.get("whole_word") is True
+    assert rec["count"] == 3
+    proj = _for_replace()
+    proj.replace_text("同層会", "同窓会", [h.target for h in proj.find_text("同層会")])
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert "ignore_case" not in rec and "whole_word" not in rec
+
+
 def _for_leave() -> Project:
     """途中退席の形。32:17 に本人が「中座します」と言って帰る。"""
     proj = Project(audio_path="a.m4a", duration=4000.0)
