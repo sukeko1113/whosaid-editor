@@ -3659,6 +3659,110 @@ def run_replace_dialog_navigation() -> int:
     return 0
 
 
+def run_replace_dialog_options() -> int:
+    """**一致の条件（完全一致・大文字小文字）が、探すときと直すときの両方に効く。**
+
+    片方にしか効かないと、一覧に出た箇所と直る箇所がずれる（設計書 §2.3）。
+    画面は条件を self.options に写し、呼び出し側が replace_text に同じ値を渡す。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[語句をまとめて直す画面の、一致の条件]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            proj = make_project(Path(d))
+            proj.segments[0].text = "Um, the summary was, um, brief. UM okay"
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            win.show_current()               # 本文欄を区間に合わせておく
+
+            dlg = ReplaceWordsDialog(win)
+            try:
+                dlg.update()
+                check("既定は部分一致・区別する",
+                      not dlg.var_whole.get() and not dlg.var_nocase.get())
+                dlg.var_before.set("um")
+                dlg.search()
+                check("部分一致・区別する: summary の中も当たる（2 件）",
+                      [h.term for h in dlg.hits] == ["um", "um"])
+                check("既定のときは options が空", dlg.options == {})
+
+                dlg.var_whole.set(True)
+                dlg._on_option_changed()          # チェックを切り替えた
+                check("完全一致: summary の中は当たらない（1 件）",
+                      [h.term for h in dlg.hits] == ["um"])
+                check("options に whole_word", dlg.options == {"whole_word": True})
+
+                dlg.var_nocase.set(True)
+                dlg._on_option_changed()
+                check("区別しない + 完全一致: Um / um / UM の 3 件、綴りは本文のもの",
+                      [h.term for h in dlg.hits] == ["Um", "um", "UM"])
+                check("一覧の綴りも本文のもの",
+                      "【Um】" in dlg.tree.set("0", "text"))
+                check("options に両方",
+                      dlg.options == {"whole_word": True, "ignore_case": True})
+
+                dlg.var_whole.set(False)
+                dlg._on_option_changed()
+                check("区別しない + 部分一致: 4 件",
+                      [h.term for h in dlg.hits] == ["Um", "um", "um", "UM"])
+            finally:
+                try:
+                    dlg.destroy()
+                except tk.TclError:
+                    pass
+
+            # --- 直すときに、探したときと同じ条件が渡る（実物の経路）---
+            import src.assign_gui as agmod
+            real_dialog = agmod.ReplaceWordsDialog
+            got: dict = {}
+            real_replace = proj.replace_text
+
+            def recording_replace(before, after, targets, **kw):
+                got.update(kw)
+                return real_replace(before, after, targets, **kw)
+
+            proj.replace_text = recording_replace
+            key0 = proj.find_text("um", ignore_case=True, whole_word=True)[0].key
+
+            class _FakeDialog(tk.Toplevel):
+                def __init__(self, master):
+                    super().__init__(master)
+                    self.result = ("um", "umm", [(key0, 0), (key0, 1), (key0, 2)])
+                    self.options = {"ignore_case": True, "whole_word": True}
+                    self.after(0, self.destroy)
+
+            agmod.ReplaceWordsDialog = _FakeDialog
+            try:
+                win.goto(0)
+                win.replace_words()
+            finally:
+                agmod.ReplaceWordsDialog = real_dialog
+                proj.replace_text = real_replace
+            check("直すときに探したときの条件が渡る",
+                  got == {"ignore_case": True, "whole_word": True})
+            check("その条件で 3 件とも直る（Um / um / UM → umm）",
+                  proj.segments[0].text == "umm, the summary was, umm, brief. umm okay")
+            win.destroy()
+    finally:
+        root.destroy()
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_no_stale_timers() -> int:
     """**窓を壊したあとに、その窓の after() が残っていないこと。**
 
@@ -3909,6 +4013,8 @@ if __name__ == "__main__":
     rc_plain = run_api_plaintext()
     rc_timers = run_no_stale_timers()
     rc_nav = run_replace_dialog_navigation()
+    rc_opts = run_replace_dialog_options()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
-             or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_cfg)
+             or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
+             or rc_cfg)

@@ -2541,7 +2541,9 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, targets = dlg.result
-        n = self.proj.replace_text(before, after, targets)
+        # 探したときと同じ一致の条件で直す（§2.3。ずれると別の箇所が直る）
+        n = self.proj.replace_text(before, after, targets,
+                                   **getattr(dlg, "options", {}))
         if not n:
             self._set_action("直すところがありませんでした"
                              "(本文が変わっていた可能性があります)。")
@@ -4540,6 +4542,12 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.var_status = tk.StringVar(value="直す前の語句を入れて［探す］。")
         # 「n / N」。行を選ぶたびに更新する（設計書 §2.2）
         self.var_pos = tk.StringVar(value="")
+        # 一致の条件（設計書 §2.2・§2.3）。**探すときと直すときで同じ値を使う**
+        # ——search() が self.options に写し、呼び出し側が replace_text に渡す。
+        # 既定は部分一致・区別する（日本語には語境界が無く、実物の str.find と同じ）
+        self.var_whole = tk.BooleanVar(value=False)
+        self.var_nocase = tk.BooleanVar(value=False)
+        self.options: dict[str, bool] = {}
         self._build()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -4549,7 +4557,7 @@ class ReplaceWordsDialog(tk.Toplevel):
     # ------------------------------------------------------------------
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)      # 行: 0 説明 / 1 入力 / 2 条件 / 3 一覧 / 4 状態 / 5 ボタン
 
         ttk.Label(
             self, wraplength=720,
@@ -4570,6 +4578,21 @@ class ReplaceWordsDialog(tk.Toplevel):
         ttk.Button(top, text="探す", command=self.search).pack(side="left")
         self.ent_before.bind("<Return>", lambda e: self.search())
 
+        # 一致の条件。切り替えたら探し直す（○×は付け直しになる）
+        opts = ttk.Frame(self)
+        opts.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        self.chk_whole = ttk.Checkbutton(
+            opts, text="完全一致（前後が英数字でない）", variable=self.var_whole,
+            command=self._on_option_changed)
+        self.chk_whole.pack(side="left")
+        self.chk_nocase = ttk.Checkbutton(
+            opts, text="英大文字小文字を区別しない", variable=self.var_nocase,
+            command=self._on_option_changed)
+        self.chk_nocase.pack(side="left", padx=(10, 0))
+        ttk.Label(opts, foreground="#888",
+                  text="※ 完全一致は英語向けです。日本語には語境界が無いので効きません。")\
+            .pack(side="left", padx=(10, 0))
+
         cols = ("mark", "at", "text")
         self.tree = ttk.Treeview(self, columns=cols, show="headings",
                                  height=12, selectmode="browse")
@@ -4579,9 +4602,9 @@ class ReplaceWordsDialog(tk.Toplevel):
                 ("text", "前後", 620, "w")):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor=anchor)
-        self.tree.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
+        self.tree.grid(row=3, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
         sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        sb.grid(row=2, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
+        sb.grid(row=3, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
         self.tree.configure(yscrollcommand=sb.set)
         # クリックでも Space でも切り替えられるように(片方だけだと迷う)
         self.tree.bind("<Button-1>", self._on_click)
@@ -4594,10 +4617,10 @@ class ReplaceWordsDialog(tk.Toplevel):
 
         ttk.Label(self, textvariable=self.var_status, foreground="#666",
                   wraplength=720)\
-            .grid(row=3, column=0, sticky="w", padx=12, pady=(6, 0))
+            .grid(row=4, column=0, sticky="w", padx=12, pady=(6, 0))
 
         btns = ttk.Frame(self)
-        btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
+        btns.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
         ttk.Button(btns, text="全部に○", command=lambda: self._mark_all(True))\
             .pack(side="left")
         ttk.Button(btns, text="全部に×", command=lambda: self._mark_all(False))\
@@ -4621,7 +4644,14 @@ class ReplaceWordsDialog(tk.Toplevel):
             self.var_status.set("直す前の語句を入れてください。")
             self._refresh_ok()
             return
-        self.hits = self.win.proj.find_text(term)
+        # **直すときにも同じ値を渡す**（呼び出し側が self.options を使う）。
+        # 片方にしか効かないと、一覧に出た箇所と直る箇所がずれる（§2.3）
+        self.options = {}
+        if self.var_nocase.get():
+            self.options["ignore_case"] = True
+        if self.var_whole.get():
+            self.options["whole_word"] = True
+        self.hits = self.win.proj.find_text(term, **self.options)
         self.marks = [True] * len(self.hits)
         for i, h in enumerate(self.hits):
             self.tree.insert("", "end", iid=str(i), values=(
@@ -4639,6 +4669,11 @@ class ReplaceWordsDialog(tk.Toplevel):
     # ------------------------------------------------------------------
     # 行の選択 → 本体をその区間へ（設計書 §2.2）
     # ------------------------------------------------------------------
+    def _on_option_changed(self) -> None:
+        """条件を切り替えたら、語句が入っていれば探し直す。"""
+        if self.var_before.get().strip():
+            self.search()
+
     def _selected_row(self) -> Optional[int]:
         sel = self.tree.selection()
         if not sel:
