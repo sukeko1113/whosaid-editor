@@ -2553,8 +2553,58 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, targets = dlg.result
-        self.apply_replacement(before, after, targets,
-                               options=getattr(dlg, "options", {}))
+        options = dict(getattr(dlg, "options", {}) or {})
+        n = self.apply_replacement(before, after, targets, options=options)
+        if n:
+            # 手入力の置換だけ聞く（辞書からの置換は画面側で回っていて、ここに来ない）
+            self._offer_dictionary_entry(before, after, options)
+
+    def _offer_dictionary_entry(self, before: str, after: str,
+                                options: Optional[dict] = None) -> bool:
+        """置換のあとに「この置換を辞書に登録しますか」を聞く（設計書 §3.4）。
+
+        **黙って追加しない。既定は「いいえ」。**一度きりの修正まで辞書に溜まると、
+        辞書自体がノイズになる。登録するときは探した条件も一緒に持たせる
+        （直すときも同じ条件を使う。§2.3）。保存の拒否は必ず人に見せる。
+        戻り値は登録して保存できたか。
+        """
+        opts = dict(options or {})
+        dic = Dictionary.load()
+        # **既に同じ組・同じ条件があるなら聞かない。**「はい」と答えたのに
+        # 二重登録の判定で黙って足されないのは、「黙って追加しない」と同じ沈黙。
+        # 手で打っただけの人に二重に聞く理由も無い
+        if not dic.load_error and dic.has(before, after,
+                                          ignore_case=bool(opts.get("ignore_case")),
+                                          whole_word=bool(opts.get("whole_word"))):
+            self._set_action(f"「{before}」→「{after}」は辞書に登録済みです。")
+            return False
+        if not messagebox.askyesno(
+                "辞書に登録しますか",
+                f"「{before}」→「{after}」を辞書に登録しますか。\n\n"
+                "登録すると、次の転写でも候補として出ます（自動では直しません）。\n"
+                "一度きりの聞き違いなら、登録しないほうが辞書が濁りません。",
+                parent=self, default="no"):
+            return False
+        if dic.load_error:
+            messagebox.showerror(
+                "辞書に登録できません",
+                "辞書ファイルが読めないため、登録できません。\n"
+                "本文の置換は済んでいます。辞書は［語句をまとめて直す...］の"
+                "管理画面から直せます。", parent=self)
+            return False
+        entry = dic.add(before, after, origin=ORIGIN_REPLACE,
+                        ignore_case=bool(opts.get("ignore_case")),
+                        whole_word=bool(opts.get("whole_word")))
+        r: SaveResult = dic.save()
+        if not r.ok:
+            messagebox.showerror(
+                "辞書に登録できません",
+                f"{r.reason}\n\n本文の置換は済んでいます。登録だけが保存されていません。",
+                parent=self)
+            return False
+        self._set_action(f"「{before}」→「{after}」を辞書に登録しました"
+                         f"（項目は {len(dic.entries)} 件）。")
+        return entry is not None
 
     def apply_replacement(self, before: str, after: str, targets: list, *,
                           options: Optional[dict] = None, origin: str = "",

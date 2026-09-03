@@ -180,6 +180,14 @@ class Dictionary:
     def find(self, entry_id: str) -> Optional[Entry]:
         return next((e for e in self.entries if e.id == entry_id), None)
 
+    def has(self, wrong: str, correct: str, *, ignore_case: bool = False,
+            whole_word: bool = False) -> bool:
+        """同じ組・同じ条件が既にあるか（登録済みなら「登録しますか」を出さない）。"""
+        wrong, correct = (wrong or "").strip(), (correct or "").strip()
+        return any((e.wrong, e.correct, e.ignore_case, e.whole_word)
+                   == (wrong, correct, bool(ignore_case), bool(whole_word))
+                   for e in self.entries)
+
     def add(self, wrong: str, correct: str, *, origin: str = ORIGIN_MANUAL,
             note: str = "", ignore_case: bool = False,
             whole_word: bool = False) -> Entry:

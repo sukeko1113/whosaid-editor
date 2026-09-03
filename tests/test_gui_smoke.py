@@ -3982,6 +3982,135 @@ def run_replace_dialog_dictionary() -> int:
     return 0
 
 
+def run_replace_dialog_register() -> int:
+    """**置換のあとに「辞書に登録しますか」を聞く。既定は「いいえ」。黙って追加しない**（§3.4）。
+
+    登録すると探した条件も一緒に持つ。保存の拒否はダイアログで知らせ、
+    ファイルは上書きしない。辞書ファイルは一時フォルダ。
+    """
+    import os
+    from src import dictionary as dm
+    from src import assign_gui as agmod
+
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[置換のあとに辞書へ登録する]")
+    keep = os.environ.get("APPDATA")
+    root = tk.Tk()
+    root.withdraw()
+    asked: list[dict] = []
+    errs: list[tuple] = []
+    answer = {"yes": True}
+    real_yes, real_err = agmod.messagebox.askyesno, agmod.messagebox.showerror
+    agmod.messagebox.askyesno = lambda *a, **k: (asked.append(dict(k)), answer["yes"])[1]
+    agmod.messagebox.showerror = lambda *a, **k: errs.append(a)
+    real_dialog = agmod.ReplaceWordsDialog
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            proj = make_project(Path(d))
+            proj.segments[0].text = "Um, the summary was, um, brief."
+            proj.save()
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)
+            win.update()
+            win.show_current()
+            key0 = proj.find_text("um", ignore_case=True, whole_word=True)[0].key
+
+            def fake(result, options):
+                class _Fake(tk.Toplevel):
+                    def __init__(self, master):
+                        super().__init__(master)
+                        self.result = result
+                        self.options = options
+                        self.after(0, self.destroy)
+                return _Fake
+
+            # --- はい → 条件つきで登録され、ファイルに残る ---
+            agmod.ReplaceWordsDialog = fake(("um", "umm", [(key0, 0)]),
+                                            {"ignore_case": True, "whole_word": True})
+            win.goto(0)
+            win.replace_words()
+            check("置換のあとに聞く", len(asked) == 1)
+            check("既定は「いいえ」", bool(asked) and asked[0].get("default") == "no")
+            dic = dm.Dictionary.load()
+            check("登録されている", [(e.wrong, e.correct) for e in dic.entries] == [("um", "umm")])
+            check("由来は置換から", dic.entries and dic.entries[0].origin == "replace_history")
+            check("探した条件も一緒に持つ",
+                  dic.entries and dic.entries[0].ignore_case and dic.entries[0].whole_word)
+            check("知らせが出る", "辞書に登録しました" in win.var_action.get()
+                  if hasattr(win, "var_action") else True)
+
+            # --- いいえ → 何も足さない ---
+            answer["yes"] = False
+            asked.clear()
+            agmod.ReplaceWordsDialog = fake(("um", "umm", [(key0, 0)]), {"ignore_case": True})
+            win.replace_words()
+            check("いいえなら聞くだけで足さない",
+                  len(asked) == 1 and len(dm.Dictionary.load().entries) == 1)
+
+            # --- 直すところが無ければ聞かない ---
+            asked.clear()
+            agmod.ReplaceWordsDialog = fake(("ここには無い", "x", [(key0, 0)]), {})
+            win.replace_words()
+            check("直すところが無ければ聞かない", asked == [])
+
+            # --- 同じ組・同じ条件が既に辞書にあれば聞かない（沈黙の裏返しを作らない）---
+            answer["yes"] = True
+            asked.clear()
+            proj.segments[0].text = "Um, the summary was, um, brief."     # 戻して同じ置換を再現
+            win.show_current()
+            key0b = proj.find_text("um", ignore_case=True, whole_word=True)[0].key
+            agmod.ReplaceWordsDialog = fake(("um", "umm", [(key0b, 0)]),
+                                            {"ignore_case": True, "whole_word": True})
+            win.replace_words()
+            check("既に登録済みなら聞かない", asked == [])
+            check("登録済みと知らせる", "登録済み" in win.var_action.get()
+                  if hasattr(win, "var_action") else True)
+            check("辞書は増えない", len(dm.Dictionary.load().entries) == 1)
+            # 条件が違えば別の組なので聞く
+            asked.clear()
+            proj.segments[0].text = "Um, the summary was, um, brief."
+            win.show_current()
+            key0c = proj.find_text("um")[0].key
+            agmod.ReplaceWordsDialog = fake(("um", "umm", [(key0c, 0)]), {})
+            win.replace_words()
+            check("条件が違えば別の組として聞く", len(asked) == 1)
+            check("別の組として登録される", len(dm.Dictionary.load().entries) == 2)
+
+            # --- 壊れた辞書 → 登録できない旨のダイアログ。上書きしない ---
+            answer["yes"] = True
+            errs.clear()
+            dm.dictionary_path().write_text("{not json", encoding="utf-8")
+            agmod.ReplaceWordsDialog = fake(("brief", "short", [(key0, 0)]), {})
+            win.replace_words()
+            check("本文の置換は済む", "short" in proj.segments[0].text)
+            check("登録できない旨をダイアログで知らせる",
+                  len(errs) == 1 and "登録できません" in errs[0][0] and "置換は済んでいます" in errs[0][1])
+            check("壊れたファイルを上書きしない",
+                  dm.dictionary_path().read_text(encoding="utf-8") == "{not json")
+            win.destroy()
+    finally:
+        agmod.ReplaceWordsDialog = real_dialog
+        agmod.messagebox.askyesno, agmod.messagebox.showerror = real_yes, real_err
+        root.destroy()
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_no_stale_timers() -> int:
     """**窓を壊したあとに、その窓の after() が残っていないこと。**
 
@@ -4234,7 +4363,8 @@ if __name__ == "__main__":
     rc_nav = run_replace_dialog_navigation()
     rc_opts = run_replace_dialog_options()
     rc_dict = run_replace_dialog_dictionary()
+    rc_reg = run_replace_dialog_register()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
              or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
-             or rc_dict or rc_cfg)
+             or rc_dict or rc_reg or rc_cfg)
