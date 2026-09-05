@@ -3739,6 +3739,53 @@ def run_replace_dialog_options() -> int:
                 dlg._on_option_changed()
                 check("区別しない + 部分一致: 4 件",
                       [h.term for h in dlg.hits] == ["Um", "um", "um", "UM"])
+
+                # --- ×を付けたあとの条件切り替え（設計書 §2.2・§6 の 5）---
+                # 探し直すと marks は全部○に戻る。耳で聴いて付けた×が「直す」に
+                # 反転するので、×があるときだけ確認して、いいえなら何もしない
+                import src.assign_gui as agmod
+                real_ask = agmod.messagebox.askyesno
+                asked: list = []
+                try:
+                    dlg._toggle(1)
+                    dlg._toggle(3)
+                    check("×を 2 件付けた", dlg.marks == [True, False, True, False])
+
+                    # 「いいえ」——○×も探した結果も、条件も動かない
+                    agmod.messagebox.askyesno = (
+                        lambda *a, **k: (asked.append(a), False)[1])
+                    dlg.var_whole.set(True)
+                    dlg._on_option_changed()
+                    check("×があると確認が出る", len(asked) == 1)
+                    check("文面に×の件数が入る", "× 2 件" in asked[0][1])
+                    check("いいえ: ○×が保たれる",
+                          dlg.marks == [True, False, True, False])
+                    check("いいえ: チェックが元に戻る", not dlg.var_whole.get())
+                    check("いいえ: 探し直していない（4 件のまま）",
+                          [h.term for h in dlg.hits] == ["Um", "um", "um", "UM"])
+                    check("いいえ: options も動かない",
+                          dlg.options == {"ignore_case": True})
+
+                    # 「はい」——探し直して、全部○に戻る
+                    agmod.messagebox.askyesno = (
+                        lambda *a, **k: (asked.append(a), True)[1])
+                    dlg.var_whole.set(True)
+                    dlg._on_option_changed()
+                    check("はい: 確認は出た", len(asked) == 2)
+                    check("はい: 探し直す（完全一致で 3 件）",
+                          [h.term for h in dlg.hits] == ["Um", "um", "UM"])
+                    check("はい: ○×は全部○に戻る", dlg.marks == [True, True, True])
+                    check("はい: options が新しい条件",
+                          dlg.options == {"whole_word": True, "ignore_case": True})
+
+                    # ×が 1 つも無ければ聞かない（既定のまま条件を試す邪魔をしない）
+                    dlg.var_nocase.set(False)
+                    dlg._on_option_changed()
+                    check("×が無ければ確認は出ない", len(asked) == 2)
+                    check("×が無ければそのまま探し直す",
+                          [h.term for h in dlg.hits] == ["um"])
+                finally:
+                    agmod.messagebox.askyesno = real_ask
             finally:
                 try:
                     dlg.destroy()

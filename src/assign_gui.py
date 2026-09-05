@@ -4631,7 +4631,7 @@ class ReplaceWordsDialog(tk.Toplevel):
         ttk.Button(top, text="探す", command=self.search).pack(side="left")
         self.ent_before.bind("<Return>", lambda e: self.search())
 
-        # 一致の条件。切り替えたら探し直す（○×は付け直しになる）
+        # 一致の条件。切り替えたら探し直す（○×は全部○に戻る。×があれば確認する）
         opts = ttk.Frame(self)
         opts.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
         self.chk_whole = ttk.Checkbutton(
@@ -4642,9 +4642,9 @@ class ReplaceWordsDialog(tk.Toplevel):
             opts, text="英大文字小文字を区別しない", variable=self.var_nocase,
             command=self._on_option_changed)
         self.chk_nocase.pack(side="left", padx=(10, 0))
-        ttk.Label(opts, foreground="#888",
+        ttk.Label(opts, foreground="#888", wraplength=430,
                   text="※ 完全一致は英語向けです（日本語には語境界が無いので効きません）。"
-                       "切り替えると探し直し、○×は付け直しになります。")\
+                       "切り替えると探し直しになり、付けた × はすべて ○ に戻ります。")\
             .pack(side="left", padx=(10, 0))
 
         cols = ("mark", "at", "text")
@@ -4725,8 +4725,34 @@ class ReplaceWordsDialog(tk.Toplevel):
     # ------------------------------------------------------------------
     def _on_option_changed(self) -> None:
         """条件を切り替えたら、語句が入っていれば探し直す。"""
+        if not self._confirm_option_change():
+            return          # チェックは元に戻した。○×も探した結果もそのまま
         if self.var_before.get().strip():
             self.search()
+
+    def _confirm_option_change(self) -> bool:
+        """×を付けたあとの条件切り替えを、件数を見せて確かめる（設計書 §2.2・§6 の 5）。
+
+        探し直すと marks は全部 True（○）に戻る。つまり、区間へ飛んで耳で
+        聴いて付けた×が、黙って「直す」に反転する。×が 1 つも無ければ
+        失うものは無いので聞かない（既定のまま条件を試す邪魔をしない）。
+
+        「いいえ」ではチェックを直前に探した条件へ戻す。この画面の変数には
+        trace を付けていないため、Checkbutton の command は var.set() では
+        発火せず、ここで再帰しない。**trace を付けるなら二重発火のガードが要る。**
+        """
+        n = sum(1 for m in self.marks if not m)
+        if not n:
+            return True
+        if messagebox.askyesno(
+                "○×を付け直します",
+                f"条件を変えると探し直しになり、いま付けている × {n} 件が"
+                "すべて ○（直す）に戻ります。よろしいですか。",
+                parent=self):
+            return True
+        self.var_whole.set(bool(self.options.get("whole_word")))
+        self.var_nocase.set(bool(self.options.get("ignore_case")))
+        return False
 
     def _selected_row(self) -> Optional[int]:
         sel = self.tree.selection()
