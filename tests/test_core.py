@@ -3201,6 +3201,218 @@ def test_replace_text_does_nothing_without_a_target():
     assert not [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
 
 
+def _for_match() -> Project:
+    """一致条件の検査用。英語のフィラーと、日本語の同一区間 2 回出現。"""
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [
+        Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                text="Um, the summary was, um, brief. UM okay"),
+        Segment(index=1, start=10.0, end=20.0, cluster="g:B",
+                text="同層会ですね同層会があのー"),
+    ]
+    return proj
+
+
+def test_whole_word_does_not_match_inside_another_word():
+    """**完全一致で `um` が `summary` に当たらない。**
+
+    `count_terms()` の部分一致が `um` を `summary` に数えた件と同根
+    （設計書 §2.3）。完全一致の定義は「語句の前後が半角英数字でない」。
+    日本語には語境界が無いので、日本語では部分一致と同じ結果になる。
+    """
+    proj = _for_match()
+    partial = proj.find_text("um")
+    assert [h.before + "【" + h.term + "】" for h in partial] == \
+        ["Um, the s【um】", "Um, the summary was, 【um】"], partial
+    whole = proj.find_text("um", whole_word=True)
+    assert [(h.before, h.term) for h in whole] == [("Um, the summary was, ", "um")], whole
+    # 日本語: 完全一致でも部分一致と同じ
+    assert len(proj.find_text("同層会", whole_word=True)) == 2
+    assert len(proj.find_text("同層会")) == 2
+
+
+def test_ignore_case_matches_both_spellings_and_reports_the_real_one():
+    """**区別しないとき `Um` と `um` と `UM` に当たり、一覧の綴りは本文のもの。**"""
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in hits] == ["Um", "um", "UM"], hits
+    assert [h.nth for h in hits] == [0, 1, 2]
+    # 部分一致 + 区別しない → summary の中も当たる
+    hits = proj.find_text("um", ignore_case=True)
+    assert [h.term for h in hits] == ["Um", "um", "um", "UM"], hits
+
+
+def test_find_and_replace_agree_when_given_the_same_options():
+    """**探すときと直すときで同じ照合を使う。**片方にしか効かないとずれる。
+
+    「区別しない・完全一致」で 3 件出し、真ん中（"um"）だけ直す。
+    同じオプションで直せば、その 1 件だけが変わる。
+    """
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    n = proj.replace_text("um", "[filler]", [hits[1].target],
+                          ignore_case=True, whole_word=True)
+    assert n == 1
+    assert proj.segments[0].text == "Um, the summary was, [filler], brief. UM okay"
+    # **直したあとの指定は古い。**「何番目」は直す前の本文で数えたもので、
+    # 直すと番号がずれる。古い指定は当たらない（0 件）ので、探し直してから直す。
+    # 画面は全部を 1 回で適用するのでこの形にはならないが、規則として縛る
+    assert proj.replace_text("um", "[filler]", [hits[2].target],
+                             ignore_case=True, whole_word=True) == 0
+    again = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in again] == ["Um", "UM"]
+    # 綴りが違う箇所を直すと、本文の綴りではなく置換語になる
+    n = proj.replace_text("um", "[filler]", [again[1].target],
+                          ignore_case=True, whole_word=True)
+    assert n == 1
+    assert proj.segments[0].text == "Um, the summary was, [filler], brief. [filler] okay"
+    # オプションを付けずに直すと "UM" には当たらない（数え方が違うので指せない）
+    proj2 = _for_match()
+    hits2 = proj2.find_text("um", ignore_case=True, whole_word=True)
+    assert proj2.replace_text("um", "[filler]", [hits2[2].target]) == 0, \
+        "オプション無しで UM が直ってしまった（照合がずれている）"
+
+
+def test_replace_text_fixes_three_hits_in_one_segment_even_if_after_contains_before():
+    """**同じ区間に 3 件以上ヒットして全部○でも、3 件とも正しく直る。**
+
+    1 件目を直すと残りの番号が繰り上がる、という形の事故を防ぐ。実装は
+    直す前の本文で位置を 1 回だけ列挙し、切り貼りで新しい本文を作る
+    （直しながら数え直さない）ので、置換後が検索語を含んでも（「田中」→
+    「田中村」）、大文字小文字を無視しても、番号はずれない。
+    その構造を、レビューで指摘された形のまま縛る（2026-09-03）。
+    """
+    # 日本語: 置換後が検索語を含む
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="田中と田中と田中が来た")]
+    hits = proj.find_text("田中")
+    assert [h.nth for h in hits] == [0, 1, 2]
+    assert proj.replace_text("田中", "田中村", [h.target for h in hits]) == 3
+    assert proj.segments[0].text == "田中村と田中村と田中村が来た"
+    # 直したあとに探せば、置換後の中の「田中」が 3 件見える（無限に増えない）
+    assert len(proj.find_text("田中")) == 3
+
+    # 一部だけ（1 件目と 3 件目）: 真ん中は元の綴りのまま
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="田中と田中と田中が来た")]
+    hits = proj.find_text("田中")
+    assert proj.replace_text("田中", "田中村", [hits[0].target, hits[2].target]) == 2
+    assert proj.segments[0].text == "田中村と田中と田中村が来た"
+
+    # 英語: 大文字小文字を無視 + 完全一致 + 置換後が検索語を含む（um → umm）
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="Um, um, UM, summary")]
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    assert [h.term for h in hits] == ["Um", "um", "UM"]
+    assert proj.replace_text("um", "umm", [h.target for h in hits],
+                             ignore_case=True, whole_word=True) == 3
+    assert proj.segments[0].text == "umm, umm, umm, summary"
+
+
+def test_replace_text_records_the_options_it_used():
+    """**何を根拠に当てたかを記録に残す。**既定のときは載せない（記録を増やさない）。"""
+    proj = _for_match()
+    hits = proj.find_text("um", ignore_case=True, whole_word=True)
+    proj.replace_text("um", "[filler]", [h.target for h in hits],
+                      ignore_case=True, whole_word=True)
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert rec.get("ignore_case") is True and rec.get("whole_word") is True
+    assert rec["count"] == 3
+    proj = _for_replace()
+    proj.replace_text("同層会", "同窓会", [h.target for h in proj.find_text("同層会")])
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert "ignore_case" not in rec and "whole_word" not in rec
+
+
+def test_restore_texts_undoes_a_replacement_but_keeps_later_hand_edits():
+    """**置換を 1 段戻す。適用後に手で直した区間は戻さない。**（設計書 §2.5）
+
+    区間の鍵で指す（番号は分割・結合で振り直る）。戻したことも記録に残す。
+    text_edited は直す前の値に戻る（機械の出力に戻ったなら False）。
+    """
+    proj = _for_replace()
+    assert proj.segments[2].text_edited is False, "前提: 機械の出力のまま"
+    hits = proj.find_text("同層会")
+    held = [(segment_key(s), s.text, s.text_edited) for s in proj.segments
+            if segment_key(s) in {h.key for h in hits}]
+    assert proj.replace_text("同層会", "同窓会", [h.target for h in hits]) == 2
+    items = [(k, old, ed, next(s.text for s in proj.segments if segment_key(s) == k))
+             for k, old, ed in held]
+
+    # --- 戻す ---
+    restored, skipped = proj.restore_texts(items)
+    assert (restored, skipped) == (1, 0)
+    assert proj.segments[2].text == "同層会ですね同層会があのー"
+    assert proj.segments[2].text_edited is False, "機械の出力に戻ったのに印が残っている"
+    recs = [r for r in proj.edit_log if r.get("op") == "replace_text_undo"]
+    assert len(recs) == 1 and recs[0]["count"] == 1 and recs[0]["skipped"] == 0
+    assert "replace_text_undo" in LOG_LABELS, "検証要約に op 名のまま出てしまう"
+    # 直した記録は消えない（「直して、戻した」が両方残る）
+    assert [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"]
+
+    # --- 適用後に手で直した区間は戻さない ---
+    proj = _for_replace()
+    hits = proj.find_text("資格")
+    held = [(segment_key(s), s.text, s.text_edited) for s in proj.segments
+            if segment_key(s) in {h.key for h in hits}]
+    proj.replace_text("資格", "私学", [h.target for h in hits])
+    items = [(k, old, ed, next(s.text for s in proj.segments if segment_key(s) == k))
+             for k, old, ed in held]
+    proj.edit_text(1, "県は私学のことですからと言うだけで（追記）")   # 手で直す
+    restored, skipped = proj.restore_texts(items)
+    assert (restored, skipped) == (1, 1)
+    assert proj.segments[0].text.endswith("防災士の資格も取ってらっしゃって")
+    assert proj.segments[1].text == "県は私学のことですからと言うだけで（追記）", \
+        "手直しが古い本文で消された"
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_undo"][-1]
+    assert rec["count"] == 1 and rec["skipped"] == 1
+
+    # --- 2 回目は何も起きない（記録も増えない）---
+    n_before = len(proj.edit_log)
+    assert proj.restore_texts(items) == (0, 1)
+    assert len(proj.edit_log) == n_before
+
+
+def test_restore_texts_does_not_touch_segments_split_or_merged_after_the_replacement():
+    """**適用のあとに分割・結合した区間は、戻さない。**
+
+    控えは鍵（orig_start, start）で指すので番号のずれは起きないが、分割で
+    前半は本文が短くなり、結合で本文はつながる。どちらも「直した後の本文と
+    今の本文が違う」ので、手直しされた区間と同じ扱いで戻さない。
+    意図して作った判定ではないが、その判定で守られていることを縛っておく
+    （レビューの指摘、2026-09-03）。
+    """
+    def _prepared():
+        proj = _for_replace()
+        hits = proj.find_text("同層会")
+        held = [(segment_key(s), s.text, s.text_edited) for s in proj.segments
+                if segment_key(s) in {h.key for h in hits}]
+        assert proj.replace_text("同層会", "同窓会", [h.target for h in hits]) == 2
+        items = [(k, old, ed,
+                  next(s.text for s in proj.segments if segment_key(s) == k))
+                 for k, old, ed in held]
+        return proj, items
+
+    # --- 分割してから戻す: 前半は鍵が同じだが本文が短い → 戻さない ---
+    proj, items = _prepared()
+    head, tail = proj.split_segment(2, 35.0, len("同窓会ですね"))
+    assert head.text == "同窓会ですね" and tail.text == "同窓会があのー"
+    assert proj.restore_texts(items) == (0, 1), "分割した区間を戻してしまった"
+    assert head.text == "同窓会ですね" and tail.text == "同窓会があのー"
+
+    # --- 結合してから戻す: 本文がつながっている → 戻さない ---
+    proj, items = _prepared()
+    merged = proj.merge_segments(1)          # 区間 1 と 2 をまとめる
+    assert "同窓会" in merged.text and "資格" in merged.text
+    text_before = merged.text
+    restored, skipped = proj.restore_texts(items)
+    assert restored == 0, "結合した区間を戻してしまった"
+    assert merged.text == text_before
+
+
 def _for_leave() -> Project:
     """途中退席の形。32:17 に本人が「中座します」と言って帰る。"""
     proj = Project(audio_path="a.m4a", duration=4000.0)

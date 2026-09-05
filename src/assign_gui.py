@@ -672,6 +672,9 @@ class AssignWindow(tk.Toplevel):
         # 直前の「まとめて適用」を丸ごと戻すための控え(時刻専用。話者の
         # _undo とは別系統 — あちらは時刻を持たない)
         self._time_undo: Optional[dict] = None
+        # 直前の「語句をまとめて直す」を丸ごと戻すための控え（本文専用。
+        # 本文の変更には Ctrl+Z も[元に戻す]も効かない。設計書 §2.5）
+        self._text_undo: Optional[dict] = None
         self._candidates: list = []
         self._cand_widgets: list[ttk.Button] = []
         self._row_ids: list[str] = []
@@ -1154,6 +1157,12 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(bottom, text="残作業を一覧...", command=self.show_remaining).pack(side="left", padx=6)
         ttk.Button(bottom, text="語句をまとめて直す...",
                    command=self.replace_words).pack(side="left", padx=(0, 6))
+        # 本文の変更には Ctrl+Z も[元に戻す]も効かないので、置換だけ 1 段戻せる
+        # 手段を隣に置く（設計書 §2.5）
+        self.btn_undo_words = ttk.Button(bottom, text="直した語句を戻す",
+                                         command=self.undo_replace_words,
+                                         state="disabled")
+        self.btn_undo_words.pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="話者をまとめて置き換える...",
                    command=self.replace_speaker).pack(side="left", padx=(0, 6))
         ttk.Button(bottom, text="このまとまりを未確定に戻す", command=self.unassign_cluster)\
@@ -1813,6 +1822,26 @@ class AssignWindow(tk.Toplevel):
         self.show_current()
         if self.var_autoplay.get():
             self.play_current()
+
+    def goto_key(self, key: tuple[float, float]) -> Optional[int]:
+        """区間の鍵（segment_key）で指した区間へ飛ぶ。飛べたら区間番号。
+
+        語句をまとめて直す画面（ReplaceWordsDialog）が、ヒットの行を選んだ
+        ときに呼ぶ。**番号ではなく鍵で指す**——番号は分割・結合で振り直る。
+        絞り込みで隠れていれば「すべて表示」に戻してから飛ぶ（jump_to_time
+        と同じ）。飛んだあと再生するかは「移動したら自動再生」に従う（goto）。
+        """
+        want = (round(float(key[0]), 3), round(float(key[1]), 3))
+        seg = next((s for s in self.proj.segments if segment_key(s) == want), None)
+        if seg is None:
+            return None
+        if seg.index not in self._visible_indexes():
+            self.var_filter.set(FILTER_ALL)
+            self.var_listen_order.set(False)
+            self.reload_tree()
+            self._set_action("絞り込みを「すべて表示」に戻して飛びました。")
+        self.goto(seg.index)
+        return seg.index
 
     def jump_to_time(self) -> None:
         """入力された時刻に一番近い区間へ飛ぶ。
@@ -2521,20 +2550,66 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, targets = dlg.result
-        n = self.proj.replace_text(before, after, targets)
+        # **直す前の本文を、区間の鍵で控える**（設計書 §2.5）。番号は分割・
+        # 結合で振り直るので鍵で持つ。適用の直前に取り、適用後の本文と組にする
+        wanted = {(round(float(k[0]), 3), round(float(k[1]), 3)) for k, _ in targets}
+        held = [(segment_key(s), s.text or "", bool(s.text_edited))
+                for s in self.proj.segments if segment_key(s) in wanted]
+        # 探したときと同じ一致の条件で直す（§2.3。ずれると別の箇所が直る）
+        n = self.proj.replace_text(before, after, targets,
+                                   **getattr(dlg, "options", {}))
         if not n:
             self._set_action("直すところがありませんでした"
                              "(本文が変わっていた可能性があります)。")
             return
+        now = {segment_key(s): (s.text or "") for s in self.proj.segments}
+        self._text_undo = {
+            "before": before, "after": after,
+            "items": [(key, old, edited, now[key])
+                      for key, old, edited in held
+                      if key in now and now[key] != old],
+        }
         self._dirty = True
         self.suggester.refresh()
         self.reload_tree()
         self.show_current()
         self.update_status()
+        self._sync_text_undo_button()
         self._set_action(
             f"「{before}」を「{after}」に {n} 箇所直しました。"
             "編集の履歴には 1 件として残ります。"
-            "「聴いて確定」の印は付いていません。")
+            "「聴いて確定」の印は付いていません。"
+            "［直した語句を戻す］で元に戻せます（次に直すまで）。")
+
+    def undo_replace_words(self) -> None:
+        """直前の「語句をまとめて直す」を丸ごと元に戻す（1 段だけ）。
+
+        **適用後に手で直した区間は戻さない**（restore_texts）。戻さなかった
+        ことは知らせる。戻したことも履歴に残る（記録を消さず、足す）。
+        """
+        snap = self._text_undo
+        if not snap:
+            self._set_action("戻せる置換がありません。")
+            return
+        self._commit_text()
+        restored, skipped = self.proj.restore_texts(snap["items"])
+        self._text_undo = None
+        self._sync_text_undo_button()
+        if restored:
+            self._dirty = True
+            self.suggester.refresh()
+            self.reload_tree()
+            self.show_current()
+            self.update_status()
+        msg = (f"「{snap['before']}」→「{snap['after']}」の置換を"
+               f" {restored} 区間で元に戻しました。")
+        if skipped:
+            msg += (f" 置換のあとに手で直した {skipped} 区間は、"
+                    "手直しを消さないよう戻していません。")
+        self._set_action(msg)
+
+    def _sync_text_undo_button(self) -> None:
+        self.btn_undo_words.state(["!disabled"] if self._text_undo else ["disabled"])
 
     def replace_speaker(self) -> None:
         """途中退席した人の発言を、まとめて別の人に付け替える。
@@ -4518,6 +4593,14 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.var_before = tk.StringVar()
         self.var_after = tk.StringVar()
         self.var_status = tk.StringVar(value="直す前の語句を入れて［探す］。")
+        # 「n / N」。行を選ぶたびに更新する（設計書 §2.2）
+        self.var_pos = tk.StringVar(value="")
+        # 一致の条件（設計書 §2.2・§2.3）。**探すときと直すときで同じ値を使う**
+        # ——search() が self.options に写し、呼び出し側が replace_text に渡す。
+        # 既定は部分一致・区別する（日本語には語境界が無く、実物の str.find と同じ）
+        self.var_whole = tk.BooleanVar(value=False)
+        self.var_nocase = tk.BooleanVar(value=False)
+        self.options: dict[str, bool] = {}
         self._build()
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -4527,7 +4610,7 @@ class ReplaceWordsDialog(tk.Toplevel):
     # ------------------------------------------------------------------
     def _build(self) -> None:
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(2, weight=1)
+        self.rowconfigure(3, weight=1)      # 行: 0 説明 / 1 入力 / 2 条件 / 3 一覧 / 4 状態 / 5 ボタン
 
         ttk.Label(
             self, wraplength=720,
@@ -4548,6 +4631,22 @@ class ReplaceWordsDialog(tk.Toplevel):
         ttk.Button(top, text="探す", command=self.search).pack(side="left")
         self.ent_before.bind("<Return>", lambda e: self.search())
 
+        # 一致の条件。切り替えたら探し直す（○×は全部○に戻る。×があれば確認する）
+        opts = ttk.Frame(self)
+        opts.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 0))
+        self.chk_whole = ttk.Checkbutton(
+            opts, text="完全一致（前後が英数字でない）", variable=self.var_whole,
+            command=self._on_option_changed)
+        self.chk_whole.pack(side="left")
+        self.chk_nocase = ttk.Checkbutton(
+            opts, text="英大文字小文字を区別しない", variable=self.var_nocase,
+            command=self._on_option_changed)
+        self.chk_nocase.pack(side="left", padx=(10, 0))
+        ttk.Label(opts, foreground="#888", wraplength=430,
+                  text="※ 完全一致は英語向けです（日本語には語境界が無いので効きません）。"
+                       "切り替えると探し直しになり、付けた × はすべて ○ に戻ります。")\
+            .pack(side="left", padx=(10, 0))
+
         cols = ("mark", "at", "text")
         self.tree = ttk.Treeview(self, columns=cols, show="headings",
                                  height=12, selectmode="browse")
@@ -4557,24 +4656,34 @@ class ReplaceWordsDialog(tk.Toplevel):
                 ("text", "前後", 620, "w")):
             self.tree.heading(key, text=label)
             self.tree.column(key, width=width, anchor=anchor)
-        self.tree.grid(row=2, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
+        self.tree.grid(row=3, column=0, sticky="nsew", padx=(12, 0), pady=(8, 0))
         sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        sb.grid(row=2, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
+        sb.grid(row=3, column=1, sticky="ns", padx=(0, 12), pady=(8, 0))
         self.tree.configure(yscrollcommand=sb.set)
         # クリックでも Space でも切り替えられるように(片方だけだと迷う)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<space>", lambda e: (self._toggle_selected(), "break"))
+        # **行を選ぶと本体がその区間に飛ぶ**（設計書 §2.2）。ここで音声を
+        # 聴けるのが、Word の検索置換には無いこの画面の値打ち。↓↑ は
+        # Treeview がそのまま動かし、Enter は次の行へ
+        self.tree.bind("<<TreeviewSelect>>", self._on_row_selected)
+        self.tree.bind("<Return>", lambda e: (self._move_row(1), "break"))
 
         ttk.Label(self, textvariable=self.var_status, foreground="#666",
                   wraplength=720)\
-            .grid(row=3, column=0, sticky="w", padx=12, pady=(6, 0))
+            .grid(row=4, column=0, sticky="w", padx=12, pady=(6, 0))
 
         btns = ttk.Frame(self)
-        btns.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
+        btns.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=10)
         ttk.Button(btns, text="全部に○", command=lambda: self._mark_all(True))\
             .pack(side="left")
         ttk.Button(btns, text="全部に×", command=lambda: self._mark_all(False))\
             .pack(side="left", padx=6)
+        self.btn_listen = ttk.Button(btns, text="▶ 聴く", command=self.listen,
+                                     state="disabled")
+        self.btn_listen.pack(side="left", padx=(12, 0))
+        ttk.Label(btns, textvariable=self.var_pos, foreground="#666")\
+            .pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="やめる", command=self._close).pack(side="right")
         self.btn_ok = ttk.Button(btns, text="直す", command=self._ok,
                                  state="disabled")
@@ -4589,7 +4698,14 @@ class ReplaceWordsDialog(tk.Toplevel):
             self.var_status.set("直す前の語句を入れてください。")
             self._refresh_ok()
             return
-        self.hits = self.win.proj.find_text(term)
+        # **直すときにも同じ値を渡す**（呼び出し側が self.options を使う）。
+        # 片方にしか効かないと、一覧に出た箇所と直る箇所がずれる（§2.3）
+        self.options = {}
+        if self.var_nocase.get():
+            self.options["ignore_case"] = True
+        if self.var_whole.get():
+            self.options["whole_word"] = True
+        self.hits = self.win.proj.find_text(term, **self.options)
         self.marks = [True] * len(self.hits)
         for i, h in enumerate(self.hits):
             self.tree.insert("", "end", iid=str(i), values=(
@@ -4597,6 +4713,90 @@ class ReplaceWordsDialog(tk.Toplevel):
         if not self.hits:
             self.var_status.set(f"「{term}」は本文にありません。")
         self._refresh_ok()
+        self._update_pos()
+        if self.hits:
+            # 最初のヒットを選ぶ → 本体がその区間へ飛ぶ（自動再生の設定に従う）
+            self.tree.selection_set("0")
+            self.tree.focus("0")
+            self.tree.focus_set()
+
+    # ------------------------------------------------------------------
+    # 行の選択 → 本体をその区間へ（設計書 §2.2）
+    # ------------------------------------------------------------------
+    def _on_option_changed(self) -> None:
+        """条件を切り替えたら、語句が入っていれば探し直す。"""
+        if not self._confirm_option_change():
+            return          # チェックは元に戻した。○×も探した結果もそのまま
+        if self.var_before.get().strip():
+            self.search()
+
+    def _confirm_option_change(self) -> bool:
+        """×を付けたあとの条件切り替えを、件数を見せて確かめる（設計書 §2.2・§6 の 5）。
+
+        探し直すと marks は全部 True（○）に戻る。つまり、区間へ飛んで耳で
+        聴いて付けた×が、黙って「直す」に反転する。×が 1 つも無ければ
+        失うものは無いので聞かない（既定のまま条件を試す邪魔をしない）。
+
+        「いいえ」ではチェックを直前に探した条件へ戻す。この画面の変数には
+        trace を付けていないため、Checkbutton の command は var.set() では
+        発火せず、ここで再帰しない。**trace を付けるなら二重発火のガードが要る。**
+        """
+        n = sum(1 for m in self.marks if not m)
+        if not n:
+            return True
+        if messagebox.askyesno(
+                "○×を付け直します",
+                f"条件を変えると探し直しになり、いま付けている × {n} 件が"
+                "すべて ○（直す）に戻ります。よろしいですか。",
+                parent=self):
+            return True
+        self.var_whole.set(bool(self.options.get("whole_word")))
+        self.var_nocase.set(bool(self.options.get("ignore_case")))
+        return False
+
+    def _selected_row(self) -> Optional[int]:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        try:
+            i = int(sel[0])
+        except ValueError:
+            return None
+        return i if 0 <= i < len(self.hits) else None
+
+    def _update_pos(self) -> None:
+        i = self._selected_row()
+        n = len(self.hits)
+        self.var_pos.set(f"{(i + 1) if i is not None else 0} / {n}")
+        self.btn_listen.configure(state="normal" if i is not None else "disabled")
+
+    def _on_row_selected(self, event=None) -> None:
+        """選んだ行の区間へ本体を飛ばす。○×の付け替えは本文を変えない。"""
+        self._update_pos()
+        i = self._selected_row()
+        if i is None:
+            return
+        self.win.goto_key(self.hits[i].key)
+
+    def _move_row(self, delta: int) -> None:
+        """Enter で次の行へ（↓↑ は Treeview に任せる）。"""
+        if not self.hits:
+            return
+        i = self._selected_row()
+        j = 0 if i is None else max(0, min(i + delta, len(self.hits) - 1))
+        self.tree.selection_set(str(j))
+        self.tree.focus(str(j))
+        self.tree.see(str(j))
+
+    def listen(self) -> None:
+        """選んでいる行の区間を鳴らす。自動再生が切れていても、押せば鳴る。"""
+        i = self._selected_row()
+        if i is None:
+            return
+        if self.win.goto_key(self.hits[i].key) is None:
+            self.var_status.set("その区間が見つかりません（本文が変わった可能性があります）。")
+            return
+        self.win.play_current(explicit=True)
 
     def _line(self, hit) -> str:
         return ("…" if hit.head else "") + hit.before \
