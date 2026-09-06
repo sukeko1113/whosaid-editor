@@ -3896,6 +3896,11 @@ def run_replace_dialog_dictionary() -> int:
                       and dlg.var_after.get() == "田仲")
                 check("開いた時点で探している（3 件）", len(dlg.hits) == 3)
                 check("メモが見える", "総務の田仲さん" in dlg.var_dict.get())
+                # 「あと N」は**いま開いている項目を含まない**（実機 2026-09-06）。
+                # 含めると「残り 1 項目」と出たあとに進む先が無い
+                check("「あと N 項目」は開いている項目を含まない（3 項目のうち あと 2）",
+                      "あと 2 項目" in dlg.var_dict.get()
+                      and len(dlg._entries_ahead()) == 2)
                 texts = [s.text for s in proj.segments]
                 check("開いただけでは本文が変わらない（自動適用しない）",
                       [s.text for s in proj.segments] == texts)
@@ -3924,12 +3929,26 @@ def run_replace_dialog_dictionary() -> int:
                 check("残りが全部直る", proj.segments[0].text == "田那可と田仲と田那可が来た")
                 check("0 件になった項目は飛ばして、次の項目（資格）へ",
                       dlg._dict_entry is not None and dlg._dict_entry.id == e3.id)
+                check("最後の項目では「これで最後」と出る",
+                      "これで最後" in dlg.var_dict.get()
+                      and dlg._entries_ahead() == [])
 
                 # 「次の項目へ」で飛ばす（適用しない）→ もう無い
                 dlg.next_entry()
                 dlg.update()
-                check("最後の項目の次は「もうありません」",
-                      dlg._dict_entry is None and "もうありません" in dlg.var_status.get())
+                check("ひととおり回り終えたことは辞書の行に出る",
+                      dlg._dict_entry is None
+                      and "ひととおり回りました" in dlg.var_dict.get()
+                      and "1 項目に候補が残っています" in dlg.var_dict.get())
+                # **同じ画面の上下で食い違わせない**（実機 2026-09-06 の指摘）。
+                # 辞書全体の話は辞書の行だけに書き、状態行は一覧の話に戻す
+                check("辞書の行が開いた直後の文言に戻らない",
+                      "項目に候補があります" not in dlg.var_dict.get())
+                check("状態行に辞書の話を書かない",
+                      "辞書" not in dlg.var_status.get()
+                      and "箇所を直します" in dlg.var_status.get())
+                check("もう一度回れる（「辞書から探す」は押せる）",
+                      not dlg.btn_dict.instate(["disabled"]))
                 check("本文に無い項目は一度も開かれない", True)   # e_none は候補に無い（上で数が 3）
 
                 # 語句を人が変えたら、辞書の項目ではなくなる（集計を誤って付けない）

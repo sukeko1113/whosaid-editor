@@ -4693,6 +4693,7 @@ class ReplaceWordsDialog(tk.Toplevel):
         self.dic = Dictionary.load()
         self._fp = str(self.win.proj.audio_fingerprint or "")
         self._dict_entry = None             # いま開いている辞書の項目（無ければ手入力）
+        self._round_done = False            # 項目をひととおり回り終えたか（文言用）
         self.var_dict = tk.StringVar(value="")
         self._build()
         self._refresh_dict_row()
@@ -5002,17 +5003,27 @@ class ReplaceWordsDialog(tk.Toplevel):
             self.btn_dict.state(["disabled"])
             self.btn_dict_next.state(["disabled"])
             return
-        n = len(entries_with_candidates(self.win.proj, self.dic, self._fp))
         if self._dict_entry is None:
-            self.var_dict.set(f"辞書の {n} 項目に候補があります。" if n
-                              else "辞書の項目は、いまの本文には出てきません。")
+            n = len(entries_with_candidates(self.win.proj, self.dic, self._fp))
+            if self._round_done and n:
+                # ひととおり回ったあと。**開いた直後と同じ文言に戻さない**——
+                # ×で送った項目は候補が残るので、まだ手つかずに読める（実機
+                # 2026-09-06。状態行の「もうありません」と並んで矛盾に見えた）
+                self.var_dict.set("辞書をひととおり回りました。"
+                                  f"{n} 項目に候補が残っています。")
+            else:
+                self.var_dict.set(f"辞書の {n} 項目に候補があります。" if n
+                                  else "辞書の項目は、いまの本文には出てきません。")
             self.btn_dict.state(["!disabled"] if n else ["disabled"])
             self.btn_dict_next.state(["disabled"])
             return
         e = self._dict_entry
         note = f"（{e.note}）" if e.note else ""
+        # **いま開いている項目は数に入れない。**入れると「残り 1 項目」と出た
+        # あとに進む先が無い（実機 2026-09-06 の指摘）
+        ahead = len(self._entries_ahead())
         self.var_dict.set(f"辞書の項目: 「{e.wrong}」→「{e.correct}」{note}"
-                          f"　残り {n} 項目に候補")
+                          + (f"　あと {ahead} 項目に候補" if ahead else "　これで最後"))
         self.btn_dict.state(["disabled"])
         self.btn_dict_next.state(["!disabled"])
 
@@ -5021,36 +5032,47 @@ class ReplaceWordsDialog(tk.Toplevel):
         self._dict_entry = None
         self.next_entry()
 
+    def _entries_ahead(self) -> list:
+        """「次の項目へ」で**これから回る**項目（いま開いている分は入れない）。
+
+        画面の「あと N 項目」と、実際に進む先を**同じ規則から出す**ための一本化。
+        別々に書くと数と動きが離れていく——実機（2026-09-06）で「残り 1 項目」と
+        出たあとに進む先が無かったのがそれ。
+        """
+        remaining = entries_with_candidates(self.win.proj, self.dic, self._fp)
+        cur = self._dict_entry
+        if cur is None:
+            return remaining
+        ids = [e.id for e in remaining]
+        if cur.id in ids:
+            return remaining[ids.index(cur.id) + 1:]
+        # いまの項目はもう出ない（全部直した）。並びで次に来るものへ。
+        # 後ろに無ければ先頭へ回る（前に置いた項目を取りこぼさない）
+        return [e for e in remaining
+                if e.wrong >= cur.wrong and e.id != cur.id] or remaining
+
     def next_entry(self) -> None:
         """次の項目へ。**進む先がいま 0 件なら飛ばす**（取り直してから選ぶ）。
 
         先の項目で全部○にして直すと、同じ誤変換の次の項目は空になる。
         空の項目を開かせない——entries_with_candidates はいま出る項目だけを返す。
         """
-        remaining = entries_with_candidates(self.win.proj, self.dic, self._fp)
-        cur = self._dict_entry
-        nxt = None
-        if cur is not None:
-            ids = [e.id for e in remaining]
-            if cur.id in ids:
-                after_cur = remaining[ids.index(cur.id) + 1:]
-                nxt = after_cur[0] if after_cur else None
-            else:
-                # いまの項目はもう出ない（全部直した）。並びで次に来るものへ
-                nxt = next((e for e in remaining if e.wrong >= cur.wrong and e.id != cur.id),
-                           remaining[0] if remaining else None)
-        else:
-            nxt = remaining[0] if remaining else None
-        if nxt is None:
+        ahead = self._entries_ahead()
+        if not ahead:
+            # ひととおり回り終えた。**辞書の話は辞書の行だけに書く。**状態行は
+            # 一覧の話に戻す——両方に書くと「もうありません」と「N 項目に候補が
+            # あります」が同じ画面に並ぶ（実機 2026-09-06 の指摘）
             self._dict_entry = None
+            self._round_done = True
             self._refresh_dict_row()
-            self.var_status.set("辞書の候補はもうありません。")
+            self._refresh_ok()
             return
-        self._open_entry(nxt)
+        self._open_entry(ahead[0])
 
     def _open_entry(self, entry) -> None:
         """項目を開く＝その語で**いま**探す。○×は人が付ける（自動適用しない）。"""
         self._dict_entry = entry
+        self._round_done = False
         self.var_before.set(entry.wrong)
         self.var_after.set(entry.correct)
         self.var_whole.set(bool(entry.whole_word))
