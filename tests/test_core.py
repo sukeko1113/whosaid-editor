@@ -3413,6 +3413,218 @@ def test_restore_texts_does_not_touch_segments_split_or_merged_after_the_replace
     assert merged.text == text_before
 
 
+def test_dictionary_persists_entries_and_never_applies_anything():
+    """**辞書はデータの置き場であって、適用エンジンではない**（設計書 §3.2）。
+
+    追加・無効化・削除・永続化。二重登録しない。空でも壊れていても落ちない。
+    壊れたファイルは上書きしない（人名の蓄えを黙って消さない）。
+    音声ごとの無効化は辞書ファイル側に指紋で持つ（作業ファイルのスキーマは変えない）。
+    """
+    import os
+    import tempfile
+    from src import dictionary as dm
+
+    keep = os.environ.get("APPDATA")
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["APPDATA"] = d
+            # --- 無ければ空。落ちない ---
+            dic = dm.Dictionary.load()
+            assert dic.entries == [] and dic.load_error == ""
+            assert dic.active_entries("fp-1") == []
+            assert dic.path == dm.dictionary_path()
+            assert not dm.dictionary_path().exists(), "読んだだけで作らない"
+
+            # --- 追加・二重登録しない・検証 ---
+            e1 = dic.add("吉田", "吉沢", origin=dm.ORIGIN_REPLACE, note="理事長")
+            e2 = dic.add("吉田", "吉沢")                    # 同じ語・同じ条件
+            assert e1 is e2 and len(dic.entries) == 1, "二重登録した"
+            e3 = dic.add("吉田", "吉沢", ignore_case=True)  # 条件が違えば別項目
+            assert e3 is not e1 and len(dic.entries) == 2
+            assert e3.options == {"ignore_case": True} and e1.options == {}
+            for bad in (("", "吉沢"), ("吉田", "吉田"), ("  ", "x")):
+                try:
+                    dic.add(*bad)
+                    assert False, f"通ってしまった: {bad}"
+                except ValueError:
+                    pass
+            assert e1.id and e1.id != e3.id and e1.added_at and e1.origin == "replace_history"
+
+            # --- 永続化（往復で同じ）---
+            dic.set_enabled(e3.id, False)
+            dic.set_disabled_for("fp-A", True)
+            dic.record_outcome(e1.id, applied=3, rejected=1)
+            dic.save()
+            back = dm.Dictionary.load()
+            assert [(e.wrong, e.correct, e.enabled, e.note, e.ignore_case, e.applied, e.rejected)
+                    for e in back.entries] == [
+                ("吉田", "吉沢", True, "理事長", False, 3, 1),
+                ("吉田", "吉沢", False, "", True, 0, 0)]
+            assert back.find(e1.id) is not None and back.find(e1.id).precision == 0.75
+            assert back.find(e3.id).precision is None
+            assert back.is_disabled_for("fp-A") and not back.is_disabled_for("fp-B")
+
+            # --- 無効化した項目・切った音声では候補にならない ---
+            assert [e.id for e in back.active_entries("fp-B")] == [e1.id]
+            assert back.active_entries("fp-A") == []
+            back.set_disabled_for("fp-A", False)
+            assert [e.id for e in back.active_entries("fp-A")] == [e1.id]
+
+            # --- 削除 ---
+            assert back.remove(e3.id) and not back.remove(e3.id)
+            back.save()
+            assert len(dm.Dictionary.load().entries) == 1
+
+            # --- 壊れたファイル: 落ちず、空で、上書きしない ---
+            # **拒否は戻り値で受け取る。**呼び出し側がこれを見ないと、足した
+            # つもりの項目が黙って消える。見ることを画面側（単位 3・5）に課す
+            dm.dictionary_path().write_text("{not json", encoding="utf-8")
+            broken = dm.Dictionary.load()
+            assert broken.entries == [] and broken.load_error and not broken.can_save
+            broken.add("吉田", "吉沢")            # 足したつもり
+            r = broken.save()
+            assert isinstance(r, dm.SaveResult) and r.ok is False and r.reason, r
+            assert "読めなかった" in r.reason
+            assert dm.dictionary_path().read_text(encoding="utf-8") == "{not json",                 "拒んだのに書いた"
+
+            # --- 1 件だけ壊れていても、他は読む。ただし保存は拒む ---
+            # 壊れていた項目は保存すると消える。**消すと決めたときだけ**
+            # force=True で上書きする（意図して消す。黙って消えるのとは違う）
+            dm.dictionary_path().write_text(json.dumps({
+                "version": 1,
+                "entries": [{"wrong": "田中", "correct": "田仲"}, {"wrong": "", "correct": "x"},
+                            "garbage"],
+            }), encoding="utf-8")
+            part = dm.Dictionary.load()
+            assert [e.wrong for e in part.entries] == ["田中"] and part.load_error == ""
+            assert part.skipped == 2 and not part.can_save
+            r = part.save()
+            assert r.ok is False and "2 件" in r.reason, r
+            r = part.save(force=True)                  # 消すと決めて消す
+            assert r.ok is True and r.path == dm.dictionary_path()
+            again = dm.Dictionary.load()
+            assert [e.wrong for e in again.entries] == ["田中"] and again.skipped == 0
+            assert again.can_save
+            # 正常時も戻り値は ok=True
+            assert again.save().ok is True
+    finally:
+        if keep is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = keep
+
+
+def test_dictionary_candidates_never_change_the_text():
+    """**辞書の候補は「探すとここに出る」だけ。本文は一切変えない**（設計書 §3.2・§3.6）。
+
+    「N 項目に候補があります」の N は項目で数える（同じ箇所が複数の項目に
+    当たるので、箇所で数えると二重になる）。無効化した項目・この音声で切った
+    辞書・本文に無い項目は出ない。探す条件は項目のもの。
+    """
+    from src import dictionary as dm
+
+    proj = _for_replace()
+    texts = [s.text for s in proj.segments]
+    logs = len(proj.edit_log)
+
+    dic = dm.Dictionary(path=None)
+    e_sikaku = dic.add("資格", "私学", note="県の私学担当")
+    e_dosokai = dic.add("同層会", "同窓会")
+    e_off = dic.add("防災士", "防災師")
+    dic.set_enabled(e_off.id, False)                    # 無効化した項目
+    e_none = dic.add("存在しない語", "x")                 # 本文に無い
+    e_sikaku2 = dic.add("資格", "私学部", note="別人")   # 同じ誤変換・別の正しい語
+
+    found = dm.entries_with_candidates(proj, dic, fingerprint="fp-1")
+    ids = [e.id for e in found]
+    assert e_off.id not in ids, "無効化した項目が候補に出た"
+    assert e_none.id not in ids, "本文に無い項目が候補に出た"
+    assert set(ids) == {e_sikaku.id, e_dosokai.id, e_sikaku2.id}
+    assert len(found) == 3, "N は項目で数える（箇所で数えると二重になる）"
+    pos = {e.id: i for i, e in enumerate(found)}
+    assert abs(pos[e_sikaku.id] - pos[e_sikaku2.id]) == 1, "同じ誤変換は隣り合う"
+
+    # 項目を開いた時点で探す。件数は find_text と同じ（区間内の複数ヒットも個別）
+    assert [h.nth for h in dm.hits_for(proj, e_dosokai)] == [0, 1]
+    assert len(dm.hits_for(proj, e_sikaku)) == 2
+
+    # --- 本文は変わらない。記録も増えない ---
+    assert [s.text for s in proj.segments] == texts, "候補を作っただけで本文が変わった"
+    assert len(proj.edit_log) == logs, "候補を作っただけで記録が増えた"
+
+    # --- この音声で辞書を切っていれば空 ---
+    dic.set_disabled_for("fp-1", True)
+    assert dm.entries_with_candidates(proj, dic, fingerprint="fp-1") == []
+    assert dm.entries_with_candidates(proj, dic, fingerprint="fp-2") != []
+
+    # --- 探す条件は項目のもの ---
+    proj2 = Project(audio_path="a.m4a", duration=100.0)
+    proj2.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                              text="Um, the summary was, um, brief. UM okay")]
+    plain = dm.Entry(wrong="um", correct="[filler]", id="p")
+    strict = dm.Entry(wrong="um", correct="[filler]", id="s", ignore_case=True, whole_word=True)
+    assert [h.term for h in dm.hits_for(proj2, plain)] == ["um", "um"]      # summary の中も
+    assert [h.term for h in dm.hits_for(proj2, strict)] == ["Um", "um", "UM"]  # 綴りは本文のもの
+
+
+def test_dictionary_search_is_done_when_the_entry_is_opened_not_upfront():
+    """**候補は項目を開いた時点で探す。先にまとめて探さない。**（§6 の 2）
+
+    「田中」→「田仲」で 2 件目だけ○にして直したあと、「田中」→「田那可」を
+    開くと、**残っている田中だけ**（1 件目と 3 件目）が出る。○にした分は
+    直って消え、×にした分が次の項目に回る。先にまとめて探すと、もう直した
+    箇所が候補に残る。
+    """
+    from src import dictionary as dm
+
+    proj = Project(audio_path="a.m4a", duration=100.0)
+    proj.segments = [Segment(index=0, start=0.0, end=10.0, cluster="g:A",
+                             text="田中と田中と田中が来た")]
+    dic = dm.Dictionary(path=None)
+    e1 = dic.add("田中", "田仲", note="総務の田仲さん")
+    e2 = dic.add("田中", "田那可", note="営業の田那可さん")
+    assert len(dm.entries_with_candidates(proj, dic)) == 2
+
+    hits1 = dm.hits_for(proj, e1)
+    assert len(hits1) == 3
+    # 2 件目だけ○（1 件目・3 件目は×）
+    assert proj.replace_text(e1.wrong, e1.correct, [hits1[1].target], **e1.options) == 1
+    assert proj.segments[0].text == "田中と田仲と田中が来た"
+
+    # 次の項目を開く → 残っている 2 件だけ。直した箇所は出ない
+    hits2 = dm.hits_for(proj, e2)
+    assert [h.before + "【" + h.term + "】" + h.after for h in hits2] ==         ["【田中】と田仲と田中が来た", "田中と田仲と【田中】が来た"]
+    assert proj.replace_text(e2.wrong, e2.correct, [h.target for h in hits2], **e2.options) == 2
+    assert proj.segments[0].text == "田那可と田仲と田那可が来た"
+    # 全部直ったので、もう候補は無い
+    assert dm.entries_with_candidates(proj, dic) == []
+
+
+def test_replace_text_records_origin_and_rejected_for_dictionary_use():
+    """**辞書から来た置換は、その旨と×の件数を記録に残す**（§6 の 2）。
+
+    適用 ÷（適用 ＋ 却下）が辞書の精度。一次の記録は作業ファイルの edit_log。
+    手入力の置換には載せない（記録を増やさない）。
+    """
+    proj = _for_replace()
+    hits = proj.find_text("資格")
+    n = proj.replace_text("資格", "私学", [hits[1].target], origin="dictionary", rejected=1)
+    assert n == 1
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert rec["origin"] == "dictionary" and rec["rejected"] == 1 and rec["count"] == 1
+    proj = _for_replace()
+    proj.replace_text("資格", "私学", [h.target for h in proj.find_text("資格")])
+    rec = [r for r in proj.edit_log if r.get("op") == "replace_text_bulk"][-1]
+    assert "origin" not in rec and "rejected" not in rec
+
+
+def test_dictionary_module_does_not_log_its_contents():
+    """**辞書には人名が入る。**このモジュールはログを書かない（設計書 §3.5）。"""
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parent.parent / "src" / "dictionary.py").read_text(encoding="utf-8")
+    assert "logging" not in src and "print(" not in src, "辞書の中身がログに出る経路がある"
+
+
 def _for_leave() -> Project:
     """途中退席の形。32:17 に本人が「中座します」と言って帰る。"""
     proj = Project(audio_path="a.m4a", duration=4000.0)

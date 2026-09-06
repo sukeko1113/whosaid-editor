@@ -1252,7 +1252,8 @@ class Project:
 
     def replace_text(self, before: str, after: str,
                      targets: Sequence[tuple[tuple[float, float], int]], *,
-                     ignore_case: bool = False, whole_word: bool = False) -> int:
+                     ignore_case: bool = False, whole_word: bool = False,
+                     origin: str = "", rejected: Optional[int] = None) -> int:
         """選ばれた箇所だけ語句を置き換える。直した箇所数を返す。
 
         **一括で置き換えない。**「資格」は 10 回出るが 1 回は本物なので、
@@ -1304,6 +1305,12 @@ class Project:
             extra["ignore_case"] = True
         if whole_word:
             extra["whole_word"] = True
+        # **辞書から来た置換は、その旨と×の件数も残す**（設計書 §6 の 2）。
+        # 適用 ÷（適用 ＋ 却下）が辞書の精度。一次の記録はここ（作業ファイル）
+        if origin:
+            extra["origin"] = origin
+        if rejected is not None:
+            extra["rejected"] = int(rejected)
         self._log("replace_text_bulk", before=before, after=after,
                   targets=touched, count=done, segments=len(touched), **extra)
         return done
