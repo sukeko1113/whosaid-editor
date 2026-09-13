@@ -4677,6 +4677,15 @@ class ReplaceWordsDialog(tk.Toplevel):
 
         self.title("語句をまとめて直す")
         self.transient(master)
+        # 画面より大きくしない(1024x768@125% の論理 819px で、注記の wraplength が
+        # 430 だったころの自然幅 837px がはみ出し、注記の右端が画面外に出た)。
+        # **837 は欲しい幅であって、自然な幅ではない**(AssignWindow の want_w と同じ
+        # 考え方)。自然な大きさは 785x507(2026-09-13 実測。字の形が違う機械では
+        # 変わりうる)。**785 に詰めないのは、一覧の「前後」列を 637px に保つため。**
+        # 785 だと列は 620px に狭まり、普通の画面でそれまで読めていた長い行の末尾が
+        # 切れる(前後が漢字 22 字ずつ・語句 6 字で 630px。実測)
+        scr_w, scr_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(837, scr_w - 40)}x{min(507, scr_h - 90)}")
         self.var_before = tk.StringVar()
         self.var_after = tk.StringVar()
         self.var_status = tk.StringVar(value="直す前の語句を入れて［探す］。")
@@ -4737,7 +4746,9 @@ class ReplaceWordsDialog(tk.Toplevel):
             opts, text="英大文字小文字を区別しない", variable=self.var_nocase,
             command=self._on_option_changed)
         self.chk_nocase.pack(side="left", padx=(10, 0))
-        ttk.Label(opts, foreground="#888", wraplength=430,
+        # wraplength: 窓が 779px(1024x768@125%)のとき、注記が全部読める上限は 372。
+        # 字幅の差に 29px の余裕を取って 340(2026-09-13 実測。430 では右端が 58px 切れた)
+        ttk.Label(opts, foreground="#888", wraplength=340,
                   text="※ 完全一致は英語向けです（日本語には語境界が無いので効きません）。"
                        "切り替えると探し直しになり、付けた × はすべて ○ に戻ります。")\
             .pack(side="left", padx=(10, 0))
