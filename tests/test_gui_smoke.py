@@ -3572,6 +3572,12 @@ def run_dialogs_fit_small_screen() -> int:
     右端が画面外に出ていた（設計書 §2.7・§3.8）。窓を画面に切り詰め、注記の
     wraplength を 340 にした。一覧は 6px 足りない（要 744 / 実 738）が、隠れる
     のは「前後」列の末尾の数 px だけなので検査しない（2026-09-13 に判断）。
+
+    話者をまとめて置き換える画面は、上の段を横 1 列に並べていて（876px）、
+    ［探す］が画面の外に出ていた（2026-09-14）。上の段を 2 行にし、窓を画面に
+    切り詰めた。一覧は 34px 足りない（要 772 / 実 738）が、隠れるのは「発言」列の
+    末尾だけなので検査しない（2026-09-14 に判断）。［探す］のあとは知らせが 2 行に
+    なるので、そこでも下まで見えているかを見る。
     """
     failures: list[str] = []
 
@@ -3580,14 +3586,28 @@ def run_dialogs_fit_small_screen() -> int:
         if not cond:
             failures.append(label)
 
+    def right_of(win, x) -> int:            # 窓の左端から、部品の右端まで
+        return x.winfo_rootx() - win.winfo_rootx() + x.winfo_width()
+
+    def shown_inside(win, x) -> bool:
+        # **部品が隠れる経路を 3 つとも塞ぐ**: 表示されているか・縮められていないか・
+        # 窓の中か。場所が足りないと pack は部品を画面から外し(unmap)、座標は古いまま
+        # 残るので、右端だけ見ると素通りする(話者置き換えの窓に切り詰めだけ入れて
+        # 組み替えない形で、実際に素通りした)。幅だけ見ると、縮まずに窓の外へ
+        # はみ出した部品を素通りする(列 0 を縮まなくした形で、話者置き換えの窓の
+        # スクロールバーとボタンの行が右端 801 まで出たのを、実際に素通りした)
+        return (bool(x.winfo_ismapped())
+                and x.winfo_width() >= x.winfo_reqwidth()
+                and right_of(win, x) <= win.winfo_width())
+
     print("\n[小窓が下限の画面（論理 819x614）に収まる・実寸で測る]")
     sw, sh = SMALL_SCREEN
     root = tk.Tk()
     root.withdraw()
     try:
         with tempfile.TemporaryDirectory() as d:
-            # 親の窓も透明・画面外で出す（transient の注記）。語句の画面が親から
-            # 読むのは proj だけなので、割当画面は作らない（画面に出さずに済む）
+            # 親の窓も透明・画面外で出す（transient の注記）。語句と話者置き換えの
+            # 画面が親から読むのは proj だけなので、割当画面は作らない（画面に出さずに済む）
             host = tk.Toplevel(root)
             host.proj = make_project(Path(d))
             show_offscreen(host)
@@ -3618,19 +3638,59 @@ def run_dialogs_fit_small_screen() -> int:
                 opts = dlg.chk_whole.master
                 note = [c for c in opts.winfo_children()
                         if c.winfo_class() == "TLabel"][0]
-                check(f"注記が切れていない（実幅 {note.winfo_width()}"
-                      f" / 要 {note.winfo_reqwidth()}）",
-                      note.winfo_width() >= note.winfo_reqwidth())
-                # 四辺を見る。行 3 は一覧（縮む側）なので除く
-                fixed = [x for x in dlg.grid_slaves()
-                         if int(x.grid_info()["row"]) != 3]
-                cut_h = [x for x in fixed if x.winfo_width() < x.winfo_reqwidth()]
+                check(f"注記が見えていて窓の中にある（実幅 {note.winfo_width()}"
+                      f" / 要 {note.winfo_reqwidth()}・右端 {right_of(dlg, note)} / 窓 {w}）",
+                      shown_inside(dlg, note))
+                # 四辺を見る。一覧は縮む側なので除く。同じ行のスクロールバーは縮まないので見る
+                fixed = [x for x in dlg.grid_slaves() if x is not dlg.tree]
+                cut_h = [x for x in fixed if not shown_inside(dlg, x)]
                 cut_v = [x for x in fixed if not x.winfo_ismapped()
                          or x.winfo_y() + x.winfo_height() > h]
                 check(f"縮まない行が右で切れていない（切れ {len(cut_h)} 行）", not cut_h)
                 check(f"縮まない行が下まで見えている（切れ {len(cut_v)} 行）", not cut_v)
             finally:
                 dlg.destroy()
+
+            # --- 話者をまとめて置き換える ---------------------------------------
+            # 探して行が並ぶように、全区間を 1 人に当てておく（3 つに 1 つを ✓。
+            # ［探す］のあとの知らせが一番長くなる形）
+            for s in host.proj.segments:
+                s.speaker_id = host.proj.speakers[0].id
+                s.reviewed = s.index % 3 == 0
+            with fake_screen(sw, sh):
+                rs = ReplaceSpeakerDialog(host)
+            try:
+                show_offscreen(rs)
+                w, h = rs.winfo_width(), rs.winfo_height()
+                check("話者置き換えの窓が表示されている（大きさを測る前提）",
+                      bool(rs.winfo_ismapped()))
+                check(f"話者置き換えの窓が画面に収まる（{w}x{h} / 上限 {sw - 40}x{sh - 90}）",
+                      w <= sw - 40 and h <= sh - 90)
+
+                check(f"［探す］が見えていて窓の中にある（右端 {right_of(rs, rs.btn_search)}"
+                      f" / 窓 {w}）", shown_inside(rs, rs.btn_search))
+                # 四辺を見る。一覧は縮む側なので除く（右端が隠れるのは判断済み）。
+                # 同じ行のスクロールバーは縮まないので見る
+                fixed = [x for x in rs.grid_slaves() if x is not rs.tree]
+                cut_h = [x for x in fixed if not shown_inside(rs, x)]
+                cut_v = [x for x in fixed if not x.winfo_ismapped()
+                         or x.winfo_y() + x.winfo_height() > h]
+                check(f"縮まない行が右で切れていない（切れ {len(cut_h)} 行）", not cut_h)
+                check(f"縮まない行が下まで見えている（切れ {len(cut_v)} 行）", not cut_v)
+
+                rs.cmb_before.current(0)
+                rs.search()                        # 知らせが 2 行になる
+                rs.update()
+                w, h = rs.winfo_width(), rs.winfo_height()
+                cut_v = [x for x in fixed if x.winfo_y() + x.winfo_height() > h]
+                check(f"［探す］のあと（{len(rs.rows)} 区間）も縮まない行が下まで見えている"
+                      f"（窓の高さ {h} / 上限 {sh - 90}）",
+                      bool(rs.rows) and not cut_v and h <= sh - 90)
+                check(f"［{rs.btn_ok.cget('text')}］が見えていて窓の中にある"
+                      f"（右端 {right_of(rs, rs.btn_ok)} / 窓 {w}）",
+                      shown_inside(rs, rs.btn_ok))
+            finally:
+                rs.destroy()
             host.destroy()
     finally:
         root.destroy()
