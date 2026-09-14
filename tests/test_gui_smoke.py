@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -195,6 +196,43 @@ def make_project(tmp: Path) -> Project:
     proj.json_path = str(tmp / "meeting.speakers.json")
     proj.save()
     return proj
+
+
+# ======================================================================
+# **隠した窓は大きさを測れない。**
+#
+# withdraw() した窓では、geometry() が指定した大きさではなく 1x1+0+0 を返し、
+# winfo_width() も 1 になる。以前の名簿の窓の「窓が画面に収まる」は、これで
+# 比較が「1 <= 画面 − 40」になり、**どんな条件でも真**だった（2026-09-13 に確認）。
+# 測るときは透明にして画面の外に出す（見えないが表示はされていて、実寸が決まる）。
+# transient の窓は、親が隠れていると最初に出すときに隠れた状態を引き継ぐので、
+# 親も同じく出しておく。
+#
+# 窓の大きさは作るときに画面の大きさから決まるので、小さい画面は作っている
+# 間だけ winfo_screenwidth / winfo_screenheight を差し替えて再現する。
+# ======================================================================
+OFFSCREEN = "+-6000+-6000"
+SMALL_SCREEN = (819, 614)       # 1024x768・拡大率 125%（README の下限）の論理値
+
+
+def show_offscreen(win) -> None:
+    """透明にして画面の外に出す（見えないが表示されて、実寸が決まる）。"""
+    win.attributes("-alpha", 0.0)
+    win.geometry(OFFSCREEN)
+    win.deiconify()
+    win.update()
+
+
+@contextmanager
+def fake_screen(w: int, h: int):
+    """作っている間だけ、画面の大きさを差し替える。"""
+    real = (tk.Misc.winfo_screenwidth, tk.Misc.winfo_screenheight)
+    tk.Misc.winfo_screenwidth = lambda self: w
+    tk.Misc.winfo_screenheight = lambda self: h
+    try:
+        yield
+    finally:
+        tk.Misc.winfo_screenwidth, tk.Misc.winfo_screenheight = real
 
 
 def install_dialog_guard() -> list:
@@ -863,11 +901,9 @@ def run() -> int:
               and rd.rows[2]["note"].get() == "加茂暁星学園理事")
         check("行は話者 ID を覚えている",
               all(r["sid"] for r in rd.rows))
-        scr_w = rd.winfo_screenwidth()
-        scr_h = rd.winfo_screenheight()
-        geo = rd.geometry().split("+")[0].split("x")
-        check("窓が画面に収まる",
-              int(geo[0]) <= scr_w - 40 and int(geo[1]) <= scr_h - 90)
+        # 窓の大きさは run_dialogs_fit_small_screen() で実寸で測る。ここの rd は
+        # withdraw() しているので測れない（geometry() が 1x1+0+0 を返し、以前ここに
+        # あった「窓が画面に収まる」はどんな条件でも真だった。2026-09-13）
 
         # 自動で分ける
         n = rd.auto_split()
@@ -3525,6 +3561,87 @@ def run_api_plaintext() -> int:
     return 0
 
 
+def run_dialogs_fit_small_screen() -> int:
+    """**README の下限の画面（1024x768・拡大率 125% = 論理 819x614）に、
+    小窓が収まること。実寸で測る。**
+
+    名簿の窓の検査は、以前は run() の中で withdraw() した窓の geometry() を
+    読んでいて、どんな条件でも真だった（show_offscreen の上の注記）。
+
+    語句をまとめて直す画面は、自然幅 837px が画面幅 819 をはみ出し、注記の
+    右端が画面外に出ていた（設計書 §2.7・§3.8）。窓を画面に切り詰め、注記の
+    wraplength を 340 にした。一覧は 6px 足りない（要 744 / 実 738）が、隠れる
+    のは「前後」列の末尾の数 px だけなので検査しない（2026-09-13 に判断）。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[小窓が下限の画面（論理 819x614）に収まる・実寸で測る]")
+    sw, sh = SMALL_SCREEN
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            # 親の窓も透明・画面外で出す（transient の注記）。語句の画面が親から
+            # 読むのは proj だけなので、割当画面は作らない（画面に出さずに済む）
+            host = tk.Toplevel(root)
+            host.proj = make_project(Path(d))
+            show_offscreen(host)
+
+            # --- 名簿 -----------------------------------------------------
+            with fake_screen(sw, sh):
+                rd = RosterDialog(host, parse_roster("佐藤(理事長)\n田中(事務局長)"))
+            try:
+                show_offscreen(rd)
+                check("名簿の窓が表示されている（大きさを測る前提）",
+                      bool(rd.winfo_ismapped()))
+                check(f"名簿の窓が画面に収まる（{rd.winfo_width()}x{rd.winfo_height()}"
+                      f" / 上限 {sw - 40}x{sh - 90}）",
+                      rd.winfo_width() <= sw - 40 and rd.winfo_height() <= sh - 90)
+            finally:
+                rd.destroy()
+
+            # --- 語句をまとめて直す -------------------------------------------
+            with fake_screen(sw, sh):
+                dlg = ReplaceWordsDialog(host)
+            try:
+                show_offscreen(dlg)
+                w, h = dlg.winfo_width(), dlg.winfo_height()
+                check("語句の窓が表示されている（大きさを測る前提）",
+                      bool(dlg.winfo_ismapped()))
+                check(f"語句の窓が画面に収まる（{w}x{h} / 上限 {sw - 40}x{sh - 90}）",
+                      w <= sw - 40 and h <= sh - 90)
+                opts = dlg.chk_whole.master
+                note = [c for c in opts.winfo_children()
+                        if c.winfo_class() == "TLabel"][0]
+                check(f"注記が切れていない（実幅 {note.winfo_width()}"
+                      f" / 要 {note.winfo_reqwidth()}）",
+                      note.winfo_width() >= note.winfo_reqwidth())
+                # 四辺を見る。行 3 は一覧（縮む側）なので除く
+                fixed = [x for x in dlg.grid_slaves()
+                         if int(x.grid_info()["row"]) != 3]
+                cut_h = [x for x in fixed if x.winfo_width() < x.winfo_reqwidth()]
+                cut_v = [x for x in fixed if not x.winfo_ismapped()
+                         or x.winfo_y() + x.winfo_height() > h]
+                check(f"縮まない行が右で切れていない（切れ {len(cut_h)} 行）", not cut_h)
+                check(f"縮まない行が下まで見えている（切れ {len(cut_v)} 行）", not cut_v)
+            finally:
+                dlg.destroy()
+            host.destroy()
+    finally:
+        root.destroy()
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_replace_dialog_navigation() -> int:
     """**語句をまとめて直す画面で、行を選ぶと本体がその区間へ飛ぶ。**
 
@@ -4536,7 +4653,8 @@ if __name__ == "__main__":
     rc_dict = run_replace_dialog_dictionary()
     rc_reg = run_replace_dialog_register()
     rc_mgr = run_dictionary_dialog()
+    rc_fit = run_dialogs_fit_small_screen()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
              or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
-             or rc_dict or rc_reg or rc_mgr or rc_cfg)
+             or rc_dict or rc_reg or rc_mgr or rc_fit or rc_cfg)
