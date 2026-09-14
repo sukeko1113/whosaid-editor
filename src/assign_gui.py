@@ -4484,6 +4484,17 @@ class ReplaceSpeakerDialog(tk.Toplevel):
 
         self.title("話者をまとめて置き換える")
         self.transient(master)
+        # 画面より大きくしない。欲しい大きさを画面に切り詰める(AssignWindow・
+        # RosterDialog・ReplaceWordsDialog と同じ形)。
+        # **欲しい幅 900 は自然な幅ではない。**普通の画面で、一覧の「発言」列を
+        # それまでどおり 622px に保つための幅(ReplaceWordsDialog の 837 と同じ決め方)。
+        # 自然な大きさは 813x503(2026-09-14 実測・［探す］のあと。字の形が違う機械では
+        # 変わりうる)で、813 に詰めると「発言」列が 600px に狭まる。高さ 503 は
+        # ［探す］のあと(知らせが 2 行)の自然な高さで、窓が伸びずに済む。
+        # 1024x768@125%(論理 819px)では 779 になり、「発言」列の右端 34px が隠れる
+        # (判断済み)。上の段を 1 行に並べていたときは［探す］が画面の外に出ていた。
+        scr_w, scr_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(900, scr_w - 40)}x{min(503, scr_h - 90)}")
         self._names = [(sp.name, sp.id) for sp in master.proj.speakers]
         self.var_after_time = tk.StringVar()
         self.var_status = tk.StringVar(value="置き換える人を選んで［探す］。")
@@ -4504,22 +4515,29 @@ class ReplaceSpeakerDialog(tk.Toplevel):
                  "前後を読んで、変えない行は × にしてください。",
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6))
 
+        # 上の段は 2 行(誰を誰に / どこから・探す)。1 行に並べると 876px 要り、
+        # 1024x768@125%(論理 819px)で［探す］が画面の外に出た
         top = ttk.Frame(self)
         top.grid(row=1, column=0, columnspan=2, sticky="w", padx=12)
-        ttk.Label(top, text="いまの話者:").pack(side="left")
-        self.cmb_before = ttk.Combobox(top, state="readonly", width=22,
+        who = ttk.Frame(top)
+        who.pack(side="top", anchor="w")
+        ttk.Label(who, text="いまの話者:").pack(side="left")
+        self.cmb_before = ttk.Combobox(who, state="readonly", width=22,
                                        values=[n for n, _ in self._names])
         self.cmb_before.pack(side="left", padx=(4, 10))
-        ttk.Label(top, text="→  こちらにする:").pack(side="left")
-        self.cmb_after = ttk.Combobox(top, state="readonly", width=22,
+        ttk.Label(who, text="→  こちらにする:").pack(side="left")
+        self.cmb_after = ttk.Combobox(who, state="readonly", width=22,
                                       values=[n for n, _ in self._names])
         self.cmb_after.pack(side="left", padx=(4, 14))
-        ttk.Label(top, text="この時刻より後だけ:").pack(side="left")
-        self.ent_time = ttk.Entry(top, textvariable=self.var_after_time, width=10)
+        when = ttk.Frame(top)
+        when.pack(side="top", anchor="w", pady=(6, 0))
+        ttk.Label(when, text="この時刻より後だけ:").pack(side="left")
+        self.ent_time = ttk.Entry(when, textvariable=self.var_after_time, width=10)
         self.ent_time.pack(side="left", padx=(4, 2))
-        ttk.Label(top, text="(32:17 のように。空なら全部)",
+        ttk.Label(when, text="(32:17 のように。空なら全部)",
                   foreground="#666").pack(side="left", padx=(0, 10))
-        ttk.Button(top, text="探す", command=self.search).pack(side="left")
+        self.btn_search = ttk.Button(when, text="探す", command=self.search)
+        self.btn_search.pack(side="left")
         self.ent_time.bind("<Return>", lambda e: self.search())
 
         cols = ("mark", "at", "seen", "text")
