@@ -1302,16 +1302,17 @@ class AssignWindow(tk.Toplevel):
     def has_real_clusters(self) -> bool:
         """一括適用の対象になる「声のまとまり」が 1 つでもあるか。
 
-        ローカル転写には声を聞き分ける者がいないので、全区間が擬似クラスタ
-        (?)になる。そのときは一括適用という機能自体が成り立たない。
+        話者分離を通さなかった転写（ローカルで分離を切った・失敗した等）は、
+        全区間が擬似クラスタ(?)になる。そのときは一括適用という機能自体が
+        成り立たない。
         """
         return any(not s.is_pseudo_cluster for s in self.proj.segments)
 
     def _toggle_cluster_mode(self) -> None:
         if not self.has_real_clusters():
             self._set_action(
-                "この作業ファイルには声のまとまりがありません"
-                "(ローカル転写では作られません)。一括適用は使えません。")
+                "この作業ファイルには声のまとまりがありません。一括適用は使えません"
+                "（ローカル転写なら、話者分離を入れて転写し直すと使えます）。")
             return
         self.var_apply_cluster.set(not self.var_apply_cluster.get())
 

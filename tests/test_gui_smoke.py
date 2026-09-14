@@ -1273,7 +1273,7 @@ def run() -> int:
         win.player.close()
         win.destroy()
 
-        # --- 声のまとまりが無い作業ファイル(ローカル転写) -----------------
+        # --- 声のまとまりが無い作業ファイル(話者分離を通さなかった転写) -------
         # 全区間が擬似クラスタなので、一括適用は成り立たない。ON のまま
         # 残すと確定のたびに警告が出る(1219 区間なら 1219 回)。
         local_proj = Project(audio_path=str(tmp / "meeting.m4a"),
@@ -1300,6 +1300,12 @@ def run() -> int:
         lwin._toggle_cluster_mode()
         check("A キーでも一括適用は入らない",
               lwin.var_apply_cluster.get() is False)
+        # 説明は注記と同じく話者分離を案内する。以前は「ローカル転写では
+        # 作られません」と書いていて、話者分離を組み込んだ 8-16 から事実と
+        # 違っていた(A キーの説明と注記が食い違っていた)。
+        check("A キーの説明も注記も話者分離を案内する",
+              "話者分離" in lwin.var_action.get()
+              and "話者分離" in str(lwin.lbl_cluster_note.cget("text")))
 
         # 確定しても警告ダイアログが出ないこと
         warned: list[str] = []
