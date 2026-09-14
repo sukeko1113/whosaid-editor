@@ -4695,13 +4695,15 @@ class ReplaceWordsDialog(tk.Toplevel):
 
         self.title("語句をまとめて直す")
         self.transient(master)
-        # 画面より大きくしない(1024x768@125% の論理 819px で、注記の wraplength が
-        # 430 だったころの自然幅 837px がはみ出し、注記の右端が画面外に出た)。
-        # **837 は欲しい幅であって、自然な幅ではない**(AssignWindow の want_w と同じ
-        # 考え方)。自然な大きさは 785x507(2026-09-13 実測。字の形が違う機械では
-        # 変わりうる)。**785 に詰めないのは、一覧の「前後」列を 637px に保つため。**
-        # 785 だと列は 620px に狭まり、普通の画面でそれまで読めていた長い行の末尾が
-        # 切れる(前後が漢字 22 字ずつ・語句 6 字で 630px。実測)
+        # 画面より大きくしない。欲しい大きさを画面に切り詰める(AssignWindow・
+        # RosterDialog・ReplaceSpeakerDialog と同じ形)。
+        # **欲しい幅 837 は自然な幅ではない。**普通の画面で、一覧の「前後」列を
+        # それまでどおり 637px に保つための幅(ReplaceSpeakerDialog の 900 と同じ決め方)。
+        # 自然な大きさは 785x507(2026-09-13 実測。字の形が違う機械では変わりうる)で、
+        # 785 に詰めると「前後」列が 620px に狭まり、それまで読めていた長い行の末尾が
+        # 切れる(前後が漢字 22 字ずつ・語句 6 字で 630px。実測)。
+        # 1024x768@125%(論理 819px)では 779 になり、「前後」列の右端 6px が隠れる
+        # (判断済み)。注記の wraplength が 430 だったときは注記の右端が画面の外に出ていた。
         scr_w, scr_h = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{min(837, scr_w - 40)}x{min(507, scr_h - 90)}")
         self.var_before = tk.StringVar()
