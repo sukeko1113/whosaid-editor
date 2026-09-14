@@ -177,6 +177,7 @@ from src.segments import (  # noqa: E402
     Segment,
     fmt_hms_frac,
     parse_roster,
+    segment_key,
 )
 
 
@@ -4130,6 +4131,96 @@ def run_replace_dialog_register() -> int:
     return 0
 
 
+def run_replace_speaker_undo() -> int:
+    """**「話者をまとめて置き換える」を、Ctrl+Z で 1 回にまとめて戻せる。**
+
+    以前は取り消しの記録に積んでおらず、置き換えのあとの Ctrl+Z は
+    **その前の個別の確定（✓）を 1 件ずつ戻していた**。置き換えは残ったまま、
+    聴いて付けた ✓ が消える（外部の GUI 評価・2026-09-14）。
+
+    取り消すと、置き換える前の ✓/△ に戻る。人が付けていた ✓ に戻すだけで、
+    機械が新しく ✓ を付けるのではない（設計書 §16.6）。
+    """
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[話者をまとめて置き換える を Ctrl+Z で戻す]")
+    root = tk.Tk()
+    root.withdraw()
+    real_dialog = assign_gui.ReplaceSpeakerDialog
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            proj = make_project(Path(d))
+            win = AssignWindow(root, proj)
+            win.var_autoplay.set(False)       # 実音声を用意しないので自動再生は切る
+            win.var_apply_cluster.set(False)  # 1 区間ずつ確定する
+            win.update()
+            yo, ni = proj.speakers[0].id, proj.speakers[1].id
+            s0, s1, s2, s3 = proj.segments[:4]
+
+            # 置き換える前: 0 と 1 は画面で 1 区間ずつ確定（✓・取り消しの記録が
+            # 2 件）、2 と 3 はまとめて埋めただけ（△）
+            win.goto(0)
+            win.assign(yo)
+            win.goto(1)
+            win.assign(yo)
+            proj.apply_speaker_to([2, 3], yo)
+            check("置き換える前の状態（0・1 は ✓、2・3 は △）",
+                  [(s.speaker_id, s.reviewed) for s in (s0, s1, s2, s3)]
+                  == [(yo, True), (yo, True), (yo, False), (yo, False)])
+            depth = len(win._undo)
+
+            # 1〜3 を別の人へ（0 は退席の発言なので残す）。窓は結果だけ返す
+            keys = [segment_key(s) for s in (s1, s2, s3)]
+
+            class _FakeDialog(tk.Toplevel):
+                def __init__(self, master):
+                    super().__init__(master)
+                    self.result = (yo, ni, keys)
+                    self.after(0, self.destroy)
+
+            assign_gui.ReplaceSpeakerDialog = _FakeDialog
+            win.replace_speaker()
+            check("置き換わる（3 区間とも別の人・すべて △）",
+                  [(s.speaker_id, s.reviewed) for s in (s1, s2, s3)]
+                  == [(ni, False)] * 3)
+            check("知らせに取り消し方が出る", "Ctrl+Z" in win.var_action.get())
+            check("取り消しの記録が 1 件増える", len(win._undo) == depth + 1)
+
+            win.undo()                          # Ctrl+Z
+            check("Ctrl+Z 1 回で、置き換えた 3 区間の話者が戻る",
+                  all(s.speaker_id == yo for s in (s1, s2, s3)))
+            check("置き換える前の ✓/△ に戻る（✓ だった区間は ✓）",
+                  [(s.speaker_id, s.reviewed) for s in (s1, s2, s3)]
+                  == [(yo, True), (yo, False), (yo, False)])
+            check("その前に 1 区間ずつ確定した区間は動かない",
+                  (s0.speaker_id, s0.reviewed) == (yo, True))
+            ops = [r.get("op") for r in proj.edit_log]
+            check("履歴に 置き換え → 取り消し（3 区間）の順で残る",
+                  ops[-2:] == ["replace_speaker_bulk", "undo_assign"]
+                  and proj.edit_log[-1].get("count") == 3)
+
+            win.undo()                          # もう一度 Ctrl+Z
+            check("次の Ctrl+Z は、その前の確定（区間 1）を戻す",
+                  (s1.speaker_id, s1.reviewed) == (None, False)
+                  and (s0.speaker_id, s0.reviewed) == (yo, True))
+            win.player.close()
+            win.destroy()
+    finally:
+        assign_gui.ReplaceSpeakerDialog = real_dialog
+        root.destroy()
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 def run_dictionary_dialog() -> int:
     """**辞書の管理画面**（§3 単位 5）。
 
@@ -4533,10 +4624,11 @@ if __name__ == "__main__":
     rc_timers = run_no_stale_timers()
     rc_nav = run_replace_dialog_navigation()
     rc_opts = run_replace_dialog_options()
+    rc_rsu = run_replace_speaker_undo()
     rc_dict = run_replace_dialog_dictionary()
     rc_reg = run_replace_dialog_register()
     rc_mgr = run_dictionary_dialog()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
-    sys.exit(rc_assign or rc_inline or rc_cand or rc_multi or rc_main
+    sys.exit(rc_assign or rc_rsu or rc_inline or rc_cand or rc_multi or rc_main
              or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
              or rc_dict or rc_reg or rc_mgr or rc_cfg)
