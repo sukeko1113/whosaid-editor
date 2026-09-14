@@ -2717,10 +2717,27 @@ class AssignWindow(tk.Toplevel):
         if not dlg.result:
             return
         before, after, keys = dlg.result
+        # **Ctrl+Z で 1 回にまとめて戻せるようにする。**以前は取り消しの記録に
+        # 積んでおらず、置き換えのあとの Ctrl+Z は、その前の個別の確定(✓)を
+        # 1 件ずつ戻していた(外部の GUI 評価・2026-09-14)。どの区間を変えるかの
+        # 条件はデータ層にあるので、ここには写さない——全区間を控えておき、
+        # 実際に変わった区間だけを積む。
+        # 取り消すと置き換え前の ✓/△ に戻る(人が付けていた ✓ に戻すだけで、
+        # 機械が新しく ✓ を付けるのではない)。**`reviewed` の定義を変えるときは、
+        # ここも合わせて見ること**(設計書 §16.6)。
+        was = [(s.index, s.speaker_id, s.reviewed) for s in self.proj.segments]
         n = self.proj.replace_speaker(before, after, keys)
         if not n:
             self._set_action("置き換えるところがありませんでした。")
             return
+        # 置き換えは区間を増減させず、並びも変えないので、控えと今の区間は
+        # 位置で合わせてよい(zip)。控えに index を入れるのは、取り消しの記録の
+        # 形(番号, 話者, reviewed)に揃えるため。n が 1 以上なら snapshot も
+        # 空ではない(置き換えた区間は必ず話者が変わる)。
+        snapshot = [(i, sid, rv) for (i, sid, rv), s in zip(was, self.proj.segments)
+                    if (s.speaker_id, s.reviewed) != (sid, rv)]
+        self._undo.append(snapshot)
+        del self._undo[:-200]
         self._dirty = True
         self.suggester.refresh()
         self.reload_tree()
@@ -2729,7 +2746,8 @@ class AssignWindow(tk.Toplevel):
         self._set_action(
             f"{self.proj.speaker_name(before)} の {n} 区間を "
             f"{self.proj.speaker_name(after)} にしました。"
-            "すべて △(まとめて適用)です。編集の履歴には 1 件として残ります。")
+            "すべて △(まとめて適用)です。編集の履歴には 1 件として残ります。"
+            "取り消しは Ctrl+Z。")
 
     def remove_added(self) -> None:
         """人が足した区間を消す。**それ以外は消せない。**"""
