@@ -841,9 +841,40 @@ def test_build_note_distinguishes_reviewed():
     proj.segments[0].reviewed = True
     proj.segments[1].speaker_id = sid          # 一括適用ぶん
     note = build_note(proj)
-    assert "聴いて確定 1 区間" in note
+    assert "個別に確定 1 区間" in note
     assert "まとめて適用 1 区間" in note
     assert "未確定 8 区間" in note
+
+
+def test_output_does_not_claim_the_audio_was_heard():
+    """**冒頭注記と検証要約に「聴いた」と書かない。**
+
+    ✓（話者）も ✎（時刻）も、利用者が 1 区間ずつ決めた印で、再生したかは
+    見ていない（割当・時刻の確定・［聴いて承認］のどれも、再生の有無を
+    確かめない）。それを「音声を聴いて割り当てたもの」「聴いて確定」と書いた
+    Word を出していた（2026-09-15 に直した）。成果物に出る 3 つ（冒頭注記・
+    検証要約・凡例）に「聴い」が戻らないことと、再生の断りがあることを見る。
+    """
+    from src.segments import build_note, build_verification
+
+    proj = _make_project()
+    sid = proj.speakers[0].id
+    proj.segments[0].speaker_id = sid
+    proj.segments[0].reviewed = True            # ✓
+    proj.segments[1].speaker_id = sid           # △
+    proj.segments[0].time_edited = True
+    proj.segments[0].time_reviewed = True       # ✎
+    proj.segments[1].time_edited = True         # ✎△
+    note = build_note(proj)
+    rows = dict(build_verification(proj, 1))
+    # 元音声の行はファイル名（利用者のデータ）なので見ない
+    texts = [("冒頭注記", note)] + [
+        (f"検証要約の「{k}」", v) for k, v in rows.items() if k != "元音声"]
+    for where, text in texts:
+        assert "聴い" not in text, f"{where}が聴いたと書いている: {text}"
+    for where, text in (("冒頭注記", note), ("凡例", rows["凡例"])):
+        assert "再生して確かめたかどうかは記録していません" in text, \
+            f"{where}に再生の断りが無い: {text}"
 
 
 def test_fmt_hms():
@@ -1940,8 +1971,8 @@ def test_write_docx_verification_summary():
     assert "cd" * 32 in text
     assert "クラウド / gemini-2.5-flash" in text
     assert "revision 3" in text
-    assert "聴いて確定 1 区間" in text and "まとめて適用 1 区間" in text
-    assert "聴いて確認 1 区間" in text              # 時刻の ✎
+    assert "個別に確定 1 区間" in text and "まとめて適用 1 区間" in text
+    assert "個別に確認 1 区間" in text              # 時刻の ✎
     assert "凡例" in text and "区間の数です" in text
     assert "保証するものではありません" in text
 
