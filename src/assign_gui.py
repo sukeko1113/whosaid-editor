@@ -1356,7 +1356,7 @@ class AssignWindow(tk.Toplevel):
         bulk = self.proj.unreviewed_count
         pct = (done / total * 100) if total else 0
         self.progress.configure(maximum=max(1, total), value=done)
-        text = f"確定 {done}/{total} ({pct:.0f}%)  聴いて確定 {heard}"
+        text = f"確定 {done}/{total} ({pct:.0f}%)  個別に確定 {heard}"
         if bulk:
             text += f" / まとめて適用 {bulk}"
         self.var_status.set(text)
@@ -1457,7 +1457,7 @@ class AssignWindow(tk.Toplevel):
 
         **話者は入れない。**候補が持っているのは turn の声(声B)であって
         名簿の誰かではない。機械が選んだ話者のまま押されると ✓ が立ち、
-        「✓＝人が聴いて決めた」という意味が壊れる(CLAUDE.md)。
+        「✓＝人が 1 区間ずつ確定」という意味が壊れる(CLAUDE.md)。
         どの声だったかは案内文で伝えるだけにする。
         """
         c = self._selected_voice_candidate()
@@ -2663,7 +2663,7 @@ class AssignWindow(tk.Toplevel):
         self._set_action(
             f"「{before}」を「{after}」に {n} 箇所直しました。"
             "編集の履歴には 1 件として残ります。"
-            "「聴いて確定」の印は付いていません。"
+            "「個別に確定」の印は付いていません。"
             "［直した語句を戻す］で元に戻せます（次に直すまで）。")
         return n
 
@@ -3021,7 +3021,7 @@ class AssignWindow(tk.Toplevel):
 
         **全部 △（一括適用で埋めただけ）になる。**Shift+クリックで 20 区間を
         一度に選べる操作は、聴かずに選ぶことを容易にする。ここで ✓ を立てると
-        「✓＝人が耳で聴いて確定」が崩れる（CLAUDE.md）。聴いて確定したい
+        「✓＝人が 1 区間ずつ確定」が崩れる（CLAUDE.md）。聴いて確定したい
         区間は、1 つずつ選べばこれまでどおり ✓ になる。
 
         取り消しは 1 回で全部戻る（Ctrl+Z）。編集履歴にも 1 件の判断として
@@ -3262,7 +3262,7 @@ class AssignWindow(tk.Toplevel):
 
         if not unassigned and not unreviewed:
             messagebox.showinfo(
-                "残作業", "すべての区間を聴いて確定済みです。", parent=self)
+                "残作業", "すべての区間を個別に確定済みです。", parent=self)
             return
 
         def breakdown(segs) -> list[str]:
@@ -4124,7 +4124,7 @@ class AddUtteranceDialog(tk.Toplevel):
         self.cmb_sp.current(0)
         self.cmb_sp.pack(side="left")
         ttk.Label(wrow, foreground="#666",
-                  text="選ぶと ✓（聴いて確定）").pack(side="left", padx=6)
+                  text="選ぶと ✓（個別に確定）").pack(side="left", padx=6)
         ttk.Button(wrow, text="＋ この位置に足す",
                    command=self._add_item).pack(side="left", padx=(12, 0))
 
@@ -4680,7 +4680,7 @@ class ReplaceSpeakerDialog(tk.Toplevel):
                "——確かめたのは「その人は居なかった」ことであって、"
                "1 区間ずつの声ではないためです。")
         if heard:
-            msg += f" うち {heard} 区間は今 ✓(聴いて確定)で、△ に戻ります。"
+            msg += f" うち {heard} 区間は今 ✓(個別に確定)で、△ に戻ります。"
         self.var_status.set(msg)
 
     # ------------------------------------------------------------------
@@ -5030,8 +5030,8 @@ class ReplaceWordsDialog(tk.Toplevel):
         if self.hits:
             self.var_status.set(
                 f"{len(self.hits)} 箇所のうち {n} 箇所を直します。"
-                "直したところに「聴いて確定」の印は付きません"
-                "(音声を聴いたわけではないため)。")
+                "直したところに「個別に確定」の印は付きません"
+                "(本文を直しただけで、話者を決めたわけではないため)。")
 
     # ------------------------------------------------------------------
     def _ok(self) -> None:

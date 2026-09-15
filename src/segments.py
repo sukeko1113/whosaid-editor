@@ -2002,7 +2002,7 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
     unassigned = total - proj.assigned_count
     rows.append((
         "話者の確認",
-        f"全 {total} 区間 — 聴いて確定 {heard} 区間、"
+        f"全 {total} 区間 — 個別に確定 {heard} 区間、"
         f"まとめて適用 {bulk} 区間、未確定 {unassigned} 区間",
     ))
     t_heard = sum(1 for s in proj.segments if s.time_edited and s.time_reviewed)
@@ -2010,17 +2010,22 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
     rows.append((
         "時刻の修正",
         f"全 {total} 区間中 {t_heard + t_bulk} 区間 — "
-        f"聴いて確認 {t_heard} 区間、適用のみ {t_bulk} 区間",
+        f"個別に確認 {t_heard} 区間、適用のみ {t_bulk} 区間",
     ))
     # **人が何回、何を触ったか。**「どこまで人が原音で確認したかを成果物に
     # 残せるか」が本製品の差別化そのもの(事業計画 v29)。件数の集計だけでは
     # 「いつまで手を入れたか」が分からない。明細は Day 75。
     rows.append(("編集の履歴", build_log_summary(proj)))
+    # **聴いたとは書かない。**✓ も ✎ も利用者が 1 区間ずつ決めた印で、再生した
+    # かは見ていない（割当・時刻の確定・［聴いて承認］のどれも確かめない）。
+    # 「その区間の音声を人が聴いて決めたもの」と書いていたのを直した(2026-09-15)。
     rows.append((
         "凡例",
-        "「聴いて確定」「聴いて確認」＝その区間の音声を人が聴いて決めたもの。"
-        "「まとめて適用」「適用のみ」＝機械の結果をまとめて当てただけで、"
-        "その区間を個別には聴いていないもの。数はいずれも区間の数です。",
+        "「個別に確定」「個別に確認」＝利用者がその区間を 1 つずつ選んで決めたもの。"
+        "「まとめて適用」「適用のみ」＝複数の区間にまとめて当てたもので、"
+        "その区間を個別には決めていないもの。"
+        "どちらも、音声を再生して確かめたかどうかは記録していません。"
+        "数はいずれも区間の数です。",
     ))
     rows.append(("注意", "本書の記載は確認の履歴であり、内容の正しさや"
                         "法的効力を保証するものではありません。"))
@@ -2028,10 +2033,16 @@ def build_verification(proj: Project, revision: int) -> list[tuple[str, str]]:
 
 
 def build_note(proj: Project) -> str:
-    """docx 冒頭に入れる但し書き。何がどこまで人手で確認されたかを明示する。"""
+    """docx 冒頭に入れる但し書き。何がどこまで人手で確認されたかを明示する。
+
+    **聴いたとは書かない。**「話者ラベルはユーザーが音声を聴いて割り当てたもの」
+    と書いていたが、✓ は利用者が 1 区間ずつ決めた印で、再生したかは見ていない
+    (2026-09-15 に直した)。受け取った人が最初に読むのはここなので、再生の
+    断りもここに置く。
+    """
     parts = [
-        "※ 話者ラベルはユーザーが音声を聴いて割り当てたものです",
-        f"(全 {proj.total_count} 区間中、聴いて確定 {proj.reviewed_count} 区間",
+        "※ 話者ラベルは利用者が割り当てたものです",
+        f"(全 {proj.total_count} 区間中、個別に確定 {proj.reviewed_count} 区間",
     ]
     if proj.unreviewed_count:
         parts.append(f"、まとめて適用 {proj.unreviewed_count} 区間")
@@ -2039,6 +2050,7 @@ def build_note(proj: Project) -> str:
     if unassigned:
         parts.append(f"、未確定 {unassigned} 区間")
     parts.append(")。")
+    parts.append("音声を再生して確かめたかどうかは記録していません。")
     return "".join(parts)
 
 
