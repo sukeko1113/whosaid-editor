@@ -105,6 +105,14 @@ def lost_names(lost: list) -> str:
     return " / ".join(out)
 
 
+def list_cells(win, values) -> dict:
+    """一覧の 1 行の値を、列の名前で引ける形にする。
+    列の順序はアプリの一覧（win.tree の columns）から取り、検査側には持たない。"""
+    cols = win.tree["columns"]
+    assert len(values) == len(cols), f"列 {len(cols)} に対して値 {len(values)}"
+    return dict(zip(cols, values))
+
+
 _REAL_CONFIG_STAMP = (real_config_path().stat().st_mtime
                       if real_config_path() and real_config_path().exists()
                       else None)
@@ -396,10 +404,10 @@ def run() -> int:
         win._nudge_time("end", +1.0)
         check("終了をナッジできる", abs(seg3.end - (orig3[1] + 1.0)) < 1e-6)
         check("そのとき開始は動かない", abs(seg3.start - 96.5) < 1e-6)
-        check("一覧に ✎ が出る", win.tree.item("s3", "values")[0].startswith("✎"))
+        check("一覧に ✎ が出る", win.tree.set("s3", "time").startswith("✎"))
         check("画面で直した時刻は確認済みになる", seg3.time_reviewed is True)
         check("確認済みは ✎ で、✎△ にはしない",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         check("区間ヘッダにも確認済みと出る", "✎時刻を修正済み" in win.var_seginfo.get())
 
         # 終了を直したら、頭からではなく終わりだけを鳴らす(長い区間で待たない)
@@ -422,7 +430,7 @@ def run() -> int:
         check("元の時刻に戻せる", (seg3.start, seg3.end) == orig3)
         check("印が外れる", seg3.time_edited is False)
         check("元の時刻は保持されている", (seg3.orig_start, seg3.orig_end) == orig3)
-        check("一覧の ✎ も消える", not win.tree.item("s3", "values")[0].startswith("✎"))
+        check("一覧の ✎ も消える", not win.tree.set("s3", "time").startswith("✎"))
         check("確認済みの印も外れる", seg3.time_reviewed is False)
 
         # --- 時刻は入れたが自分の耳では未確認(✎△) --------------------------
@@ -433,13 +441,13 @@ def run() -> int:
         win._update_row(3)
         win.goto(3)
         check("未確認の時刻は一覧で ✎△",
-              win.tree.item("s3", "values")[0].startswith("✎△"))
+              win.tree.set("s3", "time").startswith("✎△"))
         check("区間ヘッダにも未確認と出る",
               "✎△時刻は推定(未確認)" in win.var_seginfo.get())
         win._shift_time(+0.1)
         check("画面で直せば確認済みに変わる", seg3.time_reviewed is True)
         check("一覧の印も ✎ に変わる",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         win.revert_time()                                   # 後片付け
         check("元に戻すと時刻も印も消える",
               (seg3.start, seg3.end) == orig3 and seg3.time_reviewed is False)
@@ -454,7 +462,7 @@ def run() -> int:
         check("時刻の値は変わらない", (seg3.start, seg3.end) == before)
         check("確認済みになる", seg3.time_reviewed is True)
         check("一覧の印が ✎ に変わる",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         check("確認済みなら押せない", "disabled" in win.btn_confirm_time.state())
         win.revert_time()
 
@@ -481,12 +489,12 @@ def run() -> int:
               win.apply_proposal(prop, reviewed=False) is True
               and seg9.time_edited is True and seg9.time_reviewed is False)
         check("提案の時刻が入る", abs(seg9.start - (orig9[0] + 6.8)) < 0.15)
-        check("一覧では ✎△", win.tree.item("s9", "values")[0].startswith("✎△"))
+        check("一覧では ✎△", win.tree.set("s9", "time").startswith("✎△"))
         # 聴いて承認したぶんは ✎ になる
         check("聴いて承認は確認済みで入る",
               win.apply_proposal(prop, reviewed=True) is True
               and seg9.time_reviewed is True)
-        check("一覧の印も ✎", win.tree.item("s9", "values")[0].startswith("✎ "))
+        check("一覧の印も ✎", win.tree.set("s9", "time").startswith("✎ "))
 
         # 隣と重なる提案は接点で切り詰める(同時に当てても重ならない)
         seg10_start = proj.segments[10].start
@@ -1395,7 +1403,7 @@ def run() -> int:
         # **背景・文字色・括弧の 3 つ**で示す。色だけでは印刷や色覚の
         # 条件で消える。
         _asr_vals, _asr_tags = awin._row_values(ap.segments[0])
-        check("転写の区間は括弧で囲まない", "＋（" not in _asr_vals[3])
+        check("転写の区間は括弧で囲まない", "＋（" not in list_cells(awin, _asr_vals)["text"])
         check("同じ種類の色を 2 つ付けない",
               sum(1 for t in _asr_tags if t.startswith("bg_")) <= 1
               and sum(1 for t in _asr_tags if t.startswith("fg_")) <= 1)
@@ -1425,7 +1433,7 @@ def run() -> int:
             check("消すボタンが押せるようになる",
                   str(awin.btn_del_added.cget("state")) == "normal")
             _vals, _tags = awin._row_values(a)
-            check("足した発話は括弧で囲んで示す", _vals[3].startswith("＋（"))
+            check("足した発話は括弧で囲んで示す", list_cells(awin, _vals)["text"].startswith("＋（"))
             check("足した発話は背景と文字色でも示す",
                   "bg_added" in _tags and "fg_added" in _tags)
             check("足した行も同じ種類の色は 1 つずつ",
@@ -2356,8 +2364,9 @@ def run_inline_inserts() -> int:
             check("一覧の行が増えない",
                   len(win.tree.get_children()) == rows_before)
             vals, tags = win._row_values(parent)
+            cells = list_cells(win, vals)
             check("親の本文の、割り込んだ位置に入る",
-                  vals[3].startswith("これは（") and "：はい）" in vals[3])
+                  cells["text"].startswith("これは（") and "：はい）" in cells["text"])
             check("親の行にも印が付く", "bg_added" in tags)
 
             # **画面と出力が同じ位置を指すこと**
@@ -2379,8 +2388,9 @@ def run_inline_inserts() -> int:
             win.update()
             check("行で出す設定にすると行が増える",
                   len(win.tree.get_children()) == rows_before + 1)
+            vals, _tags = win._row_values(parent)
             check("行で出すときは埋め込まない",
-                  "：はい）" not in win._row_values(parent)[0][3])
+                  "：はい）" not in list_cells(win, vals)["text"])
             win.var_added_rows.set(False)
             win._on_added_rows_toggled()
             win.update()
@@ -2394,8 +2404,9 @@ def run_inline_inserts() -> int:
                 assign_gui.messagebox.askyesno = real_yes
             check("右ペインから消せる",
                   not any(s.text == "はい" for s in proj.segments))
+            vals, _tags = win._row_values(proj.segments[1])
             check("消したら埋め込みも消える",
-                  "：はい）" not in win._row_values(proj.segments[1])[0][3])
+                  "：はい）" not in list_cells(win, vals)["text"])
 
             win.destroy()
     finally:
@@ -4794,6 +4805,212 @@ def run_save_failures() -> int:
     return 0
 
 
+def run_list_section_number() -> int:
+    """**一覧の左端の「区間」の列に、ファイルの並び順の番号（index + 1）が出る。**
+
+    一覧の時刻は開始を秒に丸めて出すので同じ表示の行ができ、時刻では
+    どの行かを指せなかった（2026-09-15）。番号は右上の「区間 N/全体」と
+    同じ数え方で、絞り込みや聴く順で行の順番が変わっても動かない。
+    それが番号の列の意味そのものなので、絞り込みと聴く順の両方で確かめる。
+    """
+    import tkinter.font as tkfont
+    from tkinter import ttk
+
+    from src import listen_order as lo
+
+    failures: list[str] = []
+
+    def check(label: str, cond: bool) -> None:
+        print(f"  {'ok  ' if cond else 'FAIL'} {label}")
+        if not cond:
+            failures.append(label)
+
+    print("\n[区間の番号の列]")
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            proj = make_project(tmp)
+            total = len(proj.segments)
+            # 聴く順の順番は窓を作るときに読むので、先に置く。後ろの区間ほど点数を
+            # 高くして、聴く順では並びが逆になるようにする
+            proj.audio_fingerprint = "fp-no"
+            proj.save()
+            lo.save_hints(lo.hints_path(tmp / ".work_meeting", "fp-no"), [
+                lo.ListenHint(orig_start=float(s.start), start=float(s.start),
+                              score=float(s.index), index=s.index)
+                for s in proj.segments])
+            win = AssignWindow(root, proj)
+            # **列の和は画面に出す前に測る。**出したあとは、一覧が要求幅より広いと伸縮する
+            # 発言の列が伸びて和が変わり(開発機の見本で 594 → 595。2026-09-15)、要求幅を
+            # 測ったことにならない。出してから測るほうが実態に近く見えるが、逆になる
+            width_sum = sum(int(win.tree.column(c, "width")) for c in win.tree["columns"])
+            win.var_autoplay.set(False)
+            win.update()
+
+            def numbers_match() -> bool:
+                """一覧に出ている行すべてで、番号が Project.segments の中の位置 + 1 か。
+
+                seg.index ではなく並びの位置と比べる。index と位置がずれても見逃さない。
+                """
+                count = 0
+                for pos, seg in enumerate(proj.segments):
+                    iid = f"s{seg.index}"
+                    if win.tree.exists(iid):
+                        count += 1
+                        if win.tree.set(iid, "no") != str(pos + 1):
+                            return False
+                return 0 < count == len(win.tree.get_children())
+
+            def shown_numbers() -> list[str]:
+                return [win.tree.set(i, "no") for i in win.tree.get_children()]
+
+            def header_matches(pos: int) -> bool:
+                win.goto(pos)
+                win.update()
+                no = win.tree.set(f"s{proj.segments[pos].index}", "no")
+                return (no == str(pos + 1)
+                        and win.var_seginfo.get().startswith(f"区間 {no}/{total} "))
+
+            check("見出しが「区間」", win.tree.heading("no")["text"] == "区間")
+            check(f"全部の行に番号があり、並びの位置 + 1（1〜{total}）",
+                  numbers_match() and len(win.tree.get_children()) == total)
+            # 期待値は区間の列を足す前の列の和(時刻・声・話者・発言)。Panedwindow は
+            # この和(一覧の要求幅)で左右を配分する。区間の列か発言の列の片方だけが
+            # 動くと和が変わり、右ペインが狭くなるので、ここで落とす
+            check(f"一覧の列の和が区間の列を足す前と同じ（{width_sum} / {78 + 56 + 120 + 340}）",
+                  width_sum == 78 + 56 + 120 + 340)
+            check("右上の「区間 N/全体」と、選んだ行の番号が同じ（先頭・途中・末尾）",
+                  all(header_matches(p) for p in (0, total // 2, total - 1)))
+
+            # --- 絞り込み: 行が抜けても番号は動かない ------------------------
+            # 3 つおきに ✓ を付け、「未確認のみ」で行が抜ける形にする
+            for s in proj.segments:
+                if s.index % 3 == 0:
+                    s.speaker_id, s.reviewed = proj.speakers[0].id, True
+            win.var_filter.set(FILTER_UNREVIEWED)
+            win._on_filter_change()
+            nums = shown_numbers()
+            check("「未確認のみ」でも各行の番号はファイルの位置 + 1", numbers_match())
+            check(f"「未確認のみ」では番号が飛ぶ（{len(nums)} 行。上から数えた行の番号ではない）",
+                  len(nums) < total and nums != [str(i + 1) for i in range(len(nums))])
+            win.var_filter.set(FILTER_ALL)
+            win._on_filter_change()
+
+            # --- 聴く順: 行の順番が変わっても番号は動かない ----------------------
+            win.var_listen_order.set(True)
+            win._on_listen_order_change()
+            first = win.tree.get_children()[0]
+            win.goto(win._visible_indexes()[0])
+            win.update()
+            check("聴く順でも各行の番号はファイルの位置 + 1", numbers_match())
+            check(f"聴く順では先頭の行が最後の区間で、番号も右上も {total}"
+                  "（行の順番が変わっても番号は動かない）",
+                  win.tree.set(first, "no") == str(total)
+                  and win.var_seginfo.get().startswith(f"区間 {total}/{total} "))
+            win.var_listen_order.set(False)
+            win._on_listen_order_change()
+
+            # --- 分割: 後ろの番号が振り直される ---------------------------------
+            # 画面の処理(apply_split)で分ける。分割ダイアログは開かない
+            later = proj.segments[11]
+            before = int(win.tree.set(f"s{later.index}", "no"))
+            win.goto(10)
+            win.apply_split(proj.segments[10].start + 12.0, 4)
+            win.update()
+            check("分割すると後ろの区間の番号が 1 つずれる",
+                  win.tree.set(f"s{later.index}", "no") == str(before + 1))
+            check(f"分割のあとも全部の行で番号が位置 + 1（{len(proj.segments)} 行）",
+                  numbers_match() and len(win.tree.get_children()) == total + 1)
+
+            # --- 発話を足す: 後ろの番号が振り直される -----------------------------
+            # run_inline_inserts と同じ流れ。既定では足した発話に行を作らず、
+            # 親の本文に埋め込む
+            parent, later = proj.segments[20], proj.segments[21]
+            before = int(win.tree.set(f"s{later.index}", "no"))
+            add = proj.add_utterance(
+                parent.start + 0.1, parent.start + 0.4, "はい",
+                cluster=parent.cluster, cut=3,
+                parent_orig=parent.orig_start, parent_start=parent.start)
+            add.speaker_id = proj.speakers[0].id
+            win.reload_tree()
+            win.update()
+            check("発話を足すと後ろの区間の番号が 1 つずれる",
+                  win.tree.set(f"s{later.index}", "no") == str(before + 1))
+            check("足した発話が行にならない既定の表示では、その番号が一覧から飛ぶ",
+                  not win.tree.exists(f"s{add.index}")
+                  and str(add.index + 1) not in shown_numbers() and numbers_match())
+            win.var_added_rows.set(True)
+            win._on_added_rows_toggled()
+            win.update()
+            check("足した発話も行で出すと、その番号の行が出て、全部の行で位置 + 1",
+                  win.tree.exists(f"s{add.index}")
+                  and win.tree.set(f"s{add.index}", "no") == str(add.index + 1)
+                  and numbers_match()
+                  and len(win.tree.get_children()) == len(proj.segments))
+            win.player.close()
+            win.destroy()
+
+            # --- 下限の画面（模擬） -------------------------------------------
+            print("\n[区間の番号の列・下限の画面（論理 819x614）で実寸を測る]")
+            # 名簿の役職が長いと右ペインが広くなり、そのぶん一覧が狭くなる。見本の 3 人の
+            # 名簿では一覧が広く、話者の列が全部見えて検査が素通りになるので、実データに
+            # 近い形(9 人・長い役職)を架空の名前と肩書きで作る
+            (tmp / "small").mkdir()
+            sp = make_project(tmp / "small")
+            sp.speakers = parse_roster("\n".join([
+                "山田太郎(株式会社サンプル 経営企画本部 事業開発部 第二課 課長代理)",
+                "佐藤花子(株式会社サンプル 経営企画本部 事業開発部 主任研究員)",
+                "鈴木一郎(サンプル市 市民生活部 市民協働課 課長)",
+                "高橋次郎(サンプル工業株式会社 技術本部 品質保証部 品質管理課 係長)",
+                "田中三郎(サンプル工業株式会社 技術本部 生産技術部 主任)",
+                "伊藤四郎(サンプル商事株式会社 営業本部 第一営業部 専門職)",
+                "渡辺五郎(一般社団法人サンプル協会 理事)",
+                "中村六郎(サンプル大学 同窓会 会長)",
+                "小林七子",
+            ]))
+            for s in sp.segments:
+                s.speaker_id = sp.speakers[s.index % len(sp.speakers)].id
+            sp.save()
+            sw, sh = SMALL_SCREEN
+            with fake_screen(sw, sh):
+                small = AssignWindow(root, sp)
+            small.var_autoplay.set(False)
+            show_offscreen(small)
+            check(f"窓が表示されていて画面に収まる（{small.winfo_width()}x{small.winfo_height()}"
+                  f" / 上限 {sw - 40}x{sh - 90}・大きさを測る前提）",
+                  bool(small.winfo_ismapped())
+                  and small.winfo_width() <= sw - 40 and small.winfo_height() <= sh - 90)
+            tree = small.tree
+            have = tree.winfo_width()
+            lead = sum(int(tree.column(c, "width")) for c in ("no", "time", "cluster"))
+            check(f"区間・時刻・声の列が一覧の中に収まる（要 {lead} / 一覧 {have}）",
+                  lead <= have)
+            cell_font = tkfont.Font(
+                root=root, font=ttk.Style().lookup("Treeview", "font") or "TkDefaultFont")
+            # 余白の 8px は測った値ではない。このテーマ(Windows の vista)は一覧のセルに
+            # 余白を設定していない(Treeview.Cell の padding は空。左 4px の余白は
+            # Treeview.Item＝ツリーの列のもので、見出しだけのこの一覧では使わない。
+            # 2026-09-15 に ttk.Style().lookup で確認)。字の描き方や枠の差を見込んで
+            # 置いた値で、根拠のある下限ではない
+            need = max(cell_font.measure(tree.set(i, "speaker"))
+                       for i in tree.get_children()) + 8
+            seen_w = max(0, min(int(tree.column("speaker", "width")), have - lead))
+            check(f"話者の列に名前が読める幅がある（要 {need} / 見えている幅 {seen_w}）",
+                  seen_w >= need)
+            small.player.close()
+            small.destroy()
+    finally:
+        root.destroy()
+
+    if failures:
+        print(f"\n{len(failures)} 件失敗")
+        return 1
+    print("\nALL PASSED")
+    return 0
+
+
 if __name__ == "__main__":
     # 片方が落ちてももう片方を必ず走らせる(短絡すると検査が静かに減る)
     rc_assign = run()
@@ -4812,7 +5029,8 @@ if __name__ == "__main__":
     rc_reg = run_replace_dialog_register()
     rc_mgr = run_dictionary_dialog()
     rc_fit = run_dialogs_fit_small_screen()
+    rc_no = run_list_section_number()
     rc_cfg = run_user_config_untouched()     # **最後に必ず確かめる**
     sys.exit(rc_assign or rc_rsu or rc_inline or rc_cand or rc_multi or rc_main
              or rc_api or rc_save or rc_plain or rc_timers or rc_nav or rc_opts
-             or rc_dict or rc_reg or rc_mgr or rc_fit or rc_cfg)
+             or rc_dict or rc_reg or rc_mgr or rc_fit or rc_no or rc_cfg)

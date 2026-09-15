@@ -823,20 +823,33 @@ class AssignWindow(tk.Toplevel):
         ttk.Button(jump, text="→", width=3, takefocus=False,
                    command=self.jump_to_time).pack(side="left")
 
-        cols = ("time", "cluster", "speaker", "text")
+        # **左端に区間の番号を出す。**一覧の時刻は開始を秒に丸めて出すので、同じ表示の
+        # 行ができ、時刻ではどの行かを指せない(test-audio\01+02edited.speakers.json の
+        # 810 区間のうち 165 区間が、開始を秒に丸めると他の区間と同じになる。2026-09-15)。
+        # 165 は全区間を開始の丸めだけで数えた値で、画面に見える行を数えた数ではない。
+        # 番号は右上の「区間 N/全体」と同じ数え方(index + 1)。
+        cols = ("no", "time", "cluster", "speaker", "text")
         # **複数選べるようにする。**Shift で並び、Ctrl で飛び飛び。同じ人が
         # 続けて話す帯をまとめて指定できないと、区間ごとに同じ操作を
         # 繰り返すことになる(実機の要望・2026-08-23)。
         self.tree = ttk.Treeview(left, columns=cols, show="headings",
                                  selectmode="extended")
+        self.tree.heading("no", text="区間")
         self.tree.heading("time", text="時刻")
         self.tree.heading("cluster", text="声")
         self.tree.heading("speaker", text="話者")
         self.tree.heading("text", text="発言")
+        # 数字 4 桁と見出し「区間」が入る幅。数字なので右寄せにして桁をそろえる
+        self.tree.column("no", width=38, anchor="e", stretch=False)
         self.tree.column("time", width=78, anchor="w", stretch=False)
         self.tree.column("cluster", width=56, anchor="center", stretch=False)
         self.tree.column("speaker", width=120, anchor="w", stretch=False)
-        self.tree.column("text", width=340, anchor="w")
+        # **発言の初期幅は 340 から区間の列の 38px を差し引いた 302。**区間の列の幅を
+        # 発言の列から充て、一覧の要求幅(列の和 594px)を変えない。Panedwindow は子の
+        # 要求幅で左右を配分するので、和が増えると右ペインが狭くなる(番号の列を足すだけ
+        # だと、開発機で 1024x768@125% を再現して測ったとき右ペインが 462→442px になった。
+        # 2026-09-15)。
+        self.tree.column("text", width=302, anchor="w")
         self.tree.grid(row=2, column=0, sticky="nsew")
         sb = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         sb.grid(row=2, column=1, sticky="ns")
@@ -1626,7 +1639,9 @@ class AssignWindow(tk.Toplevel):
             # 重なりを埋め込んだ行にも印を付ける。**括弧が主、色は従。**
             # 色だけでは印刷や色覚の条件で消える。
             bg = "bg_added"
-        values = (time_cell, seg.cluster_label,
+        # 番号は Project.segments の中の位置 + 1(= index + 1。分割・結合や発話の
+        # 追加・削除のたびに振り直される)。一覧の行の順番や絞り込みの結果ではない
+        values = (str(seg.index + 1), time_cell, seg.cluster_label,
                   f"{mark}{name}" if name else "—", body)
         return values, tuple(t for t in (bg, fg) if t)
 
