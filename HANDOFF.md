@@ -1175,6 +1175,7 @@ README・Word 出力・画面・利用規約・CLAUDE.md の「聴いて確定�
 
 - 1024x768@150%（上記）
 - **AGENTS.md は CLAUDE.md の写しではない。**2026-09-15 時点で 35 行違い、揃える検査も無い。`reviewed` の原則の行だけは両方直した（`feature/output-wording`）
+- **公開リポジトリのコメント・README・HANDOFF に実在の会議参加者の実名が含まれる**（`segments.py`・`assign_gui.py` の docstring、README 576、HANDOFF 699）。未対応
 - **英語対応（v2.2.0）**。`src/lang.py` に `EN` プロファイルは入っているが、
   `lang.use()` を呼ぶのはテストだけで、**画面からも設定からも到達できない**。
   配線（UI・設定への永続化・作業ファイルへの言語の記録）と、実測での較正が要る。
