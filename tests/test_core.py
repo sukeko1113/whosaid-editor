@@ -4489,6 +4489,227 @@ def test_fetch_rejects_an_incomplete_download():
         assert not (root / "small").exists()
 
 
+def test_fetch_waits_for_the_watcher_before_renaming():
+    """**見張りが数え終わるまで、作業フォルダの名前を変えない。**
+
+    見張り（進み具合を数える別スレッド）が下のフォルダや中のファイルを
+    開いている間は、Windows では名前を変えられない（WinError 5。main の CI で
+    落ちた・2026-09-15）。自然に重なるのを待つと当たったり外れたりするので、
+    **見張りの 1 回をわざと遅くして、必ず重ねる。**数える間は下のフォルダを
+    実際に開いたままにするので、待たずに名前を変えると CI と同じ WinError 5 になる。
+
+    名前変更にはやり直しがあるので、待たなくても最後には置けてしまうことがある。
+    **置けたかではなく、数えている最中に名前変更を試みていないかを見る。**
+    """
+    import os
+    import tempfile
+    import threading
+    import time
+    from unittest import mock
+    from src import asr_fetch
+
+    state = {"scanning": False, "scans": 0, "reported": 0, "renames": []}
+    entered = threading.Event()
+
+    def slow_dir_size(path):
+        state["scanning"] = True
+        try:
+            with os.scandir(Path(path) / ".cache") as it:
+                next(it, None)
+                entered.set()
+                time.sleep(0.5)
+        finally:
+            state["scans"] += 1
+            state["scanning"] = False
+        return 0
+
+    def on_progress(done, total):
+        state["reported"] += 1
+
+    def fake_download(**kw):
+        out = Path(kw["local_dir"])
+        # huggingface_hub と同じく .cache の下にフォルダを作る。**.cache を空に
+        # しない。**scandir は読み切った時点で閉じるので、空だと開いたままに
+        # ならず、CI と同じ失敗が起きない（最初はそう書いてしまい、名前変更は
+        # 通ってアサーションでしか落ちなかった・2026-09-15）
+        (out / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+        for n in asr_fetch.NEEDED:
+            (out / n).write_text("x")
+        assert entered.wait(5), "見張りが数え始めない"
+        return str(out)          # 見張りが数えている最中に返る
+
+    real_replace = Path.replace
+
+    def spy_replace(self, target):
+        state["renames"].append(state["scanning"])
+        return real_replace(self, target)
+
+    # 待たずに進むと、見張りがまだフォルダをたどっている間に後始末が走る。
+    # 後始末が失敗しても本来の失敗が隠れないよう、後始末の失敗は無視する
+    # （失敗すると確かめたわけではない。検査 C では、開いたままのフォルダも消えた）
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        root = Path(d)
+        with mock.patch.object(asr_fetch, "dir_size", slow_dir_size), \
+                mock.patch("huggingface_hub.snapshot_download",
+                           side_effect=fake_download), \
+                mock.patch.object(Path, "replace", spy_replace):
+            try:
+                got = asr_fetch.fetch("small", root, on_progress=on_progress)
+            except PermissionError as e:
+                raise AssertionError(
+                    f"見張りが数えている最中に名前を変えて落ちた（CI と同じ）: {e}"
+                ) from e
+            at_return = (state["scanning"], state["scans"], state["reported"])
+
+        assert (got / "model.bin").is_file(), "取得が終わっていない"
+        assert state["renames"], "名前を変えていない"
+        assert not any(state["renames"]), \
+            f"見張りが数えている最中に名前変更を試みた（{state['renames']}）"
+
+        # **取得を終えた時点で、見張りのやりかけが残っていない。**残っていると、
+        # 進み具合が「取得した／できなかった」の知らせより後に届く。画面では、
+        # それが状態欄を「モデルを取得中…」に戻しうる（gui.py の fetch_progress）。
+        # **これはコードを読んだうえでの推測で、実機では見ていない。**ここで
+        # 確かめるのは「取得のあとに届くものが無い」ことだけで、画面は見ていない。
+        # 推測を間接に裏付けるにとどまる。
+        scanning, scans, reported = at_return
+        assert not scanning and reported == scans, \
+            f"取得を終えたあとに見張りが残っている（数えた {scans} 回・知らせた {reported} 回）"
+
+
+def test_fetch_waits_for_the_watcher_when_the_download_fails():
+    """**取得に失敗したときも、見張りが数え終わるまで待つ。**
+
+    名前変更の競合（検査 A）だけなら、成功した側で待てば足りる。そのため
+    「失敗した側は要らない」と削られうる。削ると、見張りの最後の進み具合が
+    「取得できませんでした」より後に届く（画面への影響は推測。検査 A の注記）。
+    検査 A と同じく、見張りの 1 回をわざと遅くして必ず重ねる。
+
+    **作業フォルダの消し残しは見ていない。**待たずに消すと、見張りが開いている
+    フォルダを消し残すと考えて確かめを入れたが、修正前のコードでも消し残しは
+    起きなかった（この機械では、開いたままのフォルダも消えた。理由は確かめて
+    いない・2026-09-15）。一度も落ちない確かめは守りにならないので外した。
+    """
+    import os
+    import tempfile
+    import threading
+    import time
+    from unittest import mock
+    from src import asr_fetch
+
+    state = {"scanning": False, "scans": 0, "reported": 0}
+    entered = threading.Event()
+
+    def slow_dir_size(path):          # 検査 A と同じ
+        state["scanning"] = True
+        try:
+            with os.scandir(Path(path) / ".cache") as it:
+                next(it, None)
+                entered.set()
+                time.sleep(0.5)
+        finally:
+            state["scans"] += 1
+            state["scanning"] = False
+        return 0
+
+    def on_progress(done, total):
+        state["reported"] += 1
+
+    def failing_download(**kw):
+        out = Path(kw["local_dir"])
+        # .cache を空にしない理由は検査 A と同じ
+        (out / ".cache" / "huggingface").mkdir(parents=True, exist_ok=True)
+        (out / "model.bin").write_text("x")          # 途中まで落ちた
+        assert entered.wait(5), "見張りが数え始めない"
+        raise OSError("通信が切れた（検査用）")       # 見張りが数えている最中に失敗する
+
+    # 後始末の失敗を無視する理由は検査 A と同じ
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+        root = Path(d)
+        with mock.patch.object(asr_fetch, "dir_size", slow_dir_size), \
+                mock.patch("huggingface_hub.snapshot_download",
+                           side_effect=failing_download):
+            try:
+                asr_fetch.fetch("small", root, on_progress=on_progress)
+            except asr_fetch.AsrFetchError as e:
+                at_raise = (str(e), state["scanning"], state["scans"],
+                            state["reported"])
+            else:
+                raise AssertionError("失敗を知らせていない")
+
+        msg, scanning, scans, reported = at_raise
+        # この文面で失敗していれば、見張りが数え始めてから失敗している（数え
+        # 始めないと failing_download の assert で別の文面になる）。重なって
+        # いないと、下の確かめは何もしなくても通ってしまう
+        assert "通信が切れた（検査用）" in msg, f"別の理由で失敗した: {msg}"
+        assert not scanning and reported == scans, \
+            f"失敗を知らせたあとに見張りが残っている（数えた {scans} 回・知らせた {reported} 回）"
+
+
+def test_fetch_retries_a_busy_rename():
+    """**名前変更を断られたら、少し待ってやり直す。決めた回数でやめる。**
+
+    見張りの終わりは待つようにしたが、ほかのプロセス（ウイルス対策の検査など）が
+    中のファイルをつかんでいても、Windows では同じ PermissionError になる。
+    回数と間隔には実測の裏付けが無い（asr_fetch.RENAME_TRIES の注記）。
+    ここで確かめるのは、やり直すことと、やめることだけ。
+    """
+    import tempfile
+    from unittest import mock
+    from src import asr_fetch
+
+    def fake_download(**kw):
+        out = Path(kw["local_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        for n in asr_fetch.NEEDED:
+            (out / n).write_text("x")
+        return str(out)
+
+    real_replace = Path.replace
+
+    def refused(times):
+        """最初の `times` 回だけ、使用中として断る名前変更。"""
+        calls = []
+
+        def replace(self, target):
+            calls.append(target)
+            if len(calls) <= times:
+                raise PermissionError(13, "使用中（検査用）")
+            return real_replace(self, target)
+        return replace, calls
+
+    # 2 回断られても、3 回目で置ける
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        replace, calls = refused(2)
+        with mock.patch("huggingface_hub.snapshot_download",
+                        side_effect=fake_download), \
+                mock.patch.object(Path, "replace", replace), \
+                mock.patch("time.sleep") as slept:
+            got = asr_fetch.fetch("small", root)
+        assert (got / "model.bin").is_file(), "断られたまま諦めた"
+        assert len(calls) == 3, f"名前変更を {len(calls)} 回試みた（3 回のはず）"
+        assert slept.call_args_list == [mock.call(asr_fetch.RENAME_WAIT_S)] * 2, \
+            f"断られるたびに待っていない（{slept.call_args_list}）"
+
+    # 断られ続けたら、決めた回数でやめて、そのまま知らせる（これまでと同じ例外）
+    with tempfile.TemporaryDirectory() as d:
+        root = Path(d)
+        replace, calls = refused(10 ** 6)
+        with mock.patch("huggingface_hub.snapshot_download",
+                        side_effect=fake_download), \
+                mock.patch.object(Path, "replace", replace), \
+                mock.patch("time.sleep"):
+            try:
+                asr_fetch.fetch("small", root)
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("断られ続けたのに置けたことになった")
+        assert len(calls) == asr_fetch.RENAME_TRIES, \
+            f"名前変更を {len(calls)} 回試みた（{asr_fetch.RENAME_TRIES} 回でやめるはず）"
+
+
 def test_fetch_sizes_are_stated_before_downloading():
     """**大きさを先に伝える。**断りも入れずに GB 級を落とさない。"""
     from src import asr_fetch
