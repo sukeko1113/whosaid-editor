@@ -105,6 +105,14 @@ def lost_names(lost: list) -> str:
     return " / ".join(out)
 
 
+def list_cells(win, values) -> dict:
+    """一覧の 1 行の値を、列の名前で引ける形にする。
+    列の順序はアプリの一覧（win.tree の columns）から取り、検査側には持たない。"""
+    cols = win.tree["columns"]
+    assert len(values) == len(cols), f"列 {len(cols)} に対して値 {len(values)}"
+    return dict(zip(cols, values))
+
+
 _REAL_CONFIG_STAMP = (real_config_path().stat().st_mtime
                       if real_config_path() and real_config_path().exists()
                       else None)
@@ -396,10 +404,10 @@ def run() -> int:
         win._nudge_time("end", +1.0)
         check("終了をナッジできる", abs(seg3.end - (orig3[1] + 1.0)) < 1e-6)
         check("そのとき開始は動かない", abs(seg3.start - 96.5) < 1e-6)
-        check("一覧に ✎ が出る", win.tree.item("s3", "values")[0].startswith("✎"))
+        check("一覧に ✎ が出る", win.tree.set("s3", "time").startswith("✎"))
         check("画面で直した時刻は確認済みになる", seg3.time_reviewed is True)
         check("確認済みは ✎ で、✎△ にはしない",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         check("区間ヘッダにも確認済みと出る", "✎時刻を修正済み" in win.var_seginfo.get())
 
         # 終了を直したら、頭からではなく終わりだけを鳴らす(長い区間で待たない)
@@ -422,7 +430,7 @@ def run() -> int:
         check("元の時刻に戻せる", (seg3.start, seg3.end) == orig3)
         check("印が外れる", seg3.time_edited is False)
         check("元の時刻は保持されている", (seg3.orig_start, seg3.orig_end) == orig3)
-        check("一覧の ✎ も消える", not win.tree.item("s3", "values")[0].startswith("✎"))
+        check("一覧の ✎ も消える", not win.tree.set("s3", "time").startswith("✎"))
         check("確認済みの印も外れる", seg3.time_reviewed is False)
 
         # --- 時刻は入れたが自分の耳では未確認(✎△) --------------------------
@@ -433,13 +441,13 @@ def run() -> int:
         win._update_row(3)
         win.goto(3)
         check("未確認の時刻は一覧で ✎△",
-              win.tree.item("s3", "values")[0].startswith("✎△"))
+              win.tree.set("s3", "time").startswith("✎△"))
         check("区間ヘッダにも未確認と出る",
               "✎△時刻は推定(未確認)" in win.var_seginfo.get())
         win._shift_time(+0.1)
         check("画面で直せば確認済みに変わる", seg3.time_reviewed is True)
         check("一覧の印も ✎ に変わる",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         win.revert_time()                                   # 後片付け
         check("元に戻すと時刻も印も消える",
               (seg3.start, seg3.end) == orig3 and seg3.time_reviewed is False)
@@ -454,7 +462,7 @@ def run() -> int:
         check("時刻の値は変わらない", (seg3.start, seg3.end) == before)
         check("確認済みになる", seg3.time_reviewed is True)
         check("一覧の印が ✎ に変わる",
-              win.tree.item("s3", "values")[0].startswith("✎ "))
+              win.tree.set("s3", "time").startswith("✎ "))
         check("確認済みなら押せない", "disabled" in win.btn_confirm_time.state())
         win.revert_time()
 
@@ -481,12 +489,12 @@ def run() -> int:
               win.apply_proposal(prop, reviewed=False) is True
               and seg9.time_edited is True and seg9.time_reviewed is False)
         check("提案の時刻が入る", abs(seg9.start - (orig9[0] + 6.8)) < 0.15)
-        check("一覧では ✎△", win.tree.item("s9", "values")[0].startswith("✎△"))
+        check("一覧では ✎△", win.tree.set("s9", "time").startswith("✎△"))
         # 聴いて承認したぶんは ✎ になる
         check("聴いて承認は確認済みで入る",
               win.apply_proposal(prop, reviewed=True) is True
               and seg9.time_reviewed is True)
-        check("一覧の印も ✎", win.tree.item("s9", "values")[0].startswith("✎ "))
+        check("一覧の印も ✎", win.tree.set("s9", "time").startswith("✎ "))
 
         # 隣と重なる提案は接点で切り詰める(同時に当てても重ならない)
         seg10_start = proj.segments[10].start
@@ -1395,7 +1403,7 @@ def run() -> int:
         # **背景・文字色・括弧の 3 つ**で示す。色だけでは印刷や色覚の
         # 条件で消える。
         _asr_vals, _asr_tags = awin._row_values(ap.segments[0])
-        check("転写の区間は括弧で囲まない", "＋（" not in _asr_vals[3])
+        check("転写の区間は括弧で囲まない", "＋（" not in list_cells(awin, _asr_vals)["text"])
         check("同じ種類の色を 2 つ付けない",
               sum(1 for t in _asr_tags if t.startswith("bg_")) <= 1
               and sum(1 for t in _asr_tags if t.startswith("fg_")) <= 1)
@@ -1425,7 +1433,7 @@ def run() -> int:
             check("消すボタンが押せるようになる",
                   str(awin.btn_del_added.cget("state")) == "normal")
             _vals, _tags = awin._row_values(a)
-            check("足した発話は括弧で囲んで示す", _vals[3].startswith("＋（"))
+            check("足した発話は括弧で囲んで示す", list_cells(awin, _vals)["text"].startswith("＋（"))
             check("足した発話は背景と文字色でも示す",
                   "bg_added" in _tags and "fg_added" in _tags)
             check("足した行も同じ種類の色は 1 つずつ",
@@ -2356,8 +2364,9 @@ def run_inline_inserts() -> int:
             check("一覧の行が増えない",
                   len(win.tree.get_children()) == rows_before)
             vals, tags = win._row_values(parent)
+            cells = list_cells(win, vals)
             check("親の本文の、割り込んだ位置に入る",
-                  vals[3].startswith("これは（") and "：はい）" in vals[3])
+                  cells["text"].startswith("これは（") and "：はい）" in cells["text"])
             check("親の行にも印が付く", "bg_added" in tags)
 
             # **画面と出力が同じ位置を指すこと**
@@ -2379,8 +2388,9 @@ def run_inline_inserts() -> int:
             win.update()
             check("行で出す設定にすると行が増える",
                   len(win.tree.get_children()) == rows_before + 1)
+            vals, _tags = win._row_values(parent)
             check("行で出すときは埋め込まない",
-                  "：はい）" not in win._row_values(parent)[0][3])
+                  "：はい）" not in list_cells(win, vals)["text"])
             win.var_added_rows.set(False)
             win._on_added_rows_toggled()
             win.update()
@@ -2394,8 +2404,9 @@ def run_inline_inserts() -> int:
                 assign_gui.messagebox.askyesno = real_yes
             check("右ペインから消せる",
                   not any(s.text == "はい" for s in proj.segments))
+            vals, _tags = win._row_values(proj.segments[1])
             check("消したら埋め込みも消える",
-                  "：はい）" not in win._row_values(proj.segments[1])[0][3])
+                  "：はい）" not in list_cells(win, vals)["text"])
 
             win.destroy()
     finally:
