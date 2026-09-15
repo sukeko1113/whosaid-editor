@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -125,7 +126,7 @@ def fetch(
     # 差し替える形にしたら、版によって total が 0 のまま流れてきて
     # 「0 / 0 MB」しか出せなかった（実機で確認・2026-08-21）。
     # 内部に頼らず、置かれたバイト数を数えるほうが壊れない。
-    watcher = _watch(staging, SIZES_MB.get(model, 0) * 1_000_000, on_progress)
+    stop_watch = _watch(staging, SIZES_MB.get(model, 0) * 1_000_000, on_progress)
     try:
         got = Path(snapshot_download(
             repo_id=REPOS[model],
@@ -133,7 +134,7 @@ def fetch(
             local_dir=str(staging),
         ))
     except Exception as e:
-        watcher.set()
+        stop_watch()
         shutil.rmtree(staging, ignore_errors=True)
         raise AsrFetchError(
             f"モデルを取得できませんでした。\n"
@@ -141,7 +142,10 @@ def fetch(
             f"{dest}\n に置いてください。\n"
             f"--- 詳細 ---\n{type(e).__name__}: {e}") from e
 
-    watcher.set()
+    # **見張りの終わりを待ってから先へ進む**（理由は _watch）。失敗した側
+    # （上の except）でも同じく待つ。片方だけにすると、なぜ片方だけかを
+    # 読む人が考えることになる。
+    stop_watch()
     missing = [n for n in NEEDED if not (got / n).is_file()]
     if missing:
         shutil.rmtree(staging, ignore_errors=True)
@@ -149,7 +153,7 @@ def fetch(
             "取得したものに足りないファイルがあります: " + "、".join(missing))
 
     shutil.rmtree(dest, ignore_errors=True)
-    staging.replace(dest)
+    _replace_retrying(staging, dest)
     if on_log:
         mb = sum(f.stat().st_size for f in dest.rglob("*") if f.is_file()) / 1e6
         on_log(f"取得しました（{mb:,.0f} MB）: {dest}")
@@ -171,17 +175,57 @@ def dir_size(path: Path) -> int:
     return total
 
 
+# 名前変更を断られたときのやり直し。**回数と間隔に実測の裏付けは無い。**
+# 見張りの終わりは待つようにした（_watch）ので、ここで待つ相手はほかの
+# プロセス（ウイルス対策の検査など）だが、それが中のファイルをどれだけ
+# 長くつかむかは測っていない。足りないと分かって直すときは、根拠の無い
+# 数字を直すことになる。
+RENAME_TRIES = 5
+RENAME_WAIT_S = 0.5
+
+
+def _replace_retrying(src: Path, dst: Path) -> None:
+    """`src` の名前を `dst` に変える。断られたら少し待ってやり直す。
+
+    Windows では、中のファイルや下のフォルダをほかが開いていると断られる
+    （WinError 5 / 32。どちらも PermissionError になる）。最後まで断られたら、
+    その例外をそのまま上げる（これまでと同じ）。
+    """
+    for i in range(RENAME_TRIES):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError:
+            if i == RENAME_TRIES - 1:
+                raise
+            time.sleep(RENAME_WAIT_S)
+
+
+# 見張りの終わりを待つ上限（秒）。合図のあと、見張りはやりかけの 1 回
+# （数える + 知らせる）を終えれば止まる。**CI ではその 1 回に 0.5〜0.7 秒
+# かかっていた**（run 34958743060 のログからの見立て。名前変更の失敗から
+# 0.5 秒後に見張りの 100% が出ていた）。10 秒はそれに対する余裕で、測った
+# 上限ではない。待ちきれなかったら、そのまま名前変更へ進む（断られたら
+# やり直す）。
+WATCH_JOIN_S = 10
+
+
 def _watch(path: Path, expected: int,
-           on_progress: Optional[Callable[[int, int], None]]) -> "threading.Event":
+           on_progress: Optional[Callable[[int, int], None]]) -> Callable[[], None]:
     """置かれたバイト数を数えて on_progress に流す（別スレッド）。
 
     `expected` は目安（SIZES_MB）なので、実際と少しずれる。**100% を
     超えないように丸める**——「103%」は壊れて見える。
+
+    **返すのは「止めて、終わるまで待つ」関数。**合図だけして先へ進むと、
+    見張りのやりかけの 1 回がまだフォルダをたどっている。Windows では、下の
+    フォルダや中のファイルを開かれているフォルダは名前を変えられない
+    （WinError 5。main の CI で落ちた・2026-09-15）。
     """
-    stop = threading.Event()
     if on_progress is None or expected <= 0:
-        stop.set()
-        return stop
+        return lambda: None
+
+    stop = threading.Event()
 
     def loop() -> None:
         while not stop.wait(0.5):
@@ -190,8 +234,14 @@ def _watch(path: Path, expected: int,
             except Exception:
                 return      # 表示のためだけ。ここで落として取得を止めない
 
-    threading.Thread(target=loop, daemon=True).start()
-    return stop
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+
+    def stop_and_wait() -> None:
+        stop.set()
+        t.join(WATCH_JOIN_S)
+
+    return stop_and_wait
 
 
 def available_models() -> list[str]:
